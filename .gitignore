@@ -1,0 +1,44 @@
+# Secrets — never commit
+mcp/.env
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*_bak.*
+
+# Old/duplicate backup directories — git history replaces the need for these
+backups/
+files/jansky_old/
+files/mercury_old/
+files/webmcp/
+
+# Old Hermes transfer remnants (June 2026) — active config lives in ~/.hermes
+hermes/
+
+# Data & config files — no financial/portfolio data or pipeline config in the public repo
+*.json
+*.yaml
+*.yml
+
+# Generated dashboard output
+*.html
+fragments/*.html
+data/
+reports/
+output/
+
+# Dated report/output snapshots
+jansky_review_*.md
+
+# Logs and process files
+*.log
+*.pid
+logs/
+
+# Debug files
+debug_ranking_*.txt
+
+# Local state
+.DS_Store
