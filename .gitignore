@@ -42,3 +42,6 @@ debug_ranking_*.txt
 
 # Local state
 .DS_Store
+macro_summary.md
+mercury_summary.md
+pipeline_health.md
