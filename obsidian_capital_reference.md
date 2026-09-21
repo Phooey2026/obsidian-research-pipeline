@@ -264,6 +264,14 @@ Ticker/sector counts are computed dynamically from `watchlist.json` throughout
 the pipeline — no hardcoded values remain in any script.
 
 ---
+---
+
+docker restart searxng
+sleep 15
+
+# Then retest
+curl -s "http://localhost:8080/search?q=Apple+earnings+press+release&format=json" | \
+python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Results: {len(d.get(\"results\",[]))}')"
 
 ### Weekly Pipeline Run Order
 
@@ -290,7 +298,7 @@ python3 repair_summaries.py
 python3 repair_summaries.py --refetch CVS TGT AMZN
 
 # 5. Legal research for flagged companies (Nova)
-python3 nova_legal.py
+python3 nova_legal.py HUBG BA LOW
 
 # 6. Earnings call research refresh (Nova)
 python3 nova_earnings_call.py --stale-only
@@ -303,6 +311,8 @@ python3 repair_sector_ranking.py --delta-only  # re-run delta + fragment only
 # 8. Jansky 21-pass weekly review of all agent outputs
 #    Pass 21 reviews trade pitches, approves/rejects, writes jansky_trade_feedback.json
 python3 jansky_review.py
+python3 settle_portfolio.py --dry-run    # preview first — recommended. 
+python3 settle_portfolio.py              # then for real
 
 # 9. Post-run health check
 python3 pipeline_health.py

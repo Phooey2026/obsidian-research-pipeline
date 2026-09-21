@@ -650,8 +650,8 @@ DATA:
 
     try:
         result = subprocess.run(
-            ["jupiter", "-z", prompt, "--reasoning", "high"],   # Jupiter — default Hermes profile
-            capture_output=True, text=True, timeout=420
+            ["jupiter", "-z", prompt, "--reasoning", "med"],   # Jupiter — default Hermes profile
+            capture_output=True, text=True, timeout=600
         )
         output = result.stdout.strip()
         if output:
