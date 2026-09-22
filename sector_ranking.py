@@ -2,8 +2,9 @@
 """
 Sector Ranking Pass (Pass 2)
 Reads the latest research JSON + watchlist.json, groups tickers by sector,
-asks Jupiter to rank each sector with forced verdict distribution, then
-regenerates the dashboard with a Sector Rankings overview tab prepended.
+asks Jupiter to rank each sector by conviction (verdict is taken as ground
+truth from each ticker's own summary, not re-decided by the ranking call),
+then regenerates the dashboard with a Sector Rankings overview tab prepended.
 
 Also runs Jupiter trade pitch pass: for each sector, Jupiter reviews
 full holdings context and pitches ADD/NEW/REDUCE trades to Jansky.
@@ -30,6 +31,35 @@ CONFIG_FILE = f"{BASE_DIR}/obsidian_config.json"
 NEPTUNE_HOLDINGS   = f"{BASE_DIR}/neptune_holdings.json"
 TRADE_DECISIONS    = f"{BASE_DIR}/trade_decisions.json"
 TRADE_FEEDBACK     = f"{BASE_DIR}/jansky_trade_feedback.json"
+
+# ─── Verdict Ground Truth ──────────────────────────────────────────────────────
+_VERDICT_RE = re.compile(
+    r'Overall Verdict\**:?\s*\**\s*(ACCUMULATE|WATCH|AVOID)', re.IGNORECASE
+)
+_VALID_VERDICTS = {"ACCUMULATE", "WATCH", "AVOID"}
+
+def extract_summary_verdict(summary: str) -> str | None:
+    """
+    Parse the analyst's own stated Overall Verdict out of a ticker's full
+    Jupiter summary (see weekly_research.py generate_summary(), section 13).
+    This is ground truth. The ranking pass below assigns rank/score/
+    strengths/risks, but must never re-decide ACCUMULATE/WATCH/AVOID
+    independently of what the analyst actually concluded.
+
+    Confirmed root cause (Sept 2026, Jansky weekly review): the ranking
+    pass previously forced a hardcoded ACCUMULATE/WATCH/AVOID quota via
+    prompt instruction, completely independent of what each ticker's own
+    summary concluded — producing the mechanically identical 2/4/2
+    distribution Jansky flagged across 14 of 16 sectors, and a 48%
+    verdict/summary mismatch (28 of those dangerous-direction on held
+    or pending-add tickers). This function plus the override logic in
+    rank_sector() replace the quota with ground truth from the summary.
+    """
+    m = _VERDICT_RE.search(summary or "")
+    if m:
+        v = m.group(1).upper()
+        return v if v in _VALID_VERDICTS else None
+    return None
 
 # ─── Load Config ──────────────────────────────────────────────────────────────
 def load_config() -> dict:
@@ -213,8 +243,9 @@ def build_brief(res: dict) -> str:
 
     # Truncate the per-stock AI summary to first 600 chars
     summary_short = summary[:600].rsplit(' ', 1)[0] + "..." if len(summary) > 600 else summary
+    stated_verdict = extract_summary_verdict(summary) or "UNSTATED"
 
-    brief = f"""── {ticker} ──
+    brief = f"""── {ticker} ── [Analyst Verdict: {stated_verdict}]
 Price: ${price}  |  P/E: {pe}  |  Fwd P/E: {fpe}  |  PEG: {peg}  |  P/S: {ps}  |  P/FCF: {pfcf}
 FCF: {fcf}  |  D/E: {de}  |  Rev Growth: {rev_g}  |  EPS Growth: {earn_g}
 52W Drawdown: {dd_s}  |  Analyst Target Upside: {upside_s}  |  Consensus: {rec}
@@ -491,9 +522,12 @@ def _validate_ranking(ranking: dict, expected_count: int = None) -> tuple[bool, 
     return True, ""
 
 
-def rank_sector(sector_name: str, briefs: list[tuple]) -> dict:
+def rank_sector(sector_name: str, briefs: list[tuple], verdict_map: dict) -> dict:
     """
-    Ask MiniMax to rank stocks in a sector with forced distribution.
+    Ask MiniMax to rank stocks in a sector by conviction. Verdicts are
+    taken from verdict_map (ground truth from each ticker's own summary),
+    not decided by this LLM call — see the override block near the end
+    of this function.
     briefs: list of (ticker, brief_text) tuples.
     Returns dict keyed by ticker with verdict + rationale.
 
@@ -503,25 +537,6 @@ def rank_sector(sector_name: str, briefs: list[tuple]) -> dict:
       Attempt 3 — explicit strengths/risks reminder (if arrays came back empty)
     """
     n = len(briefs)
-
-    # Forced distribution rules based on sector size
-    if n <= 2:
-        acc_count  = 1
-        watch_count = n - 1
-        avoid_count = 0
-    elif n <= 4:
-        acc_count  = 1
-        watch_count = n - 2
-        avoid_count = 1
-    elif n <= 6:
-        acc_count  = 1
-        watch_count = n - 3
-        avoid_count = 2
-    else:
-        acc_count  = 2
-        watch_count = n - 4
-        avoid_count = 2
-
     tickers_list = [t for t, _ in briefs]
     briefs_text  = "\n\n".join(b for _, b in briefs)
 
@@ -545,12 +560,20 @@ def rank_sector(sector_name: str, briefs: list[tuple]) -> dict:
             "2 bullet points for each field for every stock.\n"
             if remind_arrays else ""
         )
+        verdict_lines = "\n".join(
+            f"  {t}: {verdict_map.get(t.upper()) or 'UNSTATED — infer conservatively from data'}"
+            for t in tickers_list
+        )
         return f"""{header}You are a senior portfolio manager at Obsidian Capital evaluating {n} stocks in the {sector_name} sector to identify the single best re-entry opportunity among out-of-favor names.
 
-MANDATORY VERDICT DISTRIBUTION — you must assign exactly:
-  - ACCUMULATE: {acc_count} stock(s) — the most compelling beaten-down re-entry with best risk/reward
-  - WATCH:      {watch_count} stock(s) — interesting but needs a better entry point or clearer catalyst
-  - AVOID:      {avoid_count} stock(s) — poor risk/reward, deteriorating fundamentals, or technically broken
+EACH STOCK'S ANALYST VERDICT HAS ALREADY BEEN DECIDED — DO NOT CHANGE IT:
+{verdict_lines}
+
+Your job here is NOT to re-decide ACCUMULATE/WATCH/AVOID. It is to rank
+these stocks by conviction, assign a 1-10 score, and write one_liner/
+strengths/risks that are consistent with the verdict each stock was
+already given above. Copy the given verdict into the "verdict" field
+of your output for every stock, exactly as stated.
 
 Tickers to rank: {', '.join(tickers_list)}
 
@@ -672,6 +695,24 @@ STOCK DATA:
             print(f"⚠ (salvaged {n} of {len(briefs)} — full response failed to parse)")
         else:
             print("✓")
+
+        # ── Enforce verdict ground truth — never trust the LLM to
+        # re-derive ACCUMULATE/WATCH/AVOID on its own; also catches typos
+        # like "ACCUMINITE" reaching the dashboard. ─────────────────────
+        if ranking and "stocks" in ranking:
+            for s in ranking["stocks"]:
+                t = s.get("ticker", "").upper()
+                true_verdict = verdict_map.get(t)
+                llm_verdict  = str(s.get("verdict", "")).upper()
+                if true_verdict:
+                    if llm_verdict != true_verdict:
+                        print(f"      ⚠ {t}: verdict overridden "
+                              f"({llm_verdict or '?'} → {true_verdict}, per analyst summary)")
+                    s["verdict"] = true_verdict
+                elif llm_verdict not in _VALID_VERDICTS:
+                    print(f"      ⚠ {t}: invalid verdict '{s.get('verdict')}' — defaulting to WATCH")
+                    s["verdict"] = "WATCH"
+
         return ranking
 
     except FileNotFoundError:
@@ -1427,14 +1468,16 @@ def main(json_path: str = None):
             continue
 
         briefs = []
+        verdict_map = {}
         for ticker in available:
             res   = results_by_ticker[ticker.upper()]
             brief = build_brief(res)
             briefs.append((ticker, brief))
+            verdict_map[ticker.upper()] = extract_summary_verdict(res.get("summary", ""))
             print(f"    ✓ Brief built for {ticker} ({len(brief):,} chars)")
 
         # ── Pass A: Sector ranking ─────────────────────────────────────────
-        ranking = rank_sector(sector_name, briefs)
+        ranking = rank_sector(sector_name, briefs, verdict_map)
         if ranking and "stocks" in ranking:
             ranking["sector"] = sector_name
             all_rankings.append(ranking)

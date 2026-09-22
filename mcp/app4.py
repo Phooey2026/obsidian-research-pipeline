@@ -1525,19 +1525,30 @@ async def get_baltic_dry() -> str:
 
         if shipping_results:
             # ── Extract numeric BDI value from snippets ──────────────────
-            # Handles: "2,670 points", "reached 2670", "BDI... 2,729"
+            # Handles: "2,670 points", "reached 2670", "BDI... 2,729",
+            # "Baltic Dry rose to 3,399 Index Points", "climbed/fell to X".
+            # Widened Sept 2026 after confirming the original patterns
+            # missed a real current-reading snippet ("Baltic Dry rose to
+            # 3,399 Index Points on <date>") entirely — "Baltic Dry" alone
+            # (no "Index") didn't match bdi_pattern's keyword list, and the
+            # word "Index" between the number and "Points" broke
+            # points_pattern. Meanwhile a Wikipedia snippet describing the
+            # index's 1985 base value of 1,000 satisfied the old patterns
+            # just fine, so it — the wrong, historical value — is what won.
             import re as _re
             bdi_pattern = _re.compile(
-                r'(?:BDI|Baltic Dry Index|reached|reaching|stood at|to reach)' +
+                r'(?:BDI|Baltic Dry Index|Baltic Dry|reached|reaching|' +
+                r'stood at|to reach|rose to|climbed to|fell to|dropped to)' +
                 r'[^\d]{0,20}(\d{1,2},\d{3}|\d{4})\b',
                 _re.IGNORECASE
             )
             points_pattern = _re.compile(
-                r'(\d{1,2},\d{3}|\d{4})\s*points',
+                r'(\d{1,2},\d{3}|\d{4})\s*(?:index\s+)?points',
                 _re.IGNORECASE
             )
             bdi_value = None
             bdi_source_date = ""
+            _min_bdi_year = datetime.now(timezone.utc).year - 2
             for item in shipping_results:
                 text = item.get("title","") + " " + item.get("content","")
                 for pat in (bdi_pattern, points_pattern):
@@ -1545,13 +1556,26 @@ async def get_baltic_dry() -> str:
                     if m:
                         candidate = int(m.group(1).replace(",", ""))
                         if 400 <= candidate <= 8000:
-                            bdi_value = candidate
                             date_m = _re.search(
                                 r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)' +
                                 r'\w*\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}',
                                 text, _re.IGNORECASE
                             )
-                            bdi_source_date = date_m.group(0) if date_m else ""
+                            candidate_date = date_m.group(0) if date_m else ""
+                            # Reject a candidate tied to an old date — e.g. a
+                            # Wikipedia snippet describing the BDI's 1985
+                            # base value ("...set at 1,000 on January 4,
+                            # 1985") satisfies the numeric range check just
+                            # as well as a genuine current reading, and was
+                            # confirmed in practice (Sept 2026) to win the
+                            # match ahead of a result with the real current
+                            # value. Undated candidates are still accepted —
+                            # only a clearly old explicit date disqualifies.
+                            year_m = _re.search(r'\b(19|20)\d{2}\b', candidate_date)
+                            if year_m and int(year_m.group(0)) < _min_bdi_year:
+                                continue
+                            bdi_value = candidate
+                            bdi_source_date = candidate_date
                             break
                 if bdi_value:
                     break
@@ -1599,6 +1623,44 @@ async def get_baltic_dry() -> str:
 
 # ── Mercury Backdrop YAML Builder ─────────────────────────────────────────────
 
+def _extract_metric_and_change(text: str, label_prefix: str) -> tuple:
+    """
+    Parse (value, %-change, unit) from a labeled line in the formatted text
+    already returned by get_energy_prices() / get_agricultural_prices() /
+    get_baltic_dry(). Reusing their output here — instead of an independent
+    FRED-only fetch — is the fix for the yaml/summary desync flagged by
+    Jansky (Sept 2026 weekly review): two different sources for the same
+    figure (e.g. FRED's DCOILWTICO vs EIA's spot WTI) meant the backdrop
+    yaml and Mercury's prose summary could report different numbers for
+    the same metric, in different units, from different fetch times. One
+    fetch, parsed twice, guarantees they agree.
+    """
+    import re
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip().startswith(label_prefix):
+            if "error" in line.lower() or "no data" in line.lower():
+                return None, None, ""
+            unit_m = re.search(r'\(([^)]+)\)', line)
+            unit = unit_m.group(1).split(",")[0].strip() if unit_m else ""
+            rest = line.split(":", 1)[-1] if ":" in line else line
+            val_m = re.search(r'-?[\d,]+\.?\d*', rest)
+            if not val_m:
+                return None, None, ""
+            val = float(val_m.group(0).replace(",", ""))
+            chg = None
+            for j in range(i + 1, min(i + 3, len(lines))):
+                if "4-week change" in lines[j] or "~1mo" in lines[j]:
+                    chg_m = re.search(r'([-+]?\d+\.?\d*)%', lines[j])
+                    if chg_m:
+                        chg = float(chg_m.group(1))
+                    break
+                if lines[j].strip() == "":
+                    break
+            return val, chg, unit
+    return None, None, ""
+
+
 @mcp.tool()
 async def build_mercury_backdrop() -> str:
     """
@@ -1609,7 +1671,10 @@ async def build_mercury_backdrop() -> str:
     Covers: DXY trend, crypto momentum, energy trend, metals safe-haven
     signal, agricultural supply stress, BDI demand signal, COT positioning.
 
-    Source: FRED, Frankfurter, CoinGecko (multiple series)
+    Source: FRED, Frankfurter, CoinGecko, yfinance (multiple series). WTI,
+    Nat Gas, Corn, and BDI are parsed from get_energy_prices() /
+    get_agricultural_prices() / get_baltic_dry()'s own output rather than
+    fetched independently here — see _extract_metric_and_change().
     """
     async def _q(series_id: str, limit: int = 14,
                   freq: str = "") -> tuple[Optional[float], str, list]:
@@ -1649,58 +1714,30 @@ async def build_mercury_backdrop() -> str:
         pass
     copper_val, copper_date, _     = await _q("PCOPPUSDM", 14, "m")
 
-    # BDI — try SearXNG first (same approach as get_baltic_dry(), which
-    # reliably finds a current value even when FRED's DBDA series doesn't),
-    # then fall back to FRED only if SearXNG comes up empty.
-    import re as _re
-    bdi_val, bdi_date, bdi_obs = None, "N/A", []
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(
-                f"{SEARXNG_URL}/search",
-                params={
-                    "q":          "Baltic Dry Index BDI points",
-                    "format":     "json",
-                    "time_range": "week",
-                },
-            )
-            r.raise_for_status()
-            _results = r.json().get("results", [])[:10]
-        _shipping = [
-            item for item in _results
-            if any(kw in (item.get("title","") + item.get("content","")).lower()
-                   for kw in ["baltic", "bdi", "dry bulk", "shipping rate"])
-        ]
-        if _shipping:
-            _bdi_pattern = _re.compile(
-                r'(?:BDI|Baltic Dry Index|reached|reaching|stood at|to reach)' +
-                r'[^\d]{0,20}(\d{1,2},\d{3}|\d{4})\b',
-                _re.IGNORECASE
-            )
-            _points_pattern = _re.compile(
-                r'(\d{1,2},\d{3}|\d{4})\s*points', _re.IGNORECASE
-            )
-            for item in _shipping:
-                text = item.get("title","") + " " + item.get("content","")
-                for pat in (_bdi_pattern, _points_pattern):
-                    m = pat.search(text)
-                    if m:
-                        candidate = int(m.group(1).replace(",", ""))
-                        if 400 <= candidate <= 8000:
-                            bdi_val = float(candidate)
-                            break
-                if bdi_val:
-                    break
-    except Exception:
-        pass
-    if bdi_val is None:
-        # SearXNG found nothing usable — fall back to FRED
-        bdi_val, bdi_date, bdi_obs = await _q("DBDA", 30)
-    wti_val, wti_date, wti_obs     = await _q("DCOILWTICO", 14)
-    natgas_val, natgas_date, _     = await _q("DHHNGSP", 14)
-    corn_val, corn_date, corn_obs  = await _q("PMAIZMTUSDM", 14, "m")
-    soy_val, soy_date, _           = await _q("PSOYBUSDM", 14, "m")
-    wheat_val, wheat_date, _       = await _q("PWHEAMTUSDM", 14, "m")
+    # ── WTI, Nat Gas, Corn, BDI — reuse the SAME fetch the prose summary
+    # uses (get_energy_prices / get_agricultural_prices / get_baltic_dry)
+    # instead of an independent FRED-only pull. Two different sources for
+    # the same figure is exactly what caused the yaml/summary desync
+    # Jansky flagged (WTI $107.02 yaml vs $99.08 summary, natgas $2.97 vs
+    # $2.79, corn in different units, BDI "Unknown" vs 3,370). One fetch,
+    # parsed twice, guarantees the numbers agree. ──────────────────────────
+    energy_text = await get_energy_prices()
+    wti_val, wti_4w, _            = _extract_metric_and_change(energy_text, "WTI Crude Oil (")
+    natgas_val, _, _              = _extract_metric_and_change(energy_text, "Henry Hub Nat Gas (")
+
+    ag_text = await get_agricultural_prices()
+    corn_val, corn_yoy, corn_unit = _extract_metric_and_change(ag_text, "Corn (")
+    # NOTE: primary source is now yfinance daily futures ($/bu, ~1mo trend
+    # window), not FRED's monthly $/mt YoY series — "corn_yoy" here is
+    # whichever trend window the matched line reported (1mo if yfinance
+    # succeeded, true YoY if it fell back to FRED). The ag_stance
+    # thresholds below were tuned for YoY moves; revisit if it starts
+    # flipping too often on ordinary 1-month noise.
+    soy_val, soy_date, _          = await _q("PSOYBUSDM", 14, "m")
+    wheat_val, wheat_date, _      = await _q("PWHEAMTUSDM", 14, "m")
+
+    bdi_text = await get_baltic_dry()
+    bdi_val, bdi_4w, _            = _extract_metric_and_change(bdi_text, "Baltic Dry Index (")
 
     # ── DXY trend ─────────────────────────────────────────────────────────
     dxy_vals = [o["value"] for o in dxy_obs if o["value"] is not None]
@@ -1732,9 +1769,6 @@ async def build_mercury_backdrop() -> str:
     gs_ratio = (gold_val / silver_val) if gold_val and silver_val else None
 
     # ── Energy trend ─────────────────────────────────────────────────────
-    wti_vals = [o["value"] for o in wti_obs if o["value"] is not None]
-    wti_4w   = ((wti_vals[-1] - wti_vals[-5]) / wti_vals[-5] * 100) \
-               if len(wti_vals) >= 5 else None
     if wti_4w is not None:
         if wti_4w > 5:
             energy_stance = "Rising (Bullish)"
@@ -1746,9 +1780,6 @@ async def build_mercury_backdrop() -> str:
         energy_stance = "Unknown"
 
     # ── Grain supply stress ───────────────────────────────────────────────
-    corn_vals   = [o["value"] for o in corn_obs if o["value"] is not None]
-    corn_yoy    = ((corn_vals[-1] - corn_vals[-13]) / corn_vals[-13] * 100) \
-                  if len(corn_vals) >= 13 else None
     if corn_yoy is not None:
         if corn_yoy > 15:
             ag_stance = "Supply Stressed (Prices Elevated)"
@@ -1760,9 +1791,6 @@ async def build_mercury_backdrop() -> str:
         ag_stance = "Unknown"
 
     # ── BDI demand signal ─────────────────────────────────────────────────
-    bdi_vals = [o["value"] for o in bdi_obs if o["value"] is not None]
-    bdi_4w   = ((bdi_vals[-1] - bdi_vals[-5]) / bdi_vals[-5] * 100) \
-               if len(bdi_vals) >= 5 else None
     if bdi_4w is not None:
         if bdi_4w > 10:
             bdi_stance = "Accelerating Demand"
@@ -1905,8 +1933,9 @@ async def build_mercury_backdrop() -> str:
         f"agriculture:",
         f"  stance: {ag_stance}",
         f"  key_metrics:",
-        f"    corn_usd_mt: {f'{corn_val:.2f}' if corn_val else 'N/A'}",
-        f"    corn_yoy_pct: {f'{corn_yoy:.2f}' if corn_yoy is not None else 'N/A'}",
+        f"    corn_price: {f'{corn_val:.2f} {corn_unit}' if corn_val else 'N/A'}",
+        f"    corn_trend_pct: {f'{corn_yoy:.2f}' if corn_yoy is not None else 'N/A'}",
+        f"    corn_trend_window: {'1mo (yfinance)' if corn_unit == '$/bu' else 'YoY (FRED fallback)'}",
         f"    soybeans_usd_mt: {f'{soy_val:.2f}' if soy_val else 'N/A'}",
         f"    wheat_usd_mt: {f'{wheat_val:.2f}' if wheat_val else 'N/A'}",
         f"  risk_flags:",

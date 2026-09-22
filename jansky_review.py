@@ -129,17 +129,35 @@ def _days_ago(date_str: str) -> int:
     except Exception:
         return 9999
 
+NOVA_NO_DATA_RETRY_DAYS = 30  # must mirror nova_earnings_call.py's own
+                              # NO_DATA_RETRY_DAYS constant — see fix note below
+
 def _earnings_recently_attempted(earnings: dict, window_days: int = 7) -> bool:
-    """True if Nova attempted an earnings search within the last window_days,
-    regardless of whether new data was actually found. Used to suppress a
-    stale-call_date flag for a ticker Nova has already genuinely checked
-    this week — a real recent attempt with nothing new to report is a
-    different situation from a ticker nobody has looked at in months, even
-    though both can show the same old call_date."""
+    """True if a re-run of nova_earnings_call.py on this ticker right now
+    would be a no-op, so Jansky shouldn't recommend one.
+
+    Two distinct cases, matching nova_earnings_call.py's own cooldown logic
+    exactly (previously this only checked a flat 7-day window regardless of
+    outcome, which was shorter than Nova's real 30-day no-data cooldown —
+    Jansky kept recommending re-runs on tickers Nova would just skip, e.g.
+    a batch of high-risk names confirmed structurally unfindable via
+    wire-service search, not stale from lack of trying):
+      - last attempt found nothing new ("no_new_data_found"): Nova itself
+        won't re-attempt for NOVA_NO_DATA_RETRY_DAYS (30d) — mirror that
+        exact cooldown here so Jansky doesn't recommend a run Nova will
+        just skip.
+      - last attempt succeeded or result is unset (an older record from
+        before this tracking existed): fall back to the original flat
+        window_days (7d) — a genuine recent check either way.
+    """
     last_attempted = earnings.get("last_search_attempted", "")
     if not last_attempted:
         return False
-    return _days_ago(last_attempted) <= window_days
+    last_result = earnings.get("last_search_result", "")
+    days = _days_ago(last_attempted)
+    if last_result == "no_new_data_found":
+        return days <= NOVA_NO_DATA_RETRY_DAYS
+    return days <= window_days
 
 def _find_latest_file(prefix: str, directory: str) -> str | None:
     """Find the most recent file matching prefix_*.json in directory."""
@@ -179,11 +197,31 @@ def _check_stale_language(summary: str) -> list[str]:
     Fix: require stale-language phrases to appear within 120 chars of a
     data-quality context word (nova, earnings, data, record, filing,
     transcript, api, feed) to avoid flagging analytical prose.
+
+    Second false-positive class fixed (Sept 2026): five of the ten
+    STALE_LANGUAGE phrases themselves — "pre-dates", "ignored",
+    "superseded", "discard", "not used" — were *also* listed in
+    DATA_QUALITY_CONTEXT. A phrase always sits inside its own 120-char
+    window, so each of these five self-confirmed on sight regardless of
+    actual meaning: Jupiter correctly writing "this news item pre-dates
+    the filing and was ignored per protocol" (explicitly saying old data
+    was properly excluded) tripped the flag exactly as hard as genuinely
+    stale live data would have — confirmed false positives in five
+    sectors while genuine staleness passed clean, making the flag pure
+    noise. Fixed by moving those five words to a separate EXCLUSION_CONTEXT
+    list that now *suppresses* a match instead of confirming one — the
+    same words, but treated as what they actually indicate (Jupiter
+    explicitly handling/excluding old data), not evidence Jupiter is
+    describing live stale data.
     """
     DATA_QUALITY_CONTEXT = [
         "nova", "earnings call", "transcript", "api", "data feed",
-        "record", "filing", "sec", "edgar", "not used", "discarded",
-        "pre-dates", "ignored", "superseded",
+        "record", "filing", "sec", "edgar",
+    ]
+    EXCLUSION_CONTEXT = [
+        "not used", "discarded", "discard", "pre-dates", "predates",
+        "ignored", "superseded", "excluded", "per protocol",
+        "historical only", "for context only",
     ]
     found = []
     lower = summary.lower()
@@ -194,10 +232,16 @@ def _check_stale_language(summary: str) -> list[str]:
             idx = lower.find(phrase_lower, idx)
             if idx == -1:
                 break
-            # Check 120-char window around the phrase for data quality context
+            # Check 120-char window around the phrase for context
             window_start = max(0, idx - 120)
             window_end   = min(len(lower), idx + len(phrase_lower) + 120)
             window       = lower[window_start:window_end]
+            if any(ex in window for ex in EXCLUSION_CONTEXT):
+                # Jupiter explicitly flagged this as excluded/handled old
+                # data, not a live staleness admission — skip this hit,
+                # but keep scanning in case a later occurrence is genuine
+                idx += len(phrase_lower)
+                continue
             if any(ctx in window for ctx in DATA_QUALITY_CONTEXT):
                 found.append(phrase)
                 break  # Only flag once per phrase
@@ -628,8 +672,14 @@ def pass_jupiter_sector(sector: str, tickers: list[str],
                 )
 
         # Check NOVA_FLAG_DATA
+        # Case-insensitive (Sept 2026 fix): a casing variant on JBHT's
+        # label (e.g. "Nova_Flag_Data:" instead of "NOVA_FLAG_DATA:")
+        # silently broke this match with no error — the ticker just read
+        # as having no flag at all, breaking Section 9 parsing for that
+        # ticker. The dict body itself parses fine via json.loads()
+        # regardless of the label's casing.
         nova_flag_match = re.search(
-            r'NOVA_FLAG_DATA:\s*(\{[^}]+\})', summary
+            r'NOVA_FLAG_DATA:\s*(\{[^}]+\})', summary, re.IGNORECASE
         )
         if nova_flag_match:
             try:
@@ -1085,15 +1135,37 @@ TRADE PITCHES THIS WEEK:
     # ── Step 2: dedicated JSON decisions call ──────────────────────────────
     # Separate call asking ONLY for structured JSON — no prose, no narrative.
     # This is far more reliable than asking Jansky to append JSON to prose.
+    #
+    # IMPORTANT: _call_jansky() is a stateless one-shot subprocess call
+    # (see its docstring/implementation above) — there is no session or
+    # conversation continuity between this call and the "Trade Review"
+    # call above. The prompt used to say "You just reviewed..." and "the
+    # review you just completed," which was simply false: this call has
+    # zero memory of that one. Confirmed in practice (Sept 2026): Jansky
+    # correctly reported it back ("Review data from the prior turn is not
+    # present in this context") and defaulted every single decision to
+    # REJECT for lack of anything to actually decide from — not genuine
+    # per-ticker analysis, just an honest report of missing context.
+    # Fix: pass the actual `notes` text from the review call into this
+    # prompt directly, since nothing is carried over automatically.
     ticker_list = ", ".join(t.get("ticker", "?") for t in all_trades)
-    json_prompt = f"""You just reviewed {len(all_trades)} trade pitches for Obsidian Capital.
-The tickers reviewed were: {ticker_list}
+    json_prompt = f"""You are Jansky, Head of AI Operations at Obsidian Capital.
+
+Below is the trade review you completed for this week's {len(all_trades)}
+pitches from Jupiter and Mercury. This is a new, separate call with no
+memory of writing it, so it is included here in full — use it as the
+basis for your decisions.
+
+YOUR TRADE REVIEW:
+{notes}
+
+Tickers reviewed: {ticker_list}
 
 Now output ONLY a JSON object — no prose, no explanation, no markdown fences.
 Your entire response must be a single valid JSON object starting with {{ and ending with }}.
 
 For each ticker provide your APPROVE or REJECT decision and a one-sentence rationale.
-Base your decisions on the review you just completed and these hard constraints:
+Base your decisions on the review above and these hard constraints:
 - Cash floor: {cash_floor_pct:.0f}% minimum (current cash: {cash_pct:.1f}%)
 - Max single equity position: {max_eq_pct:.0f}% of portfolio
 - Max single ETF position: {max_etf_pct:.0f}% of portfolio

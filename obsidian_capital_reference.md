@@ -1,5 +1,5 @@
 # Obsidian Capital Research Pipeline — Reference Guide
-## As of June 22, 2026 — updated August 30, 2026
+## As of June 22, 2026 — updated September 21, 2026
 
 ---
 
@@ -225,7 +225,7 @@ Utilities (8):      PNW NEE SO DUK AEP SRE VST XEL
 Packaging (8):      IP PKG SW AMCR BALL CCK AVY REYN
 Casinos (8):        WYNN MGM LVS PENN FLUT GLPI BYD CZR
 Banks (9):          JPM BAC C WFC USB HBAN MTB CFG V
-Logistics (8):      FDX UPS JBHT EXPD CHRW LSTR GXO OLDF
+Logistics (8):      FDX UPS JBHT EXPD CHRW LSTR GXO ODFL
 Insurance (8):      MRSH CB PGR CI ELV ALL HUM MET
 Mining (8):         BHP RIO SCCO NEM FCX AEM VALE B
 Industrials (8):    CAT GE GEV RTX BA DE LMT HON
@@ -244,11 +244,27 @@ a payments network rather than a depository bank. SOUL.md files for
 Atlas, Mercury, Jupiter, and Jansky were all updated to say "128
 stocks, 16 sectors."
 
-**Also (August 2026): `OLDF` replaced `HUBG` in the Logistics sector.**
+**Also (August 2026): `ODFL` replaced `HUBG` in the Logistics sector.**
 Reason not explicitly confirmed, but HUBG's known issues at the time
 (Nasdaq deficiency, multi-year restatement, a pattern of repeated Form
 12b-25 late-filing notices — see Legal Risk Landscape section) are a
 plausible motivation. Treat as unconfirmed until stated directly.
+
+**Removing/swapping a ticker (Sept 2026) — `nova_supplemental.json` does
+NOT self-prune.** `research_*.json`/`rankings_*.json` rebuild fresh from
+`watchlist.json` every run, so a dropped ticker just stops appearing next
+week on its own — but `nova_supplemental.json` is a persistent,
+incrementally-updated cache that keeps a removed ticker's old
+earnings/legal records forever, which then keeps tripping Jansky's
+staleness pre-checks on a name the pipeline no longer even researches
+(this is exactly what happened to HUBG after the ODFL swap). New utility:
+**`prune_stale_tickers.py`** — run once, right after editing
+`watchlist.json`, to expunge any ticker no longer on the watchlist from
+`nova_supplemental.json`. See Script Reference below for full details.
+```bash
+python3 prune_stale_tickers.py            # dry run — shows what would be removed
+python3 prune_stale_tickers.py --apply    # actually writes the pruned file
+```
 
 Note: GOOGL removed (was duplicate of GOOG). Coverage: GOOG only.
 GOOGL is still a holdings position — Jupiter sees both via `HOLDINGS_ALIASES`
@@ -264,14 +280,49 @@ Ticker/sector counts are computed dynamically from `watchlist.json` throughout
 the pipeline — no hardcoded values remain in any script.
 
 ---
----
 
+### Quick Reference — Commands I Use Often
+
+```bash
+# Restart an MCP server after deploying a code change to its app{N}.py
+# (Python only loads the module into memory at process start — a code
+# change on disk does nothing until you restart the service.)
+systemctl --user restart mercurymcp
+systemctl --user restart webmcp
+systemctl --user restart macromcp
+systemctl --user restart novamcp
+# give it ~2s to finish starting before hitting it with a script
+
+# SearXNG down or a tool coming back suspiciously empty — restart and retest
 docker restart searxng
 sleep 15
-
-# Then retest
 curl -s "http://localhost:8080/search?q=Apple+earnings+press+release&format=json" | \
 python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Results: {len(d.get(\"results\",[]))}')"
+
+# After editing watchlist.json (dropping/swapping a ticker) — expunge its
+# stale earnings/legal cache from nova_supplemental.json
+python3 prune_stale_tickers.py            # dry run first
+python3 prune_stale_tickers.py --apply
+
+# Force-refresh a ticker's Nova earnings record even though it reads "current"
+# (staleness check has no --force flag; reset call_date manually, then
+# also clear the no-data cooldown fields if the record is in one)
+python3 -c "
+import json
+d = json.load(open('nova_supplemental.json'))
+d['TICKER']['earnings']['call_date'] = '2000-01-01'
+d['TICKER']['earnings'].pop('last_search_attempted', None)
+d['TICKER']['earnings'].pop('last_search_result', None)
+json.dump(d, open('nova_supplemental.json', 'w'), indent=2)
+"
+python3 nova_earnings_call.py TICKER
+
+# Preview trade settlement before committing it for real
+python3 settle_portfolio.py --dry-run
+python3 settle_portfolio.py
+```
+
+---
 
 ### Weekly Pipeline Run Order
 
@@ -322,6 +373,14 @@ Refresh the dashboard after any standalone repair or fragment update:
 ```bash
 bash rebuild_dashboard.sh
 ```
+
+**Not a weekly step — run only after editing `watchlist.json`:** if a
+ticker was dropped or swapped, run `python3 prune_stale_tickers.py --apply`
+once to remove its now-orphaned earnings/legal records from
+`nova_supplemental.json` (see Watchlist section and Script Reference
+below). Skipping this doesn't break anything immediately, but the
+removed ticker's stale data will keep tripping Jansky's staleness
+pre-checks indefinitely.
 
 **Note on step order:** legal (5) and earnings (6) run AFTER Jupiter
 (step 3) intentionally — `nova_legal.py`'s flagging depends on
@@ -570,8 +629,10 @@ generate_dashboard(data, date, macro_backdrop, macro_summary,
 - Reads research JSON + `watchlist.json` + `neptune_holdings.json` +
   `obsidian_config.json` + `jansky_trade_feedback.json`
 - Builds ~960-char briefs per ticker
-- **Pass A:** Calls `jupiter -z prompt` for forced-distribution ranking per sector
-  - Distribution: 1-2 ACCUMULATE, variable WATCH, 1-2 AVOID per sector
+- **Pass A:** Calls `jupiter -z prompt` for sector ranking — verdicts are
+  no longer mechanically quota'd (see **Verdict ground-truth override**
+  below); ranking/scoring/commentary are the only things actually left
+  to the model now
   - The originally-reported "Retail sector broken sort" issue (Aug 2026)
     was never independently root-caused before the much larger JSON
     corruption problem below was found and fixed (Sept 2026) — likely
@@ -647,6 +708,43 @@ saga; final state:
   `jansky_review.py` (see below) — **duplicated, not shared**, since
   these are independent top-level scripts with no shared library. Any
   future fix to this function needs to be applied in both places.
+
+**Verdict ground-truth override (Sept 2026)** — separate from the JSON
+reliability work above; this fixed a real desync Jansky's own executive
+briefing flagged (48% verdict/summary mismatch across sectors, 28
+dangerous-direction cases — e.g. a stock whose own analyst summary said
+AVOID ranked as ACCUMULATE). Root cause: `rank_sector()`'s prompt builder
+carried a hardcoded **"MANDATORY VERDICT DISTRIBUTION"** block that forced
+roughly 1-2 ACCUMULATE / N-3 WATCH / 1-2 AVOID on every ~8-stock sector
+regardless of what each ticker's own Jupiter summary actually concluded —
+so the ranking call was re-deriving (and frequently overriding) a verdict
+that had already been decided elsewhere, independently, by a different
+Jupiter call.
+- Added `extract_summary_verdict()` — regex-parses the ticker's own
+  summary for its stated `Overall Verdict:` line (ACCUMULATE/WATCH/AVOID)
+  and treats that as ground truth.
+- `build_brief()` now tags each per-ticker brief with
+  `[Analyst Verdict: {stated_verdict}]` pulled from that regex.
+- Removed the forced-distribution block entirely. `rank_sector()` now
+  takes a `verdict_map` (ticker → stated verdict) built in `main()`
+  alongside the briefs, and the prompt instructs the model: **"EACH
+  STOCK'S ANALYST VERDICT HAS ALREADY BEEN DECIDED — DO NOT CHANGE IT"** —
+  the model only ranks, scores, and writes commentary consistent with the
+  given verdict.
+- Added a hard post-processing override right before the ranking is
+  returned: any ticker with a known ground-truth verdict gets that
+  verdict force-set on the output regardless of what the LLM wrote (with
+  a console warning logged whenever an override actually fires); a
+  ticker with no stated verdict and an invalid LLM verdict defaults to
+  WATCH rather than being left malformed.
+- **Confirmed working live (9/21/26 run):** near-total WATCH distribution
+  across all 16 sectors (only AVGO/TXN/SW/DVN as ACCUMULATE, only
+  BYD/CHRW/BA as AVOID) with **zero override warnings printed** — meaning
+  the model's own output already matched ground truth every time this
+  run. Validated as correct behavior per Jupiter's "be stingy with
+  ACCUMULATE" prompt instruction and the macro stagflation backdrop, not
+  a bug — a dramatic change from the old mechanical 2/4/2-per-sector
+  split, which is exactly the point.
 
 **`repair_sector_ranking.py`**
 - Surgical repair tool for failed sector rankings (companion to repair_summaries.py)
@@ -829,6 +927,36 @@ saga; final state:
   `last_search_attempted`/`last_search_result`, or the cooldown check
   will still skip it.
 
+**`prune_stale_tickers.py`** (new, Sept 2026)
+- Standalone maintenance utility — not part of the weekly run order, run
+  manually right after editing `watchlist.json` to drop or swap a ticker
+- Purpose: `nova_supplemental.json` is the one persistent,
+  incrementally-updated cache in the pipeline that doesn't self-prune
+  (unlike `research_*.json`/`rankings_*.json`, which rebuild fresh from
+  the current watchlist every run) — so a removed ticker's stale
+  earnings/legal records otherwise linger indefinitely and keep tripping
+  Jansky's staleness pre-checks on a name the pipeline no longer even
+  researches. This is exactly what happened to HUBG after the ODFL swap.
+- Flattens `watchlist.json`'s sectors into one set of active tickers,
+  diffs against `nova_supplemental.json`'s keys, and removes any record
+  whose ticker is no longer active
+- Dry-run by default (shows what would be removed, with company name and
+  which data types — earnings/legal — each stale entry has); `--apply`
+  required to actually write
+- Backs up `nova_supplemental.json` to
+  `backups/nova_supplemental_{YYYYMMDD_HHMM}_pre_prune.json` before any
+  destructive write (kept, not deleted, per convention)
+- Same atomic `.tmp` + `os.replace()` write pattern as `app3.py`'s own
+  `_save_nova_json()`
+- Usage:
+  ```bash
+  python3 prune_stale_tickers.py            # dry run
+  python3 prune_stale_tickers.py --apply    # actually remove stale records
+  ```
+- **Confirmed working live (9/21/26):** ran after the HUBG→ODFL
+  watchlist swap; found exactly 1 stale ticker (HUBG), backed up, removed
+  it, 128 active records remained.
+
 **`jansky_review.py`**
 - 21-pass weekly review of all agent outputs
 - Pass 1: Atlas macro review
@@ -842,6 +970,26 @@ saga; final state:
   - Enforces trade limits, position limits, cash floor from `obsidian_config.json`
   - Writes approved/rejected decisions to `jansky_trade_feedback.json`
   - Generates `fragments/trades_dashboard_fragment.html`
+  - **Stateless second-call context bug (Sept 2026, distinct from the
+    JSON reliability overhaul below)** — a real run rejected 34/34
+    pitched trades with **identical boilerplate rationale text on every
+    single ticker** ("Review data from the prior turn is not present in
+    this context..."). Root cause: `_call_jansky()` is a stateless
+    one-shot `subprocess.run(["jansky", "-z", prompt], ...)` call with
+    zero continuity between invocations — but the second (decisions-
+    JSON) call's prompt falsely opened with "You just reviewed {N} trade
+    pitches..." / "Base your decisions on the review you just
+    completed," even though that call has no access whatsoever to the
+    first call's `notes` output. Fixed by embedding the actual narrative
+    review text (`notes`) directly into the second prompt's body, with a
+    comment documenting the stateless-call root cause so it isn't
+    reintroduced. **Confirmed working live (9/21/26 run):** 24 approved /
+    3 rejected (CCK, MCD, DLR), each with genuinely distinct, specific
+    per-ticker rationale (e.g. AVGO: "Best long add of the week: 18.45x
+    forward vs 45.67x trailing, PEG 0.35..."). Cash-floor logic also
+    confirmed working correctly in the same run (warned that approving
+    all $10.9M of buy pitches would drop cash to 7.4%, below the 10%
+    floor, and selectively approved 24 of 27).
   - **JSON reliability overhaul (Sept 2026)** — this call was far more
     fragile than `sector_ranking.py`'s (only 2 parse attempts, no retry
     call, no salvage) before being brought up to the same standard:
@@ -1056,6 +1204,48 @@ saga; final state:
   exists in four separate places across the codebase; any future
   addition needs to touch all four or risks the same silent gap — worth
   consolidating to a single source of truth eventually, not attempted here.
+- **`build_mercury_backdrop()` WTI/natgas/corn/BDI yaml-vs-prose desync
+  fixed (Sept 2026)** — Jansky's executive briefing flagged
+  `mercury_backdrop.yaml`'s structured fields disagreeing with Mercury's
+  own prose CCC summary for the same week. Root cause: the YAML builder
+  independently re-fetched WTI (FRED `DCOILWTICO`), natgas (FRED
+  `DHHNGSP`), and corn (FRED `PMAIZMTUSDM`, monthly $/mt) via their own
+  private code paths — different sources/units/timing than the
+  already-working `get_energy_prices()` (EIA `RWTC`), `get_agricultural_prices()`
+  (yfinance `ZC=F`, $/bu), and `get_baltic_dry()` (SearXNG) used for the
+  prose. Fixed by having `build_mercury_backdrop()` call those same
+  tools and regex-parse their already-fetched, human-readable text output
+  (new helper `_extract_metric_and_change()`) instead of re-fetching
+  independently — one source of truth feeding both outputs. Soy/wheat
+  deliberately left on the old FRED-only path for now (same latent
+  desync-risk class, but not reported this week — explicitly scoped out).
+  - **Shipped with a bug, fixed same day:** `_extract_metric_and_change()`
+    used `re.search()` without importing `re` (the deleted BDI block had
+    its own scoped `import re as _re` that didn't cover the new helper) —
+    crashed every call with `name 're' is not defined`, visible as a
+    literal error string written into `mercury_backdrop.yaml`. Fixed by
+    adding `import re` inside the helper.
+  - **Corn field relabeling:** the new corn value is $/bu (yfinance), not
+    $/mt (the old FRED field it replaced) — yaml key renamed from
+    `corn_usd_mt`/`corn_yoy_pct` to `corn_price` (unit included inline,
+    e.g. "5.43 $/bu") and `corn_trend_pct` / `corn_trend_window` (labels
+    which source — 1mo yfinance vs. YoY FRED fallback — the trend % came
+    from).
+  - **BDI extraction bug found and fixed:** `get_baltic_dry()`'s regex
+    picked up a Wikipedia snippet's "1,000" (the index's 1985 base value)
+    instead of a second search result's real current reading ("3,399"),
+    producing a nonsensical `bdi_level: 1,000` in the yaml. Widened the
+    matching patterns and added an old-date rejection check (skips a
+    candidate whose nearby date is more than 2 years old) so a
+    historical/reference value can't win over the actual current one.
+  - **Confirmed working live (9/21/26 run):** `wti_crude_usd: 99.08`,
+    `natgas_henry_hub: 2.790`, `corn_price: 5.43 $/bu`,
+    `corn_trend_window: 1mo (yfinance)`, `bdi_level: 3,399` — all now
+    matching the prose summary for the same week. `bdi_stance`/
+    `bdi_4week_change_pct` still show `Unknown`/`N/A` since the SearXNG
+    BDI path only returns a current snapshot, not a series to compute a
+    trend from — left as a known, low-priority limitation, not part of
+    this fix.
 - **Deploy-timing note:** during testing, an initial "clean" test run
   turned out to be using an `app4.py` that had the agriculture/livestock
   fixes but predated the FBTC/IBIT fix — a stale file copy, not a code
@@ -1387,9 +1577,11 @@ CRITICAL (1): HUBG — Nasdaq deficiency + multi-year restatement +
               late-filing notices — 3 filed in 2026 alone, March/May/Aug —
               meaning HUBG genuinely hadn't reported a complete quarter
               since Feb 2025 as of late Aug 2026. NOTE: HUBG has since
-              been replaced by OLDF on the active watchlist — see
+              been replaced by ODFL on the active watchlist — see
               Watchlist section above. Retained here as historical
-              context; HUBG is no longer actively tracked.)
+              context; HUBG is no longer actively tracked, and its
+              lingering earnings/legal records were expunged from
+              nova_supplemental.json via prune_stale_tickers.py in Sept 2026.)
 
 HIGH (8):     B     — Ontario class action certified, $3-7B exposure
               NEE   — Louisiana coastal litigation + FERC proceedings
@@ -1571,6 +1763,39 @@ re-verified — treat as historical unless refreshed.
   Jansky evaluates earnings staleness, that suppresses the flag when a
   genuine recent search attempt exists — regardless of whether it found
   anything new.
+- ✅ **Sector-ranking verdict/summary desync (mandatory quota bug)** —
+  `sector_ranking.py`'s ranking prompt forced a mechanical
+  1-2 ACCUMULATE / N-3 WATCH / 1-2 AVOID split on every sector regardless
+  of what each ticker's own Jupiter summary actually concluded (48%
+  mismatch rate per Jansky's executive briefing, 28 dangerous-direction
+  cases). Fixed by extracting each ticker's stated verdict from its own
+  summary as ground truth, instructing the model the verdict is already
+  decided, and hard-overriding the LLM's output verdict with the stated
+  one as a final safety net. See `sector_ranking.py` → Verdict
+  ground-truth override above for the full writeup.
+- ✅ **Mercury backdrop yaml disagreeing with Mercury's own prose summary
+  for WTI, natgas, corn, and BDI** — `build_mercury_backdrop()` was
+  independently re-fetching each of these from different sources/units
+  than the tools used for the prose summary. Fixed by having the backdrop
+  builder parse the same already-fetched tool output instead of
+  re-fetching independently. Also fixed, discovered in the process: a
+  missing `import re` that crashed the call outright, a mislabeled corn
+  unit ($/mt label on a $/bu value), and a BDI extraction bug that picked
+  a historical reference value over the real current one. See
+  `mcp/app4.py` above for the full writeup.
+- ✅ **Jansky rejecting 100% of pitched trades (34/34) with identical
+  boilerplate rationale** — traced to `jansky_review.py`'s trade-review
+  Pass 21 second (JSON decisions) call falsely assuming conversational
+  continuity with the first (narrative review) call, when `_call_jansky()`
+  is actually a fresh stateless subprocess call every time. Fixed by
+  embedding the actual review text into the second prompt. See
+  `jansky_review.py` → Stateless second-call context bug above.
+- ✅ **Stale ticker data lingering after a watchlist swap (HUBG → ODFL)**
+  — `nova_supplemental.json` doesn't self-prune when a ticker leaves
+  `watchlist.json`, unlike the research/rankings files, which keeps
+  tripping staleness checks on a name that's no longer researched. New
+  `prune_stale_tickers.py` utility added as a repeatable fix for this
+  going forward — see Script Reference above.
 
 ---
 
