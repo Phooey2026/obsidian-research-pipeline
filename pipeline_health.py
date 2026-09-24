@@ -66,6 +66,35 @@ def _days_ago(date_str: str) -> int:
     except Exception:
         return 9999
 
+# Sept 2026: must mirror nova_earnings_call.py's own NO_DATA_RETRY_DAYS
+# constant. See _earnings_recently_attempted() below.
+NOVA_NO_DATA_RETRY_DAYS = 30
+
+def _earnings_recently_attempted(earnings: dict, window_days: int = 7) -> bool:
+    """True if a re-run of nova_earnings_call.py on this ticker right now
+    would be a no-op, so this check shouldn't WARN about it.
+
+    Ported from the identical fix in jansky_review.py (Sept 22, 2026) —
+    pipeline_health.py's own Nova staleness check had the same gap:
+    it only ever looked at call_date age, with zero awareness that
+    nova_earnings_call.py tracks and skips tickers it has already
+    searched and found nothing new for within the last 30 days
+    (NO_DATA_RETRY_DAYS). Roughly half the watchlist has no findable
+    wire-service earnings source at all (structurally, not from lack of
+    trying) — those tickers will always show an old call_date and would
+    otherwise WARN every single day forever, even though Nova is doing
+    exactly what it's supposed to (not wasting API calls re-attempting a
+    search that just failed 8 days ago).
+    """
+    last_attempted = earnings.get("last_search_attempted", "")
+    if not last_attempted:
+        return False
+    last_result = earnings.get("last_search_result", "")
+    days = _days_ago(last_attempted)
+    if last_result == "no_new_data_found":
+        return days <= NOVA_NO_DATA_RETRY_DAYS
+    return days <= window_days
+
 def _find_latest(prefix: str) -> str | None:
     try:
         files = sorted([f for f in os.listdir(DATA_DIR)
@@ -273,13 +302,14 @@ def check_nova() -> dict:
     with open(nova_path) as f:
         nova = json.load(f)
 
-    stale_earnings  = []
-    stale_legal     = []
-    missing_earnings= []
-    missing_legal   = []
-    high_risk       = []
-    ages_earnings   = []
-    ages_legal      = []
+    stale_earnings   = []
+    cooldown_earnings= []
+    missing_earnings = []
+    missing_legal    = []
+    high_risk        = []
+    ages_earnings    = []
+    ages_legal       = []
+    stale_legal      = []
 
     for ticker, record in nova.items():
         # Earnings
@@ -291,7 +321,15 @@ def check_nova() -> dict:
             age = _days_ago(call_date)
             ages_earnings.append(age)
             if age > EARNINGS_STALE_DAYS:
-                stale_earnings.append(f"{ticker}({age}d)")
+                if _earnings_recently_attempted(earnings):
+                    # Nova already checked recently and found nothing new
+                    # (or is within its 30-day no-data cooldown) — an old
+                    # call_date here reflects a structurally unfindable
+                    # source, not a ticker nobody has looked at. Tracked
+                    # separately so it's visible without WARNing on it.
+                    cooldown_earnings.append(f"{ticker}({age}d)")
+                else:
+                    stale_earnings.append(f"{ticker}({age}d)")
 
         # Legal
         legal      = record.get("legal", {})
@@ -335,7 +373,18 @@ def check_nova() -> dict:
         result["issues"].append(
             f"Missing earnings records: {', '.join(missing_earnings[:10])}"
         )
+    if cooldown_earnings:
+        # Informational only — never WARNs, never flips status. These
+        # tickers have old call_dates but Nova has genuinely already
+        # checked them within its own retry window (see
+        # _earnings_recently_attempted above); re-running
+        # nova_earnings_call.py on them right now would be a no-op.
+        result["issues"].append(
+            f"Stale but in Nova's no-data cooldown (not actionable yet): "
+            f"{', '.join(cooldown_earnings[:10])}"
+        )
 
+    result["metrics"]["stale_earnings_in_cooldown"] = len(cooldown_earnings)
     result["metrics"]["high_risk_tickers"] = high_risk
     if not result["issues"]:
         result["issues"] = ["All checks passed"]

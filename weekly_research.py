@@ -7,6 +7,7 @@ Run via cron: 0 8 * * 1 /usr/bin/python3 /home/jay/stock_dashboard/weekly_resear
 
 import requests
 import json
+import re
 import datetime
 import time
 import sys
@@ -410,6 +411,69 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
     )
     return preamble
 
+# ─── Harness noise stripping (Sept 2026) ──────────────────────────────────────
+# Hermes CLI occasionally writes its own runtime/skill/memory-system status
+# narration to stdout ahead of the actual report body, which then gets saved
+# verbatim into the ticker's summary since generate_summary() previously
+# trusted raw stdout as-is. Confirmed by Jansky's weekly review across 5
+# tickers in one run (PKG, CCK, REYN, AEP, XEL), likely correlated with
+# memory-budget pressure on the Hermes side — this is harness/skill-system
+# behavior, not something the SOUL.md prompt controls (Jupiter's own SOUL.md
+# already tells it not to call tools).
+#
+# Real examples pulled from actual leaked reports (Sept 2026):
+#   PKG: "Memory consolidation is blocked this turn (harness halt — PKG
+#         note will be saved next session). Skill loaded; its table format
+#         is superseded by the 13-section output spec in this prompt.
+#         Delivering the report now."
+#   CCK: "Memory updated with the CCK stance. Here is the full analyst
+#         report."
+# Both precede the real report's actual first section, "1. COMPANY
+# OVERVIEW" — the structured 13-section format Jupiter's SOUL.md defines,
+# where Section 1 is always this exact heading. Rather than matching exact
+# wording (which will vary run to run), anchor on that structural marker:
+# find the real report's start, and if the text before it contains any
+# known noise trigger phrase, drop that whole preamble regardless of its
+# exact sentence boundaries. A line-level fallback also runs for noise that
+# isn't a clean leading block (e.g. if it shows up mid-report or trailing).
+_HARNESS_NOISE_TRIGGER_RE = re.compile(
+    r'memory (consolidation|update|sync|write|save)[^.\n]*'
+    r'(is )?(deferred|blocked|queued|pending)|'
+    r'memory updated with the .*? stance|'
+    r'\[memory\]|skill loaded;|delivering the report now|'
+    r'harness halt|background memory (update|sync|write)|'
+    r'here is the full (analyst )?report',
+    re.IGNORECASE,
+)
+_REPORT_START_RE = re.compile(r'^\s*1\.\s+[A-Z]', re.MULTILINE)
+
+def _strip_harness_noise(text: str) -> str:
+    """Remove Hermes CLI runtime/status narration from raw stdout before
+    it's treated as a ticker's summary. See notes above."""
+    if not text:
+        return text
+    original = text
+
+    # Primary strategy: drop a leading noise preamble ahead of "1. COMPANY
+    # OVERVIEW" (or whatever Section 1's real heading is) if that preamble
+    # contains a known noise trigger.
+    m = _REPORT_START_RE.search(text)
+    if m and m.start() > 0:
+        preamble = text[:m.start()]
+        if _HARNESS_NOISE_TRIGGER_RE.search(preamble):
+            print(f"    (stripped {len(preamble)} chars of harness preamble noise from Jupiter output)")
+            text = text[m.start():].strip()
+
+    # Fallback: line-level strip for noise that isn't a clean leading
+    # preamble (mid-report or trailing narration).
+    lines = text.split("\n")
+    kept = [ln for ln in lines if not _HARNESS_NOISE_TRIGGER_RE.search(ln)]
+    if len(kept) != len(lines):
+        print(f"    (stripped {len(lines) - len(kept)} additional harness noise line(s) from Jupiter output)")
+        text = "\n".join(kept).strip()
+
+    return text if text else original
+
 # ─── LLM Summary via Hermes CLI ───────────────────────────────────────────────
 def generate_summary(ticker: str, data: dict,
                      macro_backdrop: str = "",
@@ -628,9 +692,16 @@ FORMATTING — follow this exactly, every time, with no exceptions:
 
 ## 13. OVERALL VERDICT: WATCH / ACCUMULATE / AVOID
     2-3 sentence rationale focused on risk/reward asymmetry.
-    Include a one-line stop-loss thesis. Be stingy with the ACCUMULATE
+    Include a one-line stop-loss thesis — this is a price level and
+    reasoning for the thesis, not an order to execute. Frame it on a
+    WEEKLY-CLOSE basis (e.g. "reassess if the stock closes a full week
+    below $X"), never a daily-close or intraday trigger — this portfolio
+    is only reviewed once a week by this pipeline, so a daily-close
+    convention implies monitoring that isn't actually happening and can't
+    actually be acted on before the next weekly review anyway.
+    Be stingy with the ACCUMULATE
     verdict. Companies with bearish momentum and weak earnings or revenues,
-    or have huge litigation risk, should be rated "AVOID". Good companies 
+    or have huge litigation risk, should be rated "AVOID". Good companies
     that are seeing revenue and earnings weakness because of Macro economic
     or political issues, but otherwise offer a lot of upside should be rated WATCH.
 
@@ -653,7 +724,7 @@ DATA:
             ["jupiter", "-z", prompt, "--reasoning", "med"],   # Jupiter — default Hermes profile
             capture_output=True, text=True, timeout=600
         )
-        output = result.stdout.strip()
+        output = _strip_harness_noise(result.stdout.strip())
         if output:
             return output
         err = result.stderr.strip()

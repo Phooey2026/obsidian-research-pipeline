@@ -814,18 +814,49 @@ def get_earnings(ticker: str) -> str:
         lines.append(f"Next Earnings Date: {next_str}\n")
 
        # Quarterly EPS history
+        # Sept 2026: yfinance's Ticker.earnings_history has been going
+        # empty/None for a growing share of tickers (a Yahoo-side data
+        # change, not something this code controls) — matches Jansky's
+        # report of missing beat/miss coverage across whole sectors
+        # (all 8 Semis, all 8 Healthcare) rather than scattered individual
+        # tickers, which looks like a systemic source change rather than
+        # per-ticker noise. Added Ticker.get_earnings_dates() as a second
+        # attempt when the first returns nothing — it's yfinance's newer,
+        # still-maintained API for the same reported-vs-estimated EPS data,
+        # under different column names. NOT yet confirmed live (this
+        # sandbox has no network path to Yahoo Finance) — please verify
+        # against a couple of the previously-missing Semis/Healthcare
+        # tickers on the next run.
         try:
             hist = t.earnings_history
+            if hist is None or hist.empty:
+                try:
+                    hist = t.get_earnings_dates(limit=8)
+                    if hist is not None and not hist.empty:
+                        hist = hist.rename(columns={
+                            'Reported EPS': 'epsActual',
+                            'EPS Estimate': 'epsEstimate',
+                            'Surprise(%)':  'surprisePct',
+                        })
+                except Exception:
+                    hist = None
             if hist is not None and not hist.empty:
                 hist = hist.tail(8)
                 lines.append("\nQuarterly EPS (last 8 quarters):")
                 lines.append(f"  {'Quarter':<12} {'Actual':>8} {'Estimate':>10} {'Surprise':>10} {'Beat?':>6}")
                 lines.append("  " + "-" * 50)
-                for _, row in hist.iterrows():
-                    quarter = str(row.get('quarter', 'N/A'))
+                for idx, row in hist.iterrows():
+                    quarter = str(row.get('quarter', idx))
                     actual = row.get('epsActual')
                     estimate = row.get('epsEstimate')
+                    # get_earnings_dates() gives surprisePct (%), not the
+                    # raw EPS-dollar diff epsDifference gives — compute the
+                    # dollar surprise from actual/estimate when only the
+                    # percent form is available, so downstream formatting
+                    # (and the beat/miss sign) stays consistent either way.
                     surprise = row.get('epsDifference')
+                    if surprise is None and actual is not None and estimate is not None:
+                        surprise = actual - estimate
                     beat = "✓" if surprise and surprise > 0 else "✗"
                     act_str = f"${actual:>7.2f}" if actual is not None else "    N/A"
                     est_str = f"${estimate:>9.2f}" if estimate is not None else "       N/A"
@@ -949,12 +980,37 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
                          key=lambda x: x['end'], reverse=True)
 
         # Step 4: Get annual data helper
-        def get_annual(concept, unit):
-            items = facts.get(concept, {}).get('units', {}).get(unit, [])
+        # Fixed (Sept 2026): previously took a single concept tag with no
+        # duration check, so it silently accepted whatever the SEC returned
+        # under that tag — including years-old data. Two real bugs this
+        # caused, confirmed on BALL/DUK: many companies stopped populating
+        # the plain 'Revenues' tag after adopting ASC 606 (~2018) in favor
+        # of 'RevenueFromContractWithCustomerExcludingAssessedTax'; when the
+        # newer tag had no data for a ticker (a coverage gap, not the
+        # ticker's fault), the old sequential fallback chain landed on
+        # 'Revenues' and returned only its last populated years — 2012-2017
+        # for BALL/DUK — with nothing to signal it was stale. Fixed by (1)
+        # merging all known revenue tags together instead of an early-return
+        # fallback chain, so a gap in one tag doesn't hide real data sitting
+        # under another, and (2) applying the same 350-380 day duration
+        # guard get_quarterly() already uses, so a tag that mixes in
+        # five-year-selected-data-table entries or partial-year figures
+        # can't contaminate the "annual" series.
+        def get_annual(concepts, unit):
+            if isinstance(concepts, str):
+                concepts = [concepts]
             seen = {}
-            for x in items:
-                if x.get('form') in ('10-K', '10-K/A'):
+            for concept in concepts:
+                items = facts.get(concept, {}).get('units', {}).get(unit, [])
+                for x in items:
+                    if x.get('form') not in ('10-K', '10-K/A'):
+                        continue
                     try:
+                        start = datetime.strptime(x['start'], '%Y-%m-%d')
+                        end = datetime.strptime(x['end'], '%Y-%m-%d')
+                        days = (end - start).days
+                        if not (350 <= days <= 380):
+                            continue  # not a genuine full fiscal year
                         end_str = x['end'][:4]  # year
                         if end_str not in seen or \
                            x['accn'] > seen[end_str]['accn']:
@@ -989,6 +1045,60 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
         rev_by_date = {r['end']: r['val'] for r in rev_q}
         ni_by_date = {n['end']: n['val'] for n in ni_q}
 
+        # Step 7.5: Derive missing Q4 entries (Sept 2026 fix — this is what
+        # Jansky flagged on IBM as a "fiscal-vs-calendar quarter
+        # re-sequencing bug"). Root cause: 10-Q filings only ever cover
+        # fiscal Q1-Q3 — Q4 is never filed as its own 10-Q, it's folded
+        # into the 10-K's annual figures — so this table previously had NO
+        # Q4 row at all for any year. The displayed quarters were actually
+        # in correct order, but the visual effect (e.g. 2026-03-31 jumping
+        # straight to 2025-09-30, skipping 2025-12-31) looks exactly like a
+        # re-sequencing bug even though nothing was technically
+        # out-of-order. Fixed by deriving each year's Q4 as
+        # annual (10-K) minus the sum of its filed Q1+Q2+Q3 — the standard
+        # technique analysts use for this — for Revenue, Net Income, and
+        # diluted EPS, only when all three quarters and an annual figure
+        # are actually present. EPS derivation is an approximation (share
+        # count can shift quarter to quarter), so derived rows are marked
+        # "(derived)" rather than presented as directly reported.
+        rev_annual_for_q4 = get_annual(
+            ['RevenueFromContractWithCustomerExcludingAssessedTax',
+             'Revenues', 'SalesRevenueNet',
+             'RevenueFromContractWithCustomerIncludingAssessedTax'],
+            'USD')
+        ni_annual_for_q4  = get_annual('NetIncomeLoss', 'USD')
+        eps_annual_for_q4 = get_annual('EarningsPerShareDiluted', 'USD/shares')
+
+        def _q4_derive(quarterly_items, annual_items, year):
+            q123 = [it['val'] for it in quarterly_items
+                    if it['end'][:4] == year and it['end'][5:7] in ('03', '06', '09')]
+            if len(q123) != 3:
+                return None
+            annual_val = next((a['val'] for a in annual_items if a['end'][:4] == year), None)
+            if annual_val is None:
+                return None
+            return annual_val - sum(q123)
+
+        years_seen = sorted({q['end'][:4] for q in eps_q} | {r['end'][:4] for r in rev_q})
+        derived_q4 = []
+        for year in years_seen:
+            q4_end = f"{year}-12-31"
+            if q4_end in rev_by_date or any(q['end'] == q4_end for q in eps_q):
+                continue  # already have a real, filed Q4 entry — don't overwrite it
+
+            d_rev = _q4_derive(rev_q, rev_annual_for_q4, year)
+            d_ni  = _q4_derive(ni_q, ni_annual_for_q4, year)
+            d_eps = _q4_derive(eps_q, eps_annual_for_q4, year)
+
+            if d_rev is not None:
+                rev_by_date[q4_end] = d_rev
+            if d_ni is not None:
+                ni_by_date[q4_end] = d_ni
+            if d_eps is not None:
+                derived_q4.append({'end': q4_end, 'val': d_eps, 'derived': True})
+
+        eps_q = sorted(eps_q + derived_q4, key=lambda x: x['end'], reverse=True)
+
         # Step 8: Combined quarterly table
         lines.append(f"Quarterly Results (last {quarters} quarters from SEC filings):")
         lines.append(
@@ -1008,24 +1118,33 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             ni_str = f"${ni_val/1e9:.2f}B" \
                 if ni_val and not math.isnan(float(ni_val)) else "N/A"
             eps_str = f"${eps_val:.2f}" if eps_val is not None else "N/A"
+            tag = "  (derived Q4 = FY - Q1-Q3)" if q.get('derived') else ""
 
             lines.append(
-                f"  {end:<13} {rev_str:>10} {ni_str:>11} {eps_str:>12}")
+                f"  {end:<13} {rev_str:>10} {ni_str:>11} {eps_str:>12}{tag}")
             displayed += 1
 
         if displayed == 0:
             lines.append("  No quarterly EPS data found in SEC filings.")
 
-        # Step 9: Annual revenue trend
+        # Step 9: Annual revenue trend — merged across all known revenue
+        # tags (see get_annual() fix note above), not a sequential fallback
         rev_annual = get_annual(
-            'RevenueFromContractWithCustomerExcludingAssessedTax', 'USD')
-        if not rev_annual:
-            rev_annual = get_annual('Revenues', 'USD')
-        if not rev_annual:
-            rev_annual = get_annual('SalesRevenueNet', 'USD')
+            ['RevenueFromContractWithCustomerExcludingAssessedTax',
+             'Revenues',
+             'SalesRevenueNet',
+             'RevenueFromContractWithCustomerIncludingAssessedTax'],
+            'USD')
 
         if rev_annual:
             lines.append(f"\nAnnual Revenue (from 10-K filings):")
+            newest_year = int(rev_annual[0]['end'][:4])
+            if datetime.now().year - newest_year > 2:
+                lines.append(
+                    f"  ⚠ Most recent annual revenue on file is FY{newest_year} "
+                    f"({datetime.now().year - newest_year}yr+ old) — company may "
+                    f"report under a revenue XBRL tag not covered here; treat with caution."
+                )
             for r in rev_annual[:5]:
                 year = r['end'][:4]
                 val = r['val']
@@ -1610,6 +1729,21 @@ def get_analyst_ratings(ticker: str, recent_days: int = 60) -> str:
                     f"  Strong Sell: {strong_sell:>3} "
                     f"({'█' * min(strong_sell, 20)})")
                 lines.append(f"  Total:       {total:>3} analysts")
+                # Sept 2026: this total (from recommendations_summary, the
+                # buy/hold/sell panel) and num_analysts above (from
+                # numberOfAnalystOpinions, the price-target panel) are two
+                # separate Yahoo analyst panels that legitimately don't
+                # have to agree — flagged by Jansky as a mismatch in 5+
+                # tickers, but not itself a data bug. Making the
+                # discrepancy explicit here instead of presenting two
+                # unreconciled numbers with no explanation.
+                if num_analysts and total and num_analysts != total:
+                    lines.append(
+                        f"  (Note: differs from the {num_analysts} analysts "
+                        f"in the price-target panel above — Yahoo tracks "
+                        f"rating and price-target coverage as separate "
+                        f"analyst panels; this is expected, not a data error.)"
+                    )
         except Exception:
             pass
 

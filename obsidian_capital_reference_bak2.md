@@ -1,5 +1,5 @@
 # Obsidian Capital Research Pipeline — Reference Guide
-## As of June 22, 2026 — updated September 22, 2026
+## As of June 22, 2026 — updated August 30, 2026
 
 ---
 
@@ -225,7 +225,7 @@ Utilities (8):      PNW NEE SO DUK AEP SRE VST XEL
 Packaging (8):      IP PKG SW AMCR BALL CCK AVY REYN
 Casinos (8):        WYNN MGM LVS PENN FLUT GLPI BYD CZR
 Banks (9):          JPM BAC C WFC USB HBAN MTB CFG V
-Logistics (8):      FDX UPS JBHT EXPD CHRW LSTR GXO ODFL
+Logistics (8):      FDX UPS JBHT EXPD CHRW LSTR GXO OLDF
 Insurance (8):      MRSH CB PGR CI ELV ALL HUM MET
 Mining (8):         BHP RIO SCCO NEM FCX AEM VALE B
 Industrials (8):    CAT GE GEV RTX BA DE LMT HON
@@ -244,27 +244,11 @@ a payments network rather than a depository bank. SOUL.md files for
 Atlas, Mercury, Jupiter, and Jansky were all updated to say "128
 stocks, 16 sectors."
 
-**Also (August 2026): `ODFL` replaced `HUBG` in the Logistics sector.**
+**Also (August 2026): `OLDF` replaced `HUBG` in the Logistics sector.**
 Reason not explicitly confirmed, but HUBG's known issues at the time
 (Nasdaq deficiency, multi-year restatement, a pattern of repeated Form
 12b-25 late-filing notices — see Legal Risk Landscape section) are a
 plausible motivation. Treat as unconfirmed until stated directly.
-
-**Removing/swapping a ticker (Sept 2026) — `nova_supplemental.json` does
-NOT self-prune.** `research_*.json`/`rankings_*.json` rebuild fresh from
-`watchlist.json` every run, so a dropped ticker just stops appearing next
-week on its own — but `nova_supplemental.json` is a persistent,
-incrementally-updated cache that keeps a removed ticker's old
-earnings/legal records forever, which then keeps tripping Jansky's
-staleness pre-checks on a name the pipeline no longer even researches
-(this is exactly what happened to HUBG after the ODFL swap). New utility:
-**`prune_stale_tickers.py`** — run once, right after editing
-`watchlist.json`, to expunge any ticker no longer on the watchlist from
-`nova_supplemental.json`. See Script Reference below for full details.
-```bash
-python3 prune_stale_tickers.py            # dry run — shows what would be removed
-python3 prune_stale_tickers.py --apply    # actually writes the pruned file
-```
 
 Note: GOOGL removed (was duplicate of GOOG). Coverage: GOOG only.
 GOOGL is still a holdings position — Jupiter sees both via `HOLDINGS_ALIASES`
@@ -280,49 +264,15 @@ Ticker/sector counts are computed dynamically from `watchlist.json` throughout
 the pipeline — no hardcoded values remain in any script.
 
 ---
-
-### Quick Reference — Commands I Use Often
-
-```bash
-# Restart an MCP server after deploying a code change to its app{N}.py
-# (Python only loads the module into memory at process start — a code
-# change on disk does nothing until you restart the service.)
 systemctl --user restart mercurymcp
-systemctl --user restart webmcp
-systemctl --user restart macromcp
-systemctl --user restart novamcp
-# give it ~2s to finish starting before hitting it with a script
+---
 
-# SearXNG down or a tool coming back suspiciously empty — restart and retest
 docker restart searxng
 sleep 15
+
+# Then retest
 curl -s "http://localhost:8080/search?q=Apple+earnings+press+release&format=json" | \
 python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Results: {len(d.get(\"results\",[]))}')"
-
-# After editing watchlist.json (dropping/swapping a ticker) — expunge its
-# stale earnings/legal cache from nova_supplemental.json
-python3 prune_stale_tickers.py            # dry run first
-python3 prune_stale_tickers.py --apply
-
-# Force-refresh a ticker's Nova earnings record even though it reads "current"
-# (staleness check has no --force flag; reset call_date manually, then
-# also clear the no-data cooldown fields if the record is in one)
-python3 -c "
-import json
-d = json.load(open('nova_supplemental.json'))
-d['TICKER']['earnings']['call_date'] = '2000-01-01'
-d['TICKER']['earnings'].pop('last_search_attempted', None)
-d['TICKER']['earnings'].pop('last_search_result', None)
-json.dump(d, open('nova_supplemental.json', 'w'), indent=2)
-"
-python3 nova_earnings_call.py TICKER
-
-# Preview trade settlement before committing it for real
-python3 settle_portfolio.py --dry-run
-python3 settle_portfolio.py
-```
-
----
 
 ### Weekly Pipeline Run Order
 
@@ -373,14 +323,6 @@ Refresh the dashboard after any standalone repair or fragment update:
 ```bash
 bash rebuild_dashboard.sh
 ```
-
-**Not a weekly step — run only after editing `watchlist.json`:** if a
-ticker was dropped or swapped, run `python3 prune_stale_tickers.py --apply`
-once to remove its now-orphaned earnings/legal records from
-`nova_supplemental.json` (see Watchlist section and Script Reference
-below). Skipping this doesn't break anything immediately, but the
-removed ticker's stale data will keep tripping Jansky's staleness
-pre-checks indefinitely.
 
 **Note on step order:** legal (5) and earnings (6) run AFTER Jupiter
 (step 3) intentionally — `nova_legal.py`'s flagging depends on
@@ -623,48 +565,14 @@ generate_dashboard(data, date, macro_backdrop, macro_summary,
   instead of scanning the whole document for a bare keyword, with the
   old whole-text check kept only as a last-resort fallback if that
   specific line can't be found at all.
-- **Harness noise stripping added (Sept 22, 2026):** Hermes CLI
-  occasionally writes its own runtime/skill/memory-system status
-  narration to stdout ahead of the actual report body — confirmed via
-  real leaked text on 5 tickers in one run (PKG, CCK, REYN, AEP, XEL),
-  e.g. `"Memory consolidation is blocked this turn (harness halt — PKG
-  note will be saved next session). Skill loaded; its table format is
-  superseded by the 13-section output spec in this prompt. Delivering
-  the report now."` and `"Memory updated with the CCK stance. Here is
-  the full analyst report."` — both saved verbatim as the start of the
-  ticker's summary since `generate_summary()` previously trusted raw
-  stdout as-is. This is harness/skill-system behavior, not something
-  Jupiter's SOUL.md prompt controls (it already tells the model not to
-  call tools). New `_strip_harness_noise()` anchors on the real report's
-  structural start (`1. COMPANY OVERVIEW` — Section 1's fixed heading
-  per the 13-section format) rather than matching exact wording, and
-  drops anything noise-flagged ahead of it; a line-level fallback also
-  runs for noise that isn't a clean leading block. Tested against both
-  real leaked examples plus a clean report that legitimately discusses
-  "memory" in ordinary prose (to confirm no over-stripping) — all three
-  behave correctly. If a newly-observed noise phrase isn't caught, add
-  it to `_HARNESS_NOISE_TRIGGER_RE`.
-- **Section 13 stop-loss framing fixed (Sept 22, 2026):** the prompt told
-  Jupiter to "include a one-line stop-loss thesis" with no guidance on
-  what time convention to use. Flagged by Jansky on INTC — a stop
-  written as "$95 daily-close" implies monitoring that doesn't exist,
-  since this pipeline only reviews prices once a week; nothing would
-  ever act on a daily-close break before the next Sunday run anyway.
-  Added explicit instruction: frame the stop-loss thesis on a
-  **weekly-close** basis (e.g. "reassess if the stock closes a full week
-  below $X"), never daily-close or intraday. This is a written thesis in
-  the report, not an executed order — `settle_portfolio.py` has no
-  stop-loss logic of its own.
 - Outputs: `data/research_YYYYMMDD_HHMM.json`, `dashboard.html`
 
 **`sector_ranking.py`**
 - Reads research JSON + `watchlist.json` + `neptune_holdings.json` +
   `obsidian_config.json` + `jansky_trade_feedback.json`
 - Builds ~960-char briefs per ticker
-- **Pass A:** Calls `jupiter -z prompt` for sector ranking — verdicts are
-  no longer mechanically quota'd (see **Verdict ground-truth override**
-  below); ranking/scoring/commentary are the only things actually left
-  to the model now
+- **Pass A:** Calls `jupiter -z prompt` for forced-distribution ranking per sector
+  - Distribution: 1-2 ACCUMULATE, variable WATCH, 1-2 AVOID per sector
   - The originally-reported "Retail sector broken sort" issue (Aug 2026)
     was never independently root-caused before the much larger JSON
     corruption problem below was found and fixed (Sept 2026) — likely
@@ -740,43 +648,6 @@ saga; final state:
   `jansky_review.py` (see below) — **duplicated, not shared**, since
   these are independent top-level scripts with no shared library. Any
   future fix to this function needs to be applied in both places.
-
-**Verdict ground-truth override (Sept 2026)** — separate from the JSON
-reliability work above; this fixed a real desync Jansky's own executive
-briefing flagged (48% verdict/summary mismatch across sectors, 28
-dangerous-direction cases — e.g. a stock whose own analyst summary said
-AVOID ranked as ACCUMULATE). Root cause: `rank_sector()`'s prompt builder
-carried a hardcoded **"MANDATORY VERDICT DISTRIBUTION"** block that forced
-roughly 1-2 ACCUMULATE / N-3 WATCH / 1-2 AVOID on every ~8-stock sector
-regardless of what each ticker's own Jupiter summary actually concluded —
-so the ranking call was re-deriving (and frequently overriding) a verdict
-that had already been decided elsewhere, independently, by a different
-Jupiter call.
-- Added `extract_summary_verdict()` — regex-parses the ticker's own
-  summary for its stated `Overall Verdict:` line (ACCUMULATE/WATCH/AVOID)
-  and treats that as ground truth.
-- `build_brief()` now tags each per-ticker brief with
-  `[Analyst Verdict: {stated_verdict}]` pulled from that regex.
-- Removed the forced-distribution block entirely. `rank_sector()` now
-  takes a `verdict_map` (ticker → stated verdict) built in `main()`
-  alongside the briefs, and the prompt instructs the model: **"EACH
-  STOCK'S ANALYST VERDICT HAS ALREADY BEEN DECIDED — DO NOT CHANGE IT"** —
-  the model only ranks, scores, and writes commentary consistent with the
-  given verdict.
-- Added a hard post-processing override right before the ranking is
-  returned: any ticker with a known ground-truth verdict gets that
-  verdict force-set on the output regardless of what the LLM wrote (with
-  a console warning logged whenever an override actually fires); a
-  ticker with no stated verdict and an invalid LLM verdict defaults to
-  WATCH rather than being left malformed.
-- **Confirmed working live (9/21/26 run):** near-total WATCH distribution
-  across all 16 sectors (only AVGO/TXN/SW/DVN as ACCUMULATE, only
-  BYD/CHRW/BA as AVOID) with **zero override warnings printed** — meaning
-  the model's own output already matched ground truth every time this
-  run. Validated as correct behavior per Jupiter's "be stingy with
-  ACCUMULATE" prompt instruction and the macro stagflation backdrop, not
-  a bug — a dramatic change from the old mechanical 2/4/2-per-sector
-  split, which is exactly the point.
 
 **`repair_sector_ranking.py`**
 - Surgical repair tool for failed sector rankings (companion to repair_summaries.py)
@@ -959,36 +830,6 @@ Jupiter call.
   `last_search_attempted`/`last_search_result`, or the cooldown check
   will still skip it.
 
-**`prune_stale_tickers.py`** (new, Sept 2026)
-- Standalone maintenance utility — not part of the weekly run order, run
-  manually right after editing `watchlist.json` to drop or swap a ticker
-- Purpose: `nova_supplemental.json` is the one persistent,
-  incrementally-updated cache in the pipeline that doesn't self-prune
-  (unlike `research_*.json`/`rankings_*.json`, which rebuild fresh from
-  the current watchlist every run) — so a removed ticker's stale
-  earnings/legal records otherwise linger indefinitely and keep tripping
-  Jansky's staleness pre-checks on a name the pipeline no longer even
-  researches. This is exactly what happened to HUBG after the ODFL swap.
-- Flattens `watchlist.json`'s sectors into one set of active tickers,
-  diffs against `nova_supplemental.json`'s keys, and removes any record
-  whose ticker is no longer active
-- Dry-run by default (shows what would be removed, with company name and
-  which data types — earnings/legal — each stale entry has); `--apply`
-  required to actually write
-- Backs up `nova_supplemental.json` to
-  `backups/nova_supplemental_{YYYYMMDD_HHMM}_pre_prune.json` before any
-  destructive write (kept, not deleted, per convention)
-- Same atomic `.tmp` + `os.replace()` write pattern as `app3.py`'s own
-  `_save_nova_json()`
-- Usage:
-  ```bash
-  python3 prune_stale_tickers.py            # dry run
-  python3 prune_stale_tickers.py --apply    # actually remove stale records
-  ```
-- **Confirmed working live (9/21/26):** ran after the HUBG→ODFL
-  watchlist swap; found exactly 1 stale ticker (HUBG), backed up, removed
-  it, 128 active records remained.
-
 **`jansky_review.py`**
 - 21-pass weekly review of all agent outputs
 - Pass 1: Atlas macro review
@@ -1002,26 +843,6 @@ Jupiter call.
   - Enforces trade limits, position limits, cash floor from `obsidian_config.json`
   - Writes approved/rejected decisions to `jansky_trade_feedback.json`
   - Generates `fragments/trades_dashboard_fragment.html`
-  - **Stateless second-call context bug (Sept 2026, distinct from the
-    JSON reliability overhaul below)** — a real run rejected 34/34
-    pitched trades with **identical boilerplate rationale text on every
-    single ticker** ("Review data from the prior turn is not present in
-    this context..."). Root cause: `_call_jansky()` is a stateless
-    one-shot `subprocess.run(["jansky", "-z", prompt], ...)` call with
-    zero continuity between invocations — but the second (decisions-
-    JSON) call's prompt falsely opened with "You just reviewed {N} trade
-    pitches..." / "Base your decisions on the review you just
-    completed," even though that call has no access whatsoever to the
-    first call's `notes` output. Fixed by embedding the actual narrative
-    review text (`notes`) directly into the second prompt's body, with a
-    comment documenting the stateless-call root cause so it isn't
-    reintroduced. **Confirmed working live (9/21/26 run):** 24 approved /
-    3 rejected (CCK, MCD, DLR), each with genuinely distinct, specific
-    per-ticker rationale (e.g. AVGO: "Best long add of the week: 18.45x
-    forward vs 45.67x trailing, PEG 0.35..."). Cash-floor logic also
-    confirmed working correctly in the same run (warned that approving
-    all $10.9M of buy pitches would drop cash to 7.4%, below the 10%
-    floor, and selectively approved 24 of 27).
   - **JSON reliability overhaul (Sept 2026)** — this call was far more
     fragile than `sector_ranking.py`'s (only 2 parse attempts, no retry
     call, no salvage) before being brought up to the same standard:
@@ -1079,49 +900,7 @@ Jupiter call.
   "run nova_earnings_call.py HUBG" on a ticker that had already been
   checked that same week and had nothing new available (compounded by
   HUBG having since left the watchlist entirely — see Watchlist section
-  for the ODFL swap).
-- **Cooldown window mismatch fixed (Sept 22, 2026) — this is what was
-  actually behind Jansky's "run nova_earnings_call.py on 7 high-risk
-  names" recommendation, none of which were for lack of trying.** The
-  fix directly above used a flat 7-day window for *any* recent attempt,
-  but `nova_earnings_call.py`'s own no-data cooldown
-  (`NO_DATA_RETRY_DAYS`) is **30 days**, not 7 — so for a ticker Nova had
-  already checked 8-29 days ago and found nothing (still well within its
-  own freeze), Jansky kept recommending a re-run it knew would be a
-  no-op. `_earnings_recently_attempted()` now checks
-  `last_search_result == "no_new_data_found"` specifically and applies
-  the matching 30-day window (`NOVA_NO_DATA_RETRY_DAYS`, kept in sync
-  with `nova_earnings_call.py`'s constant by comment) in that case,
-  falling back to the original flat 7-day window otherwise.
-- **`_check_stale_language()` self-confirming false positive fixed (Sept
-  22, 2026)** — the root cause feeding the cooldown-mismatch symptom
-  above. Five of the ten `STALE_LANGUAGE` trigger phrases ("pre-dates",
-  "ignored", "superseded", "discard", "not used") were *also* listed in
-  `DATA_QUALITY_CONTEXT`, the list meant to confirm a genuine flag. Since
-  a phrase always sits inside its own 120-char context window, each of
-  these five self-confirmed on sight regardless of meaning — Jupiter
-  correctly writing "this item pre-dates the filing and was ignored per
-  protocol" (explicitly saying old data was properly excluded)
-  self-flagged exactly as hard as genuinely live stale data would have.
-  Confirmed false positives in five sectors while genuine staleness
-  passed clean, making the flag pure noise and polluting the sector
-  notes text Jansky's synthesis pass reads when writing its "PIPELINE
-  RECOMMENDATIONS." Fixed by moving those five words to a new
-  `EXCLUSION_CONTEXT` list that now suppresses a match instead of
-  confirming one.
-- **`NOVA_FLAG_DATA:` casing bug fixed (Sept 22, 2026)** — the regex
-  matching this label was case-sensitive; a casing variant on JBHT's
-  label (e.g. `Nova_Flag_Data:` instead of `NOVA_FLAG_DATA:`) silently
-  broke the match with no error, dropping the ticker's flag entirely and
-  breaking Section 9 parsing for it. Added `re.IGNORECASE`.
-- **Known reliability gap in Jansky's own "PIPELINE RECOMMENDATIONS"
-  synthesis (Sept 22, 2026, not fixed — nothing to fix in code):**
-  confirmed Jansky recommended running a script that doesn't exist
-  (`nova_legal_refresh.py` — the real script is `nova_legal.py`) in a
-  real weekly briefing. This is the LLM synthesis pass hallucinating a
-  plausible-sounding filename, not a parsing or data bug — worth a
-  skeptical read on any script name Jansky's recommendations section
-  names before running it verbatim.
+  for the OLDF swap).
 - Outputs: `data/jansky_YYYYMMDD_HHMM.json`, `jansky_latest.json`,
   `fragments/jansky_dashboard_fragment.html`,
   `fragments/trades_dashboard_fragment.html`,
@@ -1161,61 +940,6 @@ Jupiter call.
 ---
 
 ### MCP Server Details
-
-**`mcp/app.py` (webmcp) — `get_sec_earnings()` fixes (Sept 22, 2026):**
-- **Annual-revenue tag fallback bug fixed (BALL, DUK)** — `get_annual()`
-  had no period-duration check and tried revenue XBRL tags in a
-  sequential fallback chain (stop at the first tag with *any* data).
-  Many companies stopped populating the plain `Revenues` tag after
-  adopting ASC 606 (~2018) in favor of
-  `RevenueFromContractWithCustomerExcludingAssessedTax`; when the modern
-  tag had no data for a ticker (a coverage gap), the fallback chain
-  landed on the old `Revenues` tag and silently returned only its last
-  populated years — 2012-2017 for BALL/DUK — with nothing to flag it as
-  stale. Fixed by (1) merging all known revenue tags together instead of
-  an early-return chain, so a gap in one tag can't hide real data under
-  another, and (2) applying the same 350-380 day duration guard
-  `get_quarterly()` already used, rejecting any entry that isn't a
-  genuine full fiscal year (blocks five-year-selected-data-table
-  entries and partial-year figures from contaminating the series). Also
-  added a console warning line when the newest annual figure on file is
-  still more than 2 years old, so a similar gap is visible immediately
-  instead of silently passing as current.
-- **Missing-Q4 "re-sequencing" bug fixed (IBM)** — flagged by Jansky as
-  a "fiscal-vs-calendar quarter re-sequencing bug." Root cause: 10-Q
-  filings only ever cover fiscal Q1-Q3 — Q4 is never filed as its own
-  10-Q, it's folded into the 10-K's annual figures — so the quarterly
-  table structurally never had a Q4 row for *any* ticker. The displayed
-  quarters were technically still in correct order, but skipping
-  straight from Q1 to the prior year's Q3 (no `2025-12-31` row at all)
-  looks exactly like re-sequencing. Confirmed via IBM's actual table
-  output (`2026-03-31` → `2025-09-30`, no `2025-12-31`). Fixed by
-  deriving each year's Q4 as `annual (10-K) − (Q1+Q2+Q3)` — the standard
-  analyst technique — for Revenue, Net Income, and diluted EPS, only
-  when all three quarters and an annual figure are actually present.
-  EPS derivation is an approximation (share count can shift
-  quarter to quarter), so derived rows are tagged
-  `(derived Q4 = FY - Q1-Q3)` rather than presented as directly
-  reported. Sanity-checked against IBM's real 2025 numbers: derives Q4
-  revenue of $19.68B, consistent with IBM's seasonally strongest
-  quarter.
-- **Beat/miss quarterly-EPS fallback added** — `Ticker.earnings_history`
-  (yfinance) has been returning empty for a growing share of tickers (a
-  Yahoo-side data change), matching Jansky's report of beat/miss data
-  missing across whole sectors (all 8 Semis, all 8 Healthcare) rather
-  than scattered per-ticker gaps. Added `Ticker.get_earnings_dates()` as
-  a second attempt when the first returns nothing, mapping its
-  differently-named columns onto the existing fields. **Not yet
-  confirmed live** — added as a defensible mitigation for a
-  well-documented yfinance API deprecation, but needs verification
-  against a couple of the previously-missing tickers on the next run.
-- **Analyst-count "mismatch" explained, not a bug** — `numberOfAnalystOpinions`
-  (price-target panel) and the `recommendations_summary` buy/hold/sell
-  total (rating panel) are two separate Yahoo analyst panels that don't
-  have to agree — flagged by Jansky as a mismatch in 5+ tickers, but
-  legitimate Yahoo data structure, not a fetch error. Added an inline
-  note explaining the discrepancy instead of presenting two unreconciled
-  numbers with no explanation.
 
 **`mcp/app2.py` (macromcp) — new `get_fed_communications` tool (Aug 2026):**
 - Searches FOMC statements, Fed official speeches, and major Fed events
@@ -1333,70 +1057,12 @@ Jupiter call.
   exists in four separate places across the codebase; any future
   addition needs to touch all four or risks the same silent gap — worth
   consolidating to a single source of truth eventually, not attempted here.
-- **`build_mercury_backdrop()` WTI/natgas/corn/BDI yaml-vs-prose desync
-  fixed (Sept 2026)** — Jansky's executive briefing flagged
-  `mercury_backdrop.yaml`'s structured fields disagreeing with Mercury's
-  own prose CCC summary for the same week. Root cause: the YAML builder
-  independently re-fetched WTI (FRED `DCOILWTICO`), natgas (FRED
-  `DHHNGSP`), and corn (FRED `PMAIZMTUSDM`, monthly $/mt) via their own
-  private code paths — different sources/units/timing than the
-  already-working `get_energy_prices()` (EIA `RWTC`), `get_agricultural_prices()`
-  (yfinance `ZC=F`, $/bu), and `get_baltic_dry()` (SearXNG) used for the
-  prose. Fixed by having `build_mercury_backdrop()` call those same
-  tools and regex-parse their already-fetched, human-readable text output
-  (new helper `_extract_metric_and_change()`) instead of re-fetching
-  independently — one source of truth feeding both outputs. Soy/wheat
-  deliberately left on the old FRED-only path for now (same latent
-  desync-risk class, but not reported this week — explicitly scoped out).
-  - **Shipped with a bug, fixed same day:** `_extract_metric_and_change()`
-    used `re.search()` without importing `re` (the deleted BDI block had
-    its own scoped `import re as _re` that didn't cover the new helper) —
-    crashed every call with `name 're' is not defined`, visible as a
-    literal error string written into `mercury_backdrop.yaml`. Fixed by
-    adding `import re` inside the helper.
-  - **Corn field relabeling:** the new corn value is $/bu (yfinance), not
-    $/mt (the old FRED field it replaced) — yaml key renamed from
-    `corn_usd_mt`/`corn_yoy_pct` to `corn_price` (unit included inline,
-    e.g. "5.43 $/bu") and `corn_trend_pct` / `corn_trend_window` (labels
-    which source — 1mo yfinance vs. YoY FRED fallback — the trend % came
-    from).
-  - **BDI extraction bug found and fixed:** `get_baltic_dry()`'s regex
-    picked up a Wikipedia snippet's "1,000" (the index's 1985 base value)
-    instead of a second search result's real current reading ("3,399"),
-    producing a nonsensical `bdi_level: 1,000` in the yaml. Widened the
-    matching patterns and added an old-date rejection check (skips a
-    candidate whose nearby date is more than 2 years old) so a
-    historical/reference value can't win over the actual current one.
-  - **Confirmed working live (9/21/26 run):** `wti_crude_usd: 99.08`,
-    `natgas_henry_hub: 2.790`, `corn_price: 5.43 $/bu`,
-    `corn_trend_window: 1mo (yfinance)`, `bdi_level: 3,399` — all now
-    matching the prose summary for the same week. `bdi_stance`/
-    `bdi_4week_change_pct` still show `Unknown`/`N/A` since the SearXNG
-    BDI path only returns a current snapshot, not a series to compute a
-    trend from — left as a known, low-priority limitation, not part of
-    this fix.
 - **Deploy-timing note:** during testing, an initial "clean" test run
   turned out to be using an `app4.py` that had the agriculture/livestock
   fixes but predated the FBTC/IBIT fix — a stale file copy, not a code
   bug, but a reminder to confirm the deployed file's content
   (`grep` for a known-new string) rather than assume a restart alone
   guarantees the latest code is running.
-- **`get_energy_prices()` RBOB/Heating Oil 404s fixed (Sept 22, 2026)** —
-  these two EIA routes had extra invalid path segments
-  (`/petroleum/pri/gnd/dcus/nus/w/data/`) appended after the route
-  category; every other route in this function (spt, fut) follows the
-  clean `<category>/data/` pattern with series selection done entirely
-  via `facets[series][]`, and these two were the only ones not following
-  it. That's what was producing the confirmed 404s — series selection
-  itself was already correct. Fixed by dropping the extra segments.
-- **Gold/Copper ratio 0.00 fixed (Sept 22, 2026)** — the ratio calc
-  assumed `copp_price` (from FRED's `PCOPPUSDM`) was already in USD/lb
-  and did `copp_price * 100` as a stand-in unit conversion. `PCOPPUSDM`
-  is actually USD per **metric ton** (roughly 9,000-10,000) — dividing a
-  ~$3,000 gold price by ~900,000-1,000,000 produced a ratio that rounded
-  to 0.00 every single time, exactly the self-flagged bug from an Aug
-  2026 Mercury report. Fixed to properly convert metric tons to pounds
-  (1 mt = 2204.62 lb) before computing the ratio.
 - Tool count: 16 total
 
 ---
@@ -1722,11 +1388,9 @@ CRITICAL (1): HUBG — Nasdaq deficiency + multi-year restatement +
               late-filing notices — 3 filed in 2026 alone, March/May/Aug —
               meaning HUBG genuinely hadn't reported a complete quarter
               since Feb 2025 as of late Aug 2026. NOTE: HUBG has since
-              been replaced by ODFL on the active watchlist — see
+              been replaced by OLDF on the active watchlist — see
               Watchlist section above. Retained here as historical
-              context; HUBG is no longer actively tracked, and its
-              lingering earnings/legal records were expunged from
-              nova_supplemental.json via prune_stale_tickers.py in Sept 2026.)
+              context; HUBG is no longer actively tracked.)
 
 HIGH (8):     B     — Ontario class action certified, $3-7B exposure
               NEE   — Louisiana coastal litigation + FERC proceedings
@@ -1796,9 +1460,10 @@ re-verified — treat as historical unless refreshed.
   — expected limitation. Foreign filers ARE correctly handled for legal
   research (20-F path confirmed working, Aug 2026) — this XBRL-revenue
   gap is separate and still present.
-- ~~**RBOB Gasoline / Heating Oil** — EIA v2 route still unreliable~~ —
-  **fixed Sept 22, 2026**, see Resolved Issues below. FRED fallback
-  (GASREGCOVW / DHOILNYH) remains in place as a safety net either way.
+- **RBOB Gasoline / Heating Oil** — EIA v2 route still unreliable; FRED
+  fallback active (GASREGCOVW / DHOILNYH). Also seen returning a 404 in
+  a Mercury report Aug 2026 — not yet investigated whether this is the
+  same known EIA-route issue or something new.
 - **BoJ/BoC FRED rates** — BIS-sourced IR3TIB01 series lag ~1 quarter;
   BoJ shows 0.30% (actual differs), BoC shows stale values.
   Not a pipeline error — FRED data lag.
@@ -1810,14 +1475,13 @@ re-verified — treat as historical unless refreshed.
   self-narration root cause as the broader Sept 2026 JSON corruption
   work — the salvage system should now catch this too, not yet
   specifically re-confirmed against this exact symptom.
-- ~~**`Gold/Copper ratio` returning `0.00`**~~ — **fixed Sept 22, 2026**,
-  see Resolved Issues below (was a metric-ton vs. pound unit bug, not a
-  missing-data issue). (Note: the paired complaint in the same report,
-  "Live Cattle NASS quote data error," is a `400 Bad Request` from the
-  USDA NASS API, confirmed still present in the *retail/supplementary*
-  NASS block, separate from and unaffected by the CME-futures section
-  added above it — that one's a credential/API issue, not something
-  fixable in code; still open.)
+- **`Gold/Copper ratio` returning `0.00`** — self-flagged in an Aug 2026
+  Mercury report; not yet investigated. (Note: the paired complaint in
+  the same report, "Live Cattle NASS quote data error," was
+  investigated as part of the livestock futures fix below — it's a
+  `400 Bad Request` from the USDA NASS API, confirmed still present in
+  the *retail/supplementary* NASS block, separate from and unaffected by
+  the new CME-futures section added above it. Not yet fixed.)
 - **Metals staleness** — worth a fresh check; the original "agriculture/
   livestock/metals staleness" complaint turned out (on investigation) to
   be genuinely about agriculture and livestock specifically — both now
@@ -1908,104 +1572,6 @@ re-verified — treat as historical unless refreshed.
   Jansky evaluates earnings staleness, that suppresses the flag when a
   genuine recent search attempt exists — regardless of whether it found
   anything new.
-- ✅ **Sector-ranking verdict/summary desync (mandatory quota bug)** —
-  `sector_ranking.py`'s ranking prompt forced a mechanical
-  1-2 ACCUMULATE / N-3 WATCH / 1-2 AVOID split on every sector regardless
-  of what each ticker's own Jupiter summary actually concluded (48%
-  mismatch rate per Jansky's executive briefing, 28 dangerous-direction
-  cases). Fixed by extracting each ticker's stated verdict from its own
-  summary as ground truth, instructing the model the verdict is already
-  decided, and hard-overriding the LLM's output verdict with the stated
-  one as a final safety net. See `sector_ranking.py` → Verdict
-  ground-truth override above for the full writeup.
-- ✅ **Mercury backdrop yaml disagreeing with Mercury's own prose summary
-  for WTI, natgas, corn, and BDI** — `build_mercury_backdrop()` was
-  independently re-fetching each of these from different sources/units
-  than the tools used for the prose summary. Fixed by having the backdrop
-  builder parse the same already-fetched tool output instead of
-  re-fetching independently. Also fixed, discovered in the process: a
-  missing `import re` that crashed the call outright, a mislabeled corn
-  unit ($/mt label on a $/bu value), and a BDI extraction bug that picked
-  a historical reference value over the real current one. See
-  `mcp/app4.py` above for the full writeup.
-- ✅ **Jansky rejecting 100% of pitched trades (34/34) with identical
-  boilerplate rationale** — traced to `jansky_review.py`'s trade-review
-  Pass 21 second (JSON decisions) call falsely assuming conversational
-  continuity with the first (narrative review) call, when `_call_jansky()`
-  is actually a fresh stateless subprocess call every time. Fixed by
-  embedding the actual review text into the second prompt. See
-  `jansky_review.py` → Stateless second-call context bug above.
-- ✅ **Stale ticker data lingering after a watchlist swap (HUBG → ODFL)**
-  — `nova_supplemental.json` doesn't self-prune when a ticker leaves
-  `watchlist.json`, unlike the research/rankings files, which keeps
-  tripping staleness checks on a name that's no longer researched. New
-  `prune_stale_tickers.py` utility added as a repeatable fix for this
-  going forward — see Script Reference above.
-
-### Resolved Issues (September 22, 2026 — Jansky's 10-item action list)
-
-Jay had Jansky produce a numbered "PIPELINE RECOMMENDATIONS" action list
-in its weekly executive briefing; working through all 10 items surfaced
-six more real bugs, two prompt-design gaps, and confirmed one item
-(`nova_legal_refresh.py`) doesn't exist — Jansky hallucinated the
-filename (the real script is `nova_legal.py`).
-
-- ✅ **Jansky recommending earnings reruns on tickers already in Nova's
-  30-day no-data cooldown** — `_earnings_recently_attempted()` used a
-  flat 7-day window regardless of outcome, shorter than
-  `nova_earnings_call.py`'s real 30-day `NO_DATA_RETRY_DAYS` cooldown.
-  Fixed to check `last_search_result == "no_new_data_found"` and apply
-  the matching 30-day window in that case. See `jansky_review.py` above.
-- ✅ **`_check_stale_language()` self-confirming false positive** — the
-  direct root cause of the item above: five of ten `STALE_LANGUAGE`
-  phrases were also in the list meant to *confirm* a genuine flag, so
-  Jupiter correctly explaining old data was excluded/handled
-  self-flagged as if it were live staleness. Confirmed false positives
-  in five sectors. Fixed by moving those five words to a new
-  suppression list. See `jansky_review.py` above.
-- ✅ **`NOVA_FLAG_DATA:` casing bug (JBHT)** — case-sensitive regex
-  silently dropped the flag on a casing variant, breaking Section 9
-  parsing for that ticker. Added `re.IGNORECASE`.
-- ✅ **Hermes CLI runtime/memory-system narration leaking into Jupiter
-  reports** (PKG, CCK, REYN, AEP, XEL) — confirmed via real leaked text;
-  new `_strip_harness_noise()` anchors on the report's structural start
-  rather than exact wording. See `weekly_research.py` above.
-- ✅ **Stop-loss thesis framed on a daily-close convention for a
-  weekly-monitored portfolio (INTC)** — added explicit
-  weekly-close-only framing instruction to Section 13's prompt. This is
-  a written thesis in the report, not an executed order.
-- ✅ **SEC annual-revenue feed returning 2012-2017 data (BALL, DUK)** —
-  `get_annual()`'s sequential tag-fallback chain landed on a
-  pre-ASC-606 tag with no recency check. Fixed by merging all revenue
-  tags plus a genuine full-year duration guard. See `mcp/app.py` above.
-- ✅ **"Fiscal-vs-calendar quarter re-sequencing" (IBM)** — actually a
-  structurally missing Q4 in every ticker's quarterly table (10-Qs never
-  cover Q4). Fixed by deriving Q4 as annual minus Q1-Q3, tagged as
-  derived. See `mcp/app.py` above.
-- ✅ **RBOB Gasoline / Heating Oil EIA 404s** — extra invalid path
-  segments in the route URL; every other route in the function used a
-  clean pattern. See `mcp/app4.py` above.
-- ✅ **Gold/Copper ratio returning 0.00** — copper price is USD/metric
-  ton, code assumed USD/lb; fixed the unit conversion. See `mcp/app4.py`
-  above.
-- ⚠️ **Beat/miss EPS table missing across whole sectors (Semis,
-  Healthcare)** — added a `get_earnings_dates()` fallback for
-  yfinance's increasingly-empty `earnings_history`. **Not yet confirmed
-  live** — verify against a previously-missing ticker.
-- ℹ️ **Analyst-count "mismatch" in 5+ tickers** — not a bug; Yahoo's
-  price-target panel and rating panel are separate analyst counts that
-  don't have to agree. Added an explanatory note instead of two
-  unreconciled numbers.
-- ℹ️ **JPM legal-record "injection failure"** — inspected the actual
-  JPM record Jay provided (current as of 2026-09-21) against
-  `_build_nova_preamble()`'s logic; the injection code looks correct for
-  a record shaped like this. Likely just a stale/missing record at the
-  time that week's report ran, since refreshed — **not independently
-  confirmed as a code bug**; revisit if it recurs on a fresh run.
-- ℹ️ **V's earnings call "Q1 mislabeled Q2"** — likely not a bug. Visa's
-  fiscal year ends September 30, so a call covering Jan-Mar legitimately
-  *is* fiscal Q2 on Visa's own calendar. Not independently reconfirmed
-  against Visa's actual source release.
 
 ---
 
