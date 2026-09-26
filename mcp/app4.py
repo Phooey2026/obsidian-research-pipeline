@@ -260,7 +260,20 @@ async def get_central_bank_rates() -> str:
     lines = ["=== CENTRAL BANK POLICY RATES ===\n"]
 
     cb_series = [
-        ("Federal Reserve (USD)",          "FEDFUNDS",    "m"),
+        # Fed row uses DFF (daily effective rate), not FEDFUNDS (monthly
+        # average), unlike every other central bank below. FEDFUNDS is a
+        # finalized calendar-month average that FRED doesn't publish until
+        # early the following month, so right after an FOMC move it still
+        # reports last month's pre-hike level for weeks. That's exactly
+        # what produced the Sept 2026 cross-agent split Jansky flagged:
+        # Atlas's get_interest_rates()/build_macro_backdrop() both read
+        # DFEDTARU/DFEDTARL (current target range, 3.75-4.00% post
+        # 9/17 hike) while this tool was reporting FEDFUNDS's stale
+        # pre-hike monthly average (3.63-3.88% area) for the same week.
+        # DFF is FRED's daily effective-rate series — same source family
+        # Atlas already uses, updates same-day, and needs no change to
+        # this function's single-value-per-row shape.
+        ("Federal Reserve (USD)",          "DFF",         ""),
         ("European Central Bank (EUR)",    "ECBDFR",      "m"),
         ("Bank of Japan (JPY)",            "IRSTCB01JPM156N", "m"),
         ("Bank of England (GBP)",          "IR3TIB01GBM156N", "m"),  # IR3TIB01 series — BIS-sourced, lags ~1 quarter; BoJ/BoC may show stale values
@@ -643,8 +656,16 @@ async def get_energy_prices() -> str:
             ("WTI Crude Oil ($/bbl)",          f"{EIA_BASE}/petroleum/pri/spt/data/",           "RWTC"),
             ("Brent Crude Oil ($/bbl)",         f"{EIA_BASE}/petroleum/pri/spt/data/",           "RBRTE"),
             ("Henry Hub Nat Gas ($/MMBtu)",     f"{EIA_BASE}/natural-gas/pri/fut/data/",          "RNGWHHD"),
-            ("RBOB Gasoline ($/gal)",           f"{EIA_BASE}/petroleum/pri/gnd/dcus/nus/w/data/","EMM_EPMRU_PTE_NUS_DPG"),
-            ("Heating Oil No.2 ($/gal)",        f"{EIA_BASE}/petroleum/pri/gnd/dcus/nus/w/data/","EMM_EPD2F_PTE_NUS_DPG"),
+            # Sept 2026 fix: these two previously appended extra path
+            # segments (`/dcus/nus/w/`) after the route category, which
+            # aren't valid in the EIA v2 route structure — every other
+            # route here (spt, fut) is just "<category>/data/" with the
+            # specific series picked via facets[series][], and these two
+            # were the only ones not following that pattern. That's what
+            # was producing the confirmed 404s; series selection already
+            # happens correctly via the facets[series][] param below.
+            ("RBOB Gasoline ($/gal)",           f"{EIA_BASE}/petroleum/pri/gnd/data/",           "EMM_EPMRU_PTE_NUS_DPG"),
+            ("Heating Oil No.2 ($/gal)",        f"{EIA_BASE}/petroleum/pri/gnd/data/",           "EMM_EPD2F_PTE_NUS_DPG"),
         ]
         async with httpx.AsyncClient(timeout=30) as client:
             for label, route, series_id in eia_routes:
@@ -888,9 +909,16 @@ async def get_metals_prices() -> str:
             lines.append("  ✓ Low ratio (<50) — risk-on / silver outperforming")
 
     if gold_price and copp_price:
-        # Copper in USD/lb → convert gold to per-lb equivalent for ratio
-        # Standard: gold oz / copper lb — rising = risk-off
-        gc_ratio = gold_price / (copp_price * 100)  # normalize
+        # Sept 2026 fix: this previously divided by (copp_price * 100)
+        # assuming copp_price was already USD/lb — but the FRED series
+        # feeding it (PCOPPUSDM, labeled "Copper (USD/mt)" a few lines up)
+        # is USD per METRIC TON, roughly 9,000-10,000. Dividing a ~$3,000
+        # gold price by ~900,000-1,000,000 produces a ratio that rounds to
+        # 0.00 every single time — exactly the self-flagged bug. Standard
+        # gold-oz/copper-lb ratio needs copper actually converted to
+        # USD/lb first (1 metric ton = 2204.62 lb).
+        copper_usd_per_lb = copp_price / 2204.62
+        gc_ratio = gold_price / copper_usd_per_lb
         lines.append(f"Gold/Copper Ratio:    {gc_ratio:.2f}  (rising = risk-off)")
 
     # ── Gold ETF (IAU) via yfinance ────────────────────────────────────────

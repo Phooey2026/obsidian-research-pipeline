@@ -668,7 +668,7 @@ def main():
     if action_items:
         print(f"\n  Action Items ({len(action_items)}):")
         for item in action_items[:10]:
-            print(f"    ⚠ {item[:70]}")
+            print(f"    ⚠ {item}")
 
     print(f"\n{'═'*52}\n")
 

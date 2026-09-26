@@ -349,7 +349,7 @@ python3 repair_summaries.py
 python3 repair_summaries.py --refetch CVS TGT AMZN
 
 # 5. Legal research for flagged companies (Nova)
-python3 nova_legal.py HUBG BA LOW
+python3 nova_legal.py 
 
 # 6. Earnings call research refresh (Nova)
 python3 nova_earnings_call.py --stale-only

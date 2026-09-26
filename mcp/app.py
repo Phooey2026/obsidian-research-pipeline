@@ -576,7 +576,8 @@ def get_technicals(ticker: str) -> str:
     try:
         import yfinance as yf
 
-        hist = yf.Ticker(ticker.upper()).history(period="1y")[["Close", "High"]]
+        t = yf.Ticker(ticker.upper())
+        hist = t.history(period="1y")[["Close", "High"]]
         if hist.empty or len(hist) < 20:
             return f"Insufficient price history for {ticker}."
 
@@ -638,13 +639,28 @@ def get_technicals(ticker: str) -> str:
         else:
             rsi_interp = "OVERBOUGHT — caution"
 
-        # 52W drawdown from high — uses intraday High (not Close), matching
-        # Yahoo's own fiftyTwoWeekHigh convention (highest price ever
-        # touched, not highest closing price). Using Close-only here
-        # previously produced a systematic $1-10 gap against stock_info's
-        # figure, since a closing-price high can never exceed the true
-        # intraday high.
-        high_52w = max(highs[-252:]) if len(highs) >= 252 else max(highs)
+        # 52W high — prefer Yahoo's own fiftyTwoWeekHigh field (same field
+        # get_stock_info reports) over recomputing from history(). The
+        # High-vs-Close fix below still matters for the fallback path, but
+        # it wasn't the whole story: yf.Ticker.history() defaults to
+        # auto_adjust=True, which back-adjusts historical prices for every
+        # dividend paid since — lowering computed past highs for any
+        # dividend-paying name, while info['fiftyTwoWeekHigh'] reports the
+        # actual raw traded price. That's a systematic gap sized to
+        # dividend yield, which is exactly why Jansky saw this conflict
+        # cluster in Utilities, Healthcare, and Packaging (income-oriented
+        # sectors) rather than low/no-dividend growth names, even after the
+        # earlier Close→High fix. Falls back to the computed value (still
+        # uses intraday High, not Close, matching Yahoo's own convention)
+        # only if the live field is unavailable.
+        try:
+            info_52w = t.info.get('fiftyTwoWeekHigh')
+        except Exception:
+            info_52w = None
+        if info_52w:
+            high_52w = info_52w
+        else:
+            high_52w = max(highs[-252:]) if len(highs) >= 252 else max(highs)
         drawdown = (current - high_52w) / high_52w * 100
 
         lines = [f"=== {ticker.upper()} Technical Indicators ===\n"]
@@ -1038,6 +1054,39 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
         if not rev_q:
             rev_q = get_quarterly('RevenueFromContractWithCustomerIncludingAssessedTax', 'USD')
 
+        # Bank/thrift revenue override (Sept 2026 fix — confirmed on HBAN,
+        # MTB, CFG). ASC 606 "contract with customer" revenue explicitly
+        # EXCLUDES interest income (a different accounting standard governs
+        # it), so for an interest-income-driven filer, every tag tried
+        # above can only ever capture noninterest fee income — a real but
+        # structurally partial slice, not total revenue (confirmed on HBAN:
+        # RevenueFromContractWithCustomerExcludingAssessedTax = $1.56B fee
+        # income vs. real total revenue of ~$8B+). The standard analyst
+        # definition of bank revenue is net interest income + noninterest
+        # income (confirmed against CFG, where NII + NoninterestIncome =
+        # $8.24B matches CFG's own current Revenues tag of $8.25B almost
+        # exactly). Detected generically, no ticker/sector hardcoding:
+        # NoninterestIncome is a bank/thrift-specific tag that an ordinary
+        # commercial filer never populates, so requiring BOTH tags present
+        # can't misfire on a non-bank. Overrides per-period only where both
+        # exist; periods without bank-style data keep whatever the ASC-606
+        # chain above found.
+        def _bank_revenue(quarterly: bool) -> list[dict]:
+            fn = get_quarterly if quarterly else get_annual
+            nii = fn('InterestIncomeExpenseNet', 'USD')
+            noninterest = fn('NoninterestIncome', 'USD')
+            if not (nii and noninterest):
+                return []
+            nii_by = {x['end']: x['val'] for x in nii}
+            ni_by = {x['end']: x['val'] for x in noninterest}
+            return [{'end': end, 'val': nii_by[end] + ni_by[end]}
+                    for end in sorted(set(nii_by) & set(ni_by), reverse=True)]
+
+        bank_rev_q = _bank_revenue(quarterly=True)
+        if bank_rev_q:
+            bank_ends = {r['end'] for r in bank_rev_q}
+            rev_q = bank_rev_q + [r for r in rev_q if r['end'] not in bank_ends]
+
         # Step 7: Quarterly Net Income
         ni_q = get_quarterly('NetIncomeLoss', 'USD')
 
@@ -1066,6 +1115,11 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
              'Revenues', 'SalesRevenueNet',
              'RevenueFromContractWithCustomerIncludingAssessedTax'],
             'USD')
+        bank_rev_annual = _bank_revenue(quarterly=False)
+        if bank_rev_annual:
+            bank_ends_a = {r['end'] for r in bank_rev_annual}
+            rev_annual_for_q4 = bank_rev_annual + [
+                r for r in rev_annual_for_q4 if r['end'] not in bank_ends_a]
         ni_annual_for_q4  = get_annual('NetIncomeLoss', 'USD')
         eps_annual_for_q4 = get_annual('EarningsPerShareDiluted', 'USD/shares')
 
@@ -1135,9 +1189,22 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
              'SalesRevenueNet',
              'RevenueFromContractWithCustomerIncludingAssessedTax'],
             'USD')
+        # Bank/thrift override — see the _bank_revenue() note above.
+        if bank_rev_annual:
+            bank_ends_disp = {r['end'] for r in bank_rev_annual}
+            rev_annual = sorted(
+                bank_rev_annual + [r for r in rev_annual if r['end'] not in bank_ends_disp],
+                key=lambda x: x['end'], reverse=True)
+            lines_note_bank = True
+        else:
+            lines_note_bank = False
 
         if rev_annual:
             lines.append(f"\nAnnual Revenue (from 10-K filings):")
+            if lines_note_bank:
+                lines.append(
+                    "  (bank/thrift filer — revenue = net interest income + "
+                    "noninterest income, not ASC 606 contract revenue)")
             newest_year = int(rev_annual[0]['end'][:4])
             if datetime.now().year - newest_year > 2:
                 lines.append(

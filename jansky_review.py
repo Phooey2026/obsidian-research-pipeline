@@ -567,7 +567,10 @@ def pass_nova(data: dict) -> str:
         if ldate != "—" and _days_ago(ldate) > LEGAL_STALE_DAYS:
             note += "STALE-L "
         if cdate != "—" and _days_ago(cdate) > EARNINGS_STALE_DAYS:
-            note += "STALE-E "
+            if _earnings_recently_attempted(earnings):
+                note += "STALE-E(cooldown) "
+            else:
+                note += "STALE-E "
         nova_table_lines.append(
             f"{ticker:<8} {risk:<10} {conf:<8} {ldate:<12} {cdate:<12} {note}"
         )
@@ -602,8 +605,14 @@ Your job:
 2. Call out any stale earnings records that are particularly concerning
    — especially if they involve high-risk tickers.
 3. Are the HIGH/CRITICAL risk tickers being properly tracked?
-4. Make specific refresh recommendations (e.g., "run nova_earnings_call.py
-   on TICKER, TICKER, TICKER").
+4. Make specific refresh recommendations ONLY for tickers in the
+   "Stale Earnings Records (>{EARNINGS_STALE_DAYS} days old — need refresh)"
+   pre-check list above (e.g., "run nova_earnings_call.py on TICKER, TICKER,
+   TICKER"). Do NOT recommend re-running earnings on any ticker tagged
+   STALE-E(cooldown) in the table below — that tag means Nova already
+   searched within the last {NOVA_NO_DATA_RETRY_DAYS} days, found nothing
+   new, and a re-run right now would be a no-op. A plain STALE-E tag (no
+   "(cooldown)") is genuinely actionable.
 5. Rate Nova's coverage: STRONG / ADEQUATE / NEEDS IMPROVEMENT
 6. Acknowledge strong coverage where it exists.
 

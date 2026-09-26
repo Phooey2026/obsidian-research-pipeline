@@ -199,6 +199,18 @@ def research_ticker(ticker: str) -> dict:
     tasks = [
         ("stock_info",        "get_stock_info",        {"ticker": ticker}),
         ("sec_earnings",      "get_sec_earnings",      {"ticker": ticker}),
+        # get_sec_earnings (SEC EDGAR XBRL) only ever has reported actuals —
+        # there is no "consensus estimate" field in an XBRL filing, so it can
+        # never carry a beat/miss or surprise % no matter how good the SEC
+        # extraction is. Section 3 of the report spec explicitly asks for
+        # "beat/miss vs estimate and surprise %", and that only exists in
+        # Yahoo's earnings-history data, which was never wired into this
+        # task list at all (Sept 2026: the get_earnings() fallback fix in
+        # app.py has been fully dead code from Jupiter's perspective — the
+        # tool works, but nothing ever calls it). This is the actual root
+        # cause of Jansky's "0 of 128 tickers have a surprise figure"
+        # finding, not a Yahoo data outage.
+        ("yahoo_earnings",    "get_earnings",          {"ticker": ticker}),
         ("analyst_ratings",   "get_analyst_ratings",   {"ticker": ticker}),
         ("stock_news",        "get_stock_news",        {"ticker": ticker, "max_results": 5}),
         ("short_interest",    "get_short_interest",    {"ticker": ticker}),
