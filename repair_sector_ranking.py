@@ -122,6 +122,7 @@ def main():
             compute_deltas, generate_delta_summary, generate_delta_html,
             generate_rankings_html, write_sectors_delta_fragment,
             archive_trade_decisions, build_holdings_context,
+            extract_summary_verdict,
         )
     except ImportError as e:
         print(f"✗ Cannot import from sector_ranking.py: {e}")
@@ -248,13 +249,28 @@ def main():
             continue
 
         briefs = []
+        verdict_map = {}
         for ticker in available:
             res   = results_by_ticker[ticker.upper()]
             brief = build_brief(res)
             briefs.append((ticker, brief))
+            # Oct 2026 fix: rank_sector() gained a required verdict_map
+            # argument (the "verdict ground-truth override" — it stops the
+            # ranking pass from re-deciding ACCUMULATE/WATCH/AVOID instead
+            # of trusting each ticker's own Jupiter summary). This script
+            # duplicates sector_ranking.py's main() loop rather than
+            # calling into it, so it never picked up that change and broke
+            # the next time someone ran a manual repair (TypeError: missing
+            # 1 required positional argument: 'verdict_map'). Built the
+            # same way sector_ranking.py's main() builds it, so a repaired
+            # sector enforces the identical ground-truth rule a normal run
+            # would.
+            verdict_map[ticker.upper()] = extract_summary_verdict(
+                res.get("summary", "")
+            )
 
         # ── Re-run ranking ────────────────────────────────────────────────
-        ranking = rank_sector(sector_name, briefs)
+        ranking = rank_sector(sector_name, briefs, verdict_map)
         if not ranking or "stocks" not in ranking:
             print(f"    ✗ Ranking still failed for {sector_name}")
             failed += 1

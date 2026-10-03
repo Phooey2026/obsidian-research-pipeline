@@ -305,6 +305,7 @@ def check_nova() -> dict:
     stale_earnings   = []
     cooldown_earnings= []
     missing_earnings = []
+    missing_in_cooldown = []
     missing_legal    = []
     high_risk        = []
     ages_earnings    = []
@@ -316,7 +317,15 @@ def check_nova() -> dict:
         earnings  = record.get("earnings", {})
         call_date = earnings.get("call_date", "")
         if not call_date:
-            missing_earnings.append(ticker)
+            if _earnings_recently_attempted(earnings):
+                # Oct 2026 fix: same bug class as the stale-earnings branch
+                # below, just the sibling path — a ticker that has *never*
+                # found a call_date (e.g. ODFL) was being dumped straight
+                # into missing_earnings even when Nova just tried it and is
+                # correctly sitting in its 30-day no-data cooldown.
+                missing_in_cooldown.append(ticker)
+            else:
+                missing_earnings.append(ticker)
         else:
             age = _days_ago(call_date)
             ages_earnings.append(age)
@@ -373,6 +382,15 @@ def check_nova() -> dict:
         result["issues"].append(
             f"Missing earnings records: {', '.join(missing_earnings[:10])}"
         )
+    if missing_in_cooldown:
+        # Informational only — never WARNs, never flips status. Same
+        # treatment as cooldown_earnings below, for tickers that have no
+        # call_date at all rather than an old one.
+        result["issues"].append(
+            f"Missing earnings in Nova's no-data cooldown (not actionable yet): "
+            f"{', '.join(missing_in_cooldown[:10])}"
+        )
+    result["metrics"]["missing_earnings_in_cooldown"] = len(missing_in_cooldown)
     if cooldown_earnings:
         # Informational only — never WARNs, never flips status. These
         # tickers have old call_dates but Nova has genuinely already

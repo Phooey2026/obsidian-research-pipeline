@@ -1132,6 +1132,17 @@ Trade limits (hard rules):
   Max single ETF: {max_etf_pct:.0f}%  |  Max single equity: {max_eq_pct:.0f}%
   Cash floor: {cash_floor_pct:.0f}% — do NOT approve buys that breach this
 
+NOTE (Oct 2026): settle_portfolio.py now enforces this floor as a hard
+stop at settlement time — it will refuse to settle any approved buy that
+would drop cash below {cash_floor_pct:.0f}%, regardless of what you decide
+here. Your approval is no longer the only line of defense, but it is
+still the only place that decides WHICH buys get cut if you approve more
+than the floor allows: settlement respects the priority ranking you
+provide in the decisions JSON (lowest priority number funded first,
+highest priority number rejected first if cash runs out). An approval you
+give no real thought to prioritizing could mean your best idea gets cut
+instead of your weakest one.
+
 For EACH trade write your decision and rationale. Be specific — cite the
 data, coach the agents, explain every rejection clearly.
 
@@ -1173,17 +1184,30 @@ Tickers reviewed: {ticker_list}
 Now output ONLY a JSON object — no prose, no explanation, no markdown fences.
 Your entire response must be a single valid JSON object starting with {{ and ending with }}.
 
-For each ticker provide your APPROVE or REJECT decision and a one-sentence rationale.
+For each ticker provide your APPROVE or REJECT decision, a one-sentence rationale,
+and a priority rank for every APPROVE'd BUY (NEW_POSITION or ADD_TO_POSITION).
 Base your decisions on the review above and these hard constraints:
 - Cash floor: {cash_floor_pct:.0f}% minimum (current cash: {cash_pct:.1f}%)
 - Max single equity position: {max_eq_pct:.0f}% of portfolio
 - Max single ETF position: {max_etf_pct:.0f}% of portfolio
 - If approving all buys would breach the cash floor, reject the lowest-conviction ones first
 
+IMPORTANT — priority ranking: settle_portfolio.py enforces the cash floor as a
+hard stop at settlement time, separately from your review. It does not know
+which of your approved buys you consider strongest, so YOU must tell it: give
+every APPROVE'd buy a "priority" integer, 1 = fund first / most convicted,
+counting up from there for weaker convictions among your approvals. If cash
+runs out at settlement, the highest priority numbers are the ones that will
+be rejected — rank them as if you were deciding exactly that. Priority is
+only meaningful for APPROVE'd buys; use 0 for REJECTs and for SELL-side
+decisions (REDUCE_POSITION), which never hit the floor.
+
 Required format:
-{{"decisions": [{{"ticker": "AVGO", "decision": "APPROVE", "rationale": "one sentence"}}, {{"ticker": "MU", "decision": "REJECT", "rationale": "one sentence"}}]}}
+{{"decisions": [{{"ticker": "AVGO", "decision": "APPROVE", "rationale": "one sentence", "priority": 1}}, {{"ticker": "MU", "decision": "REJECT", "rationale": "one sentence", "priority": 0}}]}}
 
 All {len(all_trades)} tickers must appear. "decision" must be exactly APPROVE or REJECT.
+Priority values do not need to be unique across sectors, just internally consistent
+with your own conviction ranking of this week's approved buys.
 """
 
     print(f"    [decisions JSON] asking Jansky...", end=" ", flush=True)
@@ -1208,6 +1232,7 @@ All {len(all_trades)} tickers must appear. "decision" must be exactly APPROVE or
                         result[t] = {
                             "decision":  entry.get("decision", "PENDING").upper(),
                             "rationale": entry.get("rationale", "")[:300],
+                            "priority":  entry.get("priority"),
                         }
                 if result:
                     return result
@@ -1256,6 +1281,7 @@ All {len(all_trades)} tickers must appear. "decision" must be exactly APPROVE or
                     parsed_map[t] = {
                         "decision":  entry.get("decision", "PENDING").upper(),
                         "rationale": entry.get("rationale", "")[:300],
+                        "priority":  entry.get("priority"),
                     }
         if len(parsed_map) >= expected_count:
             print(f"✓ ({len(parsed_map)} decisions parsed, via salvage)")
@@ -1273,6 +1299,7 @@ All {len(all_trades)} tickers must appear. "decision" must be exactly APPROVE or
                 parsed_map[t] = {
                     "decision":  entry.get("decision", "PENDING").upper(),
                     "rationale": entry.get("rationale", "")[:300],
+                    "priority":  entry.get("priority"),
                 }
         if parsed_map:
             print(f"⚠ (salvaged {len(parsed_map)} of {expected_count} decisions)")
@@ -1288,6 +1315,18 @@ All {len(all_trades)} tickers must appear. "decision" must be exactly APPROVE or
 
         if decision not in ("APPROVE", "REJECT"):
             decision = "PENDING"
+
+        # Oct 2026: settle_portfolio.py's cash-floor hard stop sorts
+        # approved buys by this priority (lower = funded first, higher =
+        # rejected first if cash runs out). Jansky is asked for an int
+        # starting at 1; anything missing or unparseable (model skipped
+        # the field, returned a string, etc.) defaults to the worst
+        # priority rather than the best — an unranked buy should be the
+        # first one cut, never silently treated as top conviction.
+        try:
+            priority = int(entry.get("priority"))
+        except (TypeError, ValueError):
+            priority = 999
 
         # Hard override: reject any pre-flagged breach items automatically
         if ticker in pre_flags:
@@ -1308,6 +1347,7 @@ All {len(all_trades)} tickers must appear. "decision" must be exactly APPROVE or
             "run_date":   trade.get("run_date"),
             "decision":   decision,
             "rationale":  rationale,
+            "priority":   priority,
             "pre_flags":  pre_flags.get(ticker, []),
         })
 
@@ -1354,6 +1394,7 @@ def write_trade_feedback(decisions: list[dict], config: dict) -> None:
             "decision":   d.get("decision"),
             "rationale":  d.get("rationale"),
             "pitched_by": d.get("pitched_by"),
+            "priority":   d.get("priority", 999),
             "date":       today,
         }
 

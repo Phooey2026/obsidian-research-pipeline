@@ -41,6 +41,29 @@ BASE_DIR         = os.environ.get("STOCK_BASE_DIR", "/home/jay/stock_dashboard")
 NEPTUNE_HOLDINGS = f"{BASE_DIR}/neptune_holdings.json"
 TRADE_FEEDBACK   = f"{BASE_DIR}/jansky_trade_feedback.json"
 
+
+def _load_config() -> dict:
+    """Load obsidian_config.json so the cash floor here always matches
+    whatever jansky_review.py is using — same config key, same default.
+    Oct 2026: settle_trades() previously had no cash-floor awareness at
+    all; the floor was only ever a WARNING + prompt instruction shown to
+    Jansky (the LLM) during review, which Jansky can approve straight
+    through. This is the hard stop at the only point that actually
+    writes to the portfolio."""
+    config_path = os.path.join(BASE_DIR, "obsidian_config.json")
+    defaults = {"cash_floor": {"min_cash_pct": 10.0}}
+    if not os.path.exists(config_path):
+        return defaults
+    try:
+        with open(config_path) as f:
+            return json.load(f)
+    except Exception:
+        return defaults
+
+
+_config = _load_config()
+CASH_FLOOR_PCT = _config.get("cash_floor", {}).get("min_cash_pct", 10.0)
+
 # Known ETF tickers this pipeline tracks — used to classify a brand-new
 # NEW_POSITION as "etf" vs "equity" (matches mercurymcp's DEFAULT_ETFS list).
 KNOWN_ETFS = {
@@ -129,7 +152,8 @@ def already_settled(trade_log: list, ticker: str, date: str, action: str, dollar
     return False
 
 
-def settle_trades(holdings: dict, feedback: dict, dry_run: bool) -> dict:
+def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
+                   ignore_cash_floor: bool = False) -> dict:
     print("\n── Trade Settlement ───────────────────────────────────")
     positions  = holdings.setdefault("positions", {})
     trade_log  = holdings.setdefault("trade_log", [])
@@ -137,14 +161,45 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool) -> dict:
     cash       = summary.get("cash_value", 0.0)
     today      = datetime.date.today().isoformat()
 
+    # Oct 2026: total portfolio value is (to a very close approximation)
+    # invariant across these trades — a buy or sell just moves `dollars`
+    # between cash and market_value at the fetched execution price, it
+    # doesn't change the total. Snapshotting it once here, before any
+    # trade is applied, gives a stable denominator for the cash-floor
+    # check below rather than recomputing (and drifting) mid-loop.
+    total_value = cash + sum(p.get("market_value", 0) for p in positions.values())
+
     approved = {t: d for t, d in feedback.items() if d.get("decision") == "APPROVE"}
     if not approved:
         print("  No approved trades in jansky_trade_feedback.json.")
         return holdings
 
-    applied, skipped = 0, 0
+    # Oct 2026: process sells before buys regardless of file order, so
+    # sell proceeds count toward cash *before* the floor is checked for
+    # any buy — this was the same-pass netting gap in jansky_review.py's
+    # own (advisory-only) floor warning. Order within each group is
+    # preserved from jansky_trade_feedback.json.
+    sells = [(t, d) for t, d in approved.items() if d.get("action") == "REDUCE_POSITION"]
+    buys  = [(t, d) for t, d in approved.items() if d.get("action") != "REDUCE_POSITION"]
 
-    for ticker, decision in approved.items():
+    # Oct 2026: buys are settled in Jansky's own conviction order, not raw
+    # file order. jansky_review.py now asks for a "priority" int per
+    # approved buy (1 = fund first); without this, whichever ticker
+    # happened to sit first in jansky_trade_feedback.json got funded and
+    # the cash floor cut off whatever came after — not necessarily the
+    # weakest idea. Missing/invalid priority (older feedback entries
+    # written before this field existed, or a parse miss) sorts last, so
+    # an unranked buy is the first one the floor cuts, never silently
+    # treated as top conviction.
+    buys.sort(key=lambda item: item[1].get("priority", 999)
+              if isinstance(item[1].get("priority"), int) else 999)
+
+    ordered = sells + buys
+
+    applied, skipped = 0, 0
+    cash_floor_rejected = []
+
+    for ticker, decision in ordered:
         action  = decision.get("action")
         dollars = decision.get("dollars")
         d_date  = decision.get("date", today)
@@ -157,6 +212,22 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool) -> dict:
             print(f"  – {ticker}: already settled ({action}, ${dollars:,.0f} on {d_date}) — skipping")
             skipped += 1
             continue
+
+        # Oct 2026 hard stop: a buy that would drop cash below the floor
+        # is rejected here, at the only point that actually writes to
+        # the portfolio — not left to Jansky's prompt-level warning,
+        # which can be (and has been) approved straight through.
+        is_buy = action in ("NEW_POSITION", "ADD_TO_POSITION")
+        if is_buy and not ignore_cash_floor:
+            projected_cash = cash - dollars
+            projected_pct  = (projected_cash / total_value * 100) if total_value else 0.0
+            if projected_pct < CASH_FLOOR_PCT:
+                print(f"  ✗ {ticker}: REJECTED — {action} ${dollars:,.0f} would drop cash to "
+                      f"{projected_pct:.1f}% (floor: {CASH_FLOOR_PCT:.0f}%)")
+                cash_floor_rejected.append(
+                    f"{ticker} ({action}, ${dollars:,.0f} → projected {projected_pct:.1f}%)"
+                )
+                continue
 
         price = fetch_latest_close(ticker)
         if price is None:
@@ -253,7 +324,15 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool) -> dict:
         applied += 1
 
     summary["cash_value"] = round(cash, 2)
-    print(f"\n  Applied: {applied}   Already settled (skipped): {skipped}")
+    print(f"\n  Applied: {applied}   Already settled (skipped): {skipped}"
+          f"   Cash-floor rejected: {len(cash_floor_rejected)}")
+
+    if cash_floor_rejected:
+        print(f"\n  ⚠ Rejected for breaching the {CASH_FLOOR_PCT:.0f}% cash floor "
+              f"(still APPROVE'd in jansky_trade_feedback.json — will be retried "
+              f"next run unless overwritten by a new weekly_research.py pass):")
+        for item in cash_floor_rejected:
+            print(f"    - {item}")
 
     if dry_run:
         print("\n  (dry run — no changes written)")
@@ -290,6 +369,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without writing")
     parser.add_argument("--skip-refresh", action="store_true", help="Skip price refresh, settlement only")
     parser.add_argument("--skip-settlement", action="store_true", help="Skip trade settlement, price refresh only")
+    parser.add_argument("--ignore-cash-floor", action="store_true",
+                         help=f"Settle buys even if they breach the {CASH_FLOOR_PCT:.0f}% cash floor "
+                              f"(manual override — use deliberately, not as a default)")
     args = parser.parse_args()
 
     print("═" * 56)
@@ -297,6 +379,11 @@ def main():
     print(f"  {datetime.date.today().isoformat()}")
     if args.dry_run:
         print("  Mode: DRY RUN (no changes will be written)")
+    if args.ignore_cash_floor:
+        print(f"  ⚠ Cash floor override active — buys will NOT be blocked "
+              f"below {CASH_FLOOR_PCT:.0f}%")
+    else:
+        print(f"  Cash floor: {CASH_FLOOR_PCT:.0f}% (hard stop on buys)")
     print("═" * 56)
 
     holdings = load_json(NEPTUNE_HOLDINGS, None)
@@ -309,7 +396,8 @@ def main():
 
     if not args.skip_settlement:
         feedback = load_json(TRADE_FEEDBACK, {})
-        holdings = settle_trades(holdings, feedback, args.dry_run)
+        holdings = settle_trades(holdings, feedback, args.dry_run,
+                                  ignore_cash_floor=args.ignore_cash_floor)
 
     holdings = recompute_summary(holdings)
     holdings["last_updated"] = datetime.date.today().isoformat()
