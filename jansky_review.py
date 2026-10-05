@@ -3,12 +3,13 @@
 jansky_review.py — Jansky Weekly Agent Review
 Head of AI Operations, Obsidian Capital
 
-Runs 19 passes reviewing all four specialist agents:
+Runs 21 passes reviewing all four specialist agents:
   Pass 1:    Atlas macroeconomic review
   Pass 2:    Mercury CCC review
   Pass 3:    Nova legal & earnings review (with Python pre-checks)
-  Pass 4-18: Jupiter sector reviews × 15 (sections 8-13 per ticker)
-  Pass 19:   Cross-agent synthesis + Rankings + Delta
+  Pass 4-19: Jupiter sector reviews × 16 (sections 8-13 per ticker)
+  Pass 20:   Cross-agent synthesis + Rankings + Delta
+  Pass 21:   Trade review (Jupiter + Mercury pitches)
 
 Outputs:
   data/jansky_YYYYMMDD_HHMM.json     dated archive
@@ -37,6 +38,14 @@ import sys
 import datetime
 import subprocess
 import time
+
+# Single source of truth for parsing a ticker's stated "Overall Verdict:"
+# line (Oct 2026): this file previously counted a verdict by searching the
+# whole summary for the bare word "ACCUMULATE", which false-positives on
+# any prose that mentions it (e.g. "ACCUMULATE is wrong here") — the same
+# bug fixed in the dashboard's verdictClass() in Sept 2026, never fixed
+# here. Imported rather than copied so the two can't drift apart again.
+from sector_ranking import extract_summary_verdict
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 BASE_DIR      = os.environ.get("STOCK_BASE_DIR", "/home/jay/stock_dashboard")
@@ -656,10 +665,17 @@ def pass_jupiter_sector(sector: str, tickers: list[str],
             flags.append("EMPTY SUMMARY — repair_summaries.py needed")
 
         # Check for missing verdict
-        has_verdict = any(v in summary for v in
-                          ["ACCUMULATE", "WATCH", "AVOID"])
+        # (Oct 2026) require a real "Overall Verdict:" line, not just the
+        # bare word anywhere in the prose.
+        has_verdict = extract_summary_verdict(summary) is not None
         if not has_verdict:
-            flags.append("MISSING VERDICT — repair_summaries.py needed")
+            if any(v in summary for v in ["ACCUMULATE", "WATCH", "AVOID"]):
+                flags.append(
+                    "NO PARSEABLE 'Overall Verdict:' LINE — verdict word "
+                    "appears only in prose; check formatting"
+                )
+            else:
+                flags.append("MISSING VERDICT — repair_summaries.py needed")
 
         # Check for stale language Jupiter may have flagged
         stale_found = _check_stale_language(summary)
@@ -783,26 +799,73 @@ JUPITER'S {sector.upper()} SECTOR ANALYSIS:
 
     return _call_jansky(prompt, f"Jupiter/{sector}"), python_flags
 
-# ─── Pass 19: Synthesis ───────────────────────────────────────────────────────
+# ─── Pass 20: Synthesis ───────────────────────────────────────────────────────
 
-def pass_synthesis(pass_notes: dict, data: dict) -> str:
+# Linux caps a SINGLE argv string at MAX_ARG_STRLEN = 131,072 BYTES, and
+# _call_jansky() passes the whole prompt as one argv string
+# (["jansky", "-z", prompt]). Box-drawing/em-dash characters are 3 bytes in
+# UTF-8, so budget in bytes, not characters, with headroom under the limit.
+PROMPT_MAX_BYTES = 120_000
+SECTOR_NOTES_MAX_CHARS = 60_000
+SECTOR_NOTES_MIN_CHARS = 12_000
+SYNTHESIS_FIXED_TEXT_BYTES = 6_000   # instructions + verdict block, generous
+
+
+def _count_verdicts(research: list) -> tuple[dict, list]:
     """
-    Final synthesis pass — fed only Jansky's own notes from passes 1-18.
-    Also reviews rankings and delta.
+    Verdict distribution from each ticker's own stated "Overall Verdict:"
+    line. A ticker with no parseable line counts as MISSING (and is
+    returned in the second value) rather than being guessed from prose.
     """
-    print("\n  ── Pass 19: Synthesis + Rankings + Delta ────────────────────")
+    dist = {"ACCUMULATE": 0, "WATCH": 0, "AVOID": 0, "MISSING": 0}
+    missing = []
+    for record in research:
+        v = extract_summary_verdict(record.get("summary", ""))
+        if v in dist:
+            dist[v] += 1
+        else:
+            dist["MISSING"] += 1
+            missing.append(record.get("ticker", "?"))
+    return dist, missing
 
-    # Build condensed rankings summary
-    rankings_summary = ""
-    rankings = data.get("rankings", {})
-    if rankings:
-        lines = ["SECTOR RANKINGS SUMMARY:"]
-        # Handle various rankings JSON structures
-        sectors_data = rankings if isinstance(rankings, dict) else {}
-        if "sectors" in sectors_data:
-            sectors_data = sectors_data["sectors"]
 
-        for sector, sector_data in sectors_data.items():
+def _build_rankings_summary(rankings) -> str:
+    """
+    Condensed sector-rankings table for the synthesis prompt.
+
+    (Oct 2026) sector_ranking.py saves rankings_*.json as a LIST of
+    {"sector", "ranking_rationale", "stocks": [{ticker, rank, verdict,
+    score, ...}]}. The old builder only understood a dict keyed by sector
+    with ACCUMULATE/AVOID ticker lists, so a list silently produced just
+    the header line — Jansky reported "the sector-rankings table was
+    empty". Reads the real list format; the old dict shape is still
+    accepted. Returns "" if nothing usable is found.
+    """
+    if not rankings:
+        return ""
+    if isinstance(rankings, dict) and isinstance(rankings.get("sectors"), (list, dict)):
+        rankings = rankings["sectors"]
+
+    lines = []
+    if isinstance(rankings, list):
+        for entry in rankings:
+            if not isinstance(entry, dict):
+                continue
+            stocks = [s for s in entry.get("stocks", []) if isinstance(s, dict)]
+            if not stocks:
+                continue
+            stocks.sort(key=lambda s: (s.get("rank") is None, s.get("rank", 0)))
+            ordered = ", ".join(
+                f"{s.get('ticker', '?')} {str(s.get('verdict', '?'))[:3]} "
+                f"{s.get('score', '?')}"
+                for s in stocks
+            )
+            lines.append(f"  {entry.get('sector', 'Unknown')} (best first): {ordered}")
+            rationale = " ".join(str(entry.get("ranking_rationale", "")).split())
+            if rationale:
+                lines.append(f"      why: {rationale[:220]}")
+    elif isinstance(rankings, dict):          # legacy shape
+        for sector, sector_data in rankings.items():
             if isinstance(sector_data, dict):
                 accum = sector_data.get("ACCUMULATE", [])
                 avoid = sector_data.get("AVOID", [])
@@ -810,20 +873,73 @@ def pass_synthesis(pass_notes: dict, data: dict) -> str:
                     f"  {sector:<15} ACCUMULATE: {', '.join(accum):<25} "
                     f"AVOID: {', '.join(avoid)}"
                 )
-        rankings_summary = "\n".join(lines)
+
+    if not lines:
+        return ""
+    return ("SECTOR RANKINGS SUMMARY (verdict abbreviated ACC/WAT/AVO, "
+            "score out of 10):\n" + "\n".join(lines))
+
+
+def _fit_sector_notes(notes: list, budget_chars: int) -> tuple[str, list]:
+    """
+    Fit all sector notes into budget_chars so EVERY sector is represented.
+    (Oct 2026) The old code joined every sector's notes into one string and
+    sliced it at 20,000 chars, so whichever sectors came last in watchlist
+    order were silently dropped — Jansky's last synthesis saw 6 full
+    sectors plus a truncated Banks (the 7th of 16).
+
+    notes: ordered list of (sector, note_text).
+    Returns (text, trimmed_sector_names). If everything fits, nothing is
+    cut. Otherwise the longest notes are shortened first (a common cap is
+    found by binary search), keeping the head and tail of each trimmed
+    note and cutting from the middle.
+    """
+    entries = [(k, f"[{k}]\n{n}\n") for k, n in notes]
+    lens = [len(t) for _, t in entries]
+    if sum(lens) + len(entries) <= budget_chars:
+        return "\n".join(t for _, t in entries), []
+
+    lo, hi = 0, max(lens, default=0)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if sum(min(l, mid) for l in lens) + len(entries) <= budget_chars:
+            lo = mid
+        else:
+            hi = mid - 1
+    cap = max(lo, 400)
+
+    out, trimmed = [], []
+    for k, t in entries:
+        if len(t) <= cap:
+            out.append(t)
+            continue
+        marker = f"\n[… {len(t) - cap:,} chars trimmed from the middle of {k} notes …]\n"
+        keep = max(cap - len(marker), 200)
+        head = int(keep * 0.55)
+        out.append(t[:head] + marker + t[len(t) - (keep - head):])
+        trimmed.append(k)
+    return "\n".join(out), trimmed
+
+
+def pass_synthesis(pass_notes: dict, data: dict) -> str:
+    """
+    Final synthesis pass — fed only Jansky's own notes from passes 1-19.
+    Also reviews rankings and delta.
+    """
+    print("\n  ── Pass 20: Synthesis + Rankings + Delta ────────────────────")
+
+    # Build condensed rankings summary
+    rankings_summary = _build_rankings_summary(data.get("rankings", {}))
+    if data.get("rankings") and not rankings_summary:
+        print("    ⚠ rankings file loaded but no sector rows could be read "
+              "from it — synthesis will have no rankings table")
 
     # Build verdict distribution from research
-    verdict_dist = {"ACCUMULATE": 0, "WATCH": 0, "AVOID": 0, "MISSING": 0}
-    for record in data.get("research", []):
-        summary = record.get("summary", "")
-        if "ACCUMULATE" in summary:
-            verdict_dist["ACCUMULATE"] += 1
-        elif "AVOID" in summary:
-            verdict_dist["AVOID"] += 1
-        elif "WATCH" in summary:
-            verdict_dist["WATCH"] += 1
-        else:
-            verdict_dist["MISSING"] += 1
+    verdict_dist, _missing_verdicts = _count_verdicts(data.get("research", []))
+    if _missing_verdicts:
+        print(f"    ⚠ {len(_missing_verdicts)} ticker(s) with no parseable "
+              f"'Overall Verdict:' line: {', '.join(_missing_verdicts[:12])}"
+              f"{' …' if len(_missing_verdicts) > 12 else ''}")
 
     # Build portfolio holdings summary (Neptune paper trading account)
     holdings_summary = ""
@@ -855,13 +971,45 @@ def pass_synthesis(pass_notes: dict, data: dict) -> str:
         )
 
     # Compile all sector notes
-    sector_notes_text = []
-    for key, note in pass_notes.items():
-        if key not in ("atlas", "mercury", "nova", "synthesis"):
-            sector_notes_text.append(f"[{key}]\n{note}\n")
+    sector_notes_list = [
+        (key, note) for key, note in pass_notes.items()
+        if key not in ("atlas", "mercury", "nova", "synthesis")
+    ]
 
     n_tickers = data.get("n_tickers", len(data.get("by_ticker", {})))
     n_sectors = data.get("n_sectors", len(data.get("sectors", {})))
+
+    # Size the sector-notes block from what's left of the argv byte budget
+    # after the other sections (each still individually capped below).
+    _other_bytes = SYNTHESIS_FIXED_TEXT_BYTES + sum(
+        len(p.encode("utf-8")) for p in (
+            rankings_summary[:10000],
+            holdings_summary,
+            pass_notes.get("atlas", "[not available]")[:20000],
+            pass_notes.get("mercury", "[not available]")[:20000],
+            pass_notes.get("nova", "[not available]")[:20000],
+        )
+    )
+    _raw_sector_text = "".join(n for _, n in sector_notes_list) or " "
+    _bytes_per_char = max(
+        1.0, len(_raw_sector_text.encode("utf-8")) / len(_raw_sector_text))
+    sector_budget = int(max(
+        SECTOR_NOTES_MIN_CHARS,
+        min(SECTOR_NOTES_MAX_CHARS,
+            (PROMPT_MAX_BYTES - _other_bytes) / _bytes_per_char),
+    ))
+    sector_notes_block, _trimmed_sectors = _fit_sector_notes(
+        sector_notes_list, sector_budget)
+    print(f"    sector notes: {len(sector_notes_list)} sectors, "
+          f"{len(sector_notes_block):,} chars (budget {sector_budget:,})"
+          + (f" — trimmed: {', '.join(_trimmed_sectors)}"
+             if _trimmed_sectors else " — nothing trimmed"))
+    _trim_note = (
+        f"\n(NOTE: to fit the prompt limit, the middle of the notes for "
+        f"{', '.join(_trimmed_sectors)} was trimmed; their opening and "
+        f"closing sections are intact.)"
+        if _trimmed_sectors else ""
+    )
 
     prompt = f"""You are Jansky, Head of AI Operations at Obsidian Capital.
 
@@ -888,8 +1036,8 @@ YOUR MERCURY REVIEW NOTES:
 YOUR NOVA REVIEW NOTES:
 {pass_notes.get('nova', '[not available]')[:20000]}
 
-YOUR JUPITER SECTOR REVIEW NOTES (all {n_sectors} sectors):
-{chr(10).join(sector_notes_text)[:20000]}
+YOUR JUPITER SECTOR REVIEW NOTES (all {n_sectors} sectors):{_trim_note}
+{sector_notes_block}
 
 Your synthesis must include:
 
@@ -1387,7 +1535,8 @@ def write_trade_feedback(decisions: list[dict], config: dict) -> None:
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     for d in decisions:
         ticker = d.get("ticker", "?")
-        pruned[ticker] = {
+        previous = pruned.get(ticker, {})
+        entry = {
             "ticker":     ticker,
             "action":     d.get("action"),
             "dollars":    d.get("dollars"),
@@ -1396,7 +1545,19 @@ def write_trade_feedback(decisions: list[dict], config: dict) -> None:
             "pitched_by": d.get("pitched_by"),
             "priority":   d.get("priority", 999),
             "date":       today,
+            # Oct 2026: carry the PITCH's identity so settle_portfolio.py can
+            # tell "same pitch re-reviewed on a later day" (must not settle
+            # twice) from a genuinely new pitch of the same size.
+            "pitched_at": d.get("pitched_at"),
+            "run_date":   d.get("run_date"),
         }
+        # Same pitch re-reviewed: keep what settlement already did with it.
+        if (entry["pitched_at"] and entry["pitched_at"] == previous.get("pitched_at")
+                and previous.get("settlement_status")):
+            for k in ("settlement_status", "settlement_note", "settlement_checked"):
+                if k in previous:
+                    entry[k] = previous[k]
+        pruned[ticker] = entry
 
     with open(TRADE_FEEDBACK, "w") as f:
         json.dump(pruned, f, indent=2)
@@ -1423,17 +1584,7 @@ def build_report(pass_notes: dict, python_flags: dict,
     exec_summary = synthesis if synthesis else ""
 
     # Verdict distribution
-    verdict_dist = {"ACCUMULATE": 0, "WATCH": 0, "AVOID": 0, "MISSING": 0}
-    for record in data.get("research", []):
-        summary = record.get("summary", "")
-        if "ACCUMULATE" in summary:
-            verdict_dist["ACCUMULATE"] += 1
-        elif "AVOID" in summary:
-            verdict_dist["AVOID"] += 1
-        elif "WATCH" in summary:
-            verdict_dist["WATCH"] += 1
-        else:
-            verdict_dist["MISSING"] += 1
+    verdict_dist, _ = _count_verdicts(data.get("research", []))
 
     # Sector notes for Jupiter
     sectors = list(data.get("sectors", {}).keys())
@@ -2028,7 +2179,7 @@ def main():
         pass_notes["nova"] = pass_nova(data)
         time.sleep(2)
 
-    # ── Passes 4-19: Jupiter Sectors ──────────────────────────────────────
+    # ── Passes 4-19: Jupiter Sectors (one per sector, 16 today) ───────────
     if not PASS_FILTER or PASS_FILTER in ("jupiter", "all"):
         for i, sector in enumerate(sector_list):
             if SECTOR_FILTER and sector != SECTOR_FILTER:

@@ -318,6 +318,12 @@ def load_nova_supplemental() -> dict:
         return {}
 
 
+# Age (days since the earnings CALL) at which a Nova earnings summary gets a
+# staleness warning in Jupiter's prompt, and the age at which it is omitted.
+EARNINGS_WARN_DAYS = 120
+EARNINGS_DROP_DAYS = 365
+
+
 def _nova_is_current(rec: dict, section: str, stale_days: int = 90) -> bool:
     """Return True if a nova record section (legal/earnings) is within stale_days."""
     sub = rec.get(section, {})
@@ -398,11 +404,35 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
         summary_text = earnings.get("nova_earnings_summary", "")
         rd           = earnings.get("research_date", "unknown date")
 
+        # Oct 2026: age the record by the CALL date, not research_date
+        # (which only says when Nova last touched it). ABBV's 2024 call
+        # sailed through as "current" and was blended unlabeled into a 2026
+        # verdict. Nova earnings are a nice-to-have, so a very old call is
+        # dropped; a merely aging one is injected with an explicit warning.
+        call_age = None
+        try:
+            call_age = (datetime.date.today() -
+                        datetime.datetime.strptime(call_date[:10], "%Y-%m-%d").date()).days
+        except Exception:
+            pass
+
+        if summary_text and call_age is not None and call_age > EARNINGS_DROP_DAYS:
+            summary_text = ""   # too old to be useful — omit rather than mislead
+
         if summary_text:
             source_note = f"Quartr" if source == "quartr" else "web transcript"
+            age_warning = ""
+            if call_age is None:
+                age_warning = (" ⚠ CALL DATE UNKNOWN — do not treat this as the "
+                               "latest quarter.\n")
+            elif call_age > EARNINGS_WARN_DAYS:
+                age_warning = (f" ⚠ STALE: this call is {call_age} days old and is NOT "
+                               f"the most recent quarter — use only as background, "
+                               f"and say so if you rely on it.\n")
             earnings_block = (
                 f"📞 NOVA EARNINGS CALL SUMMARY  "
                 f"({fiscal_q}, call date {call_date}, source: {source_note})\n"
+                f"{age_warning}"
                 f"{summary_text}"
             )
             sections.append(earnings_block)
@@ -579,6 +609,16 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
                     f"(cost basis ${total_cost:,.0f}, {total_gl_pct:+.1f}% return).\n"
                     f"Use this context when assessing conviction — these are live positions.\n\n"
                 )
+        else:
+            # Oct 2026: say so explicitly when the ticker is NOT held. The
+            # note used to be omitted entirely, and Jansky repeatedly read
+            # the silence as an injection bug (AEP, LVS) — it is by design.
+            holdings_preamble = (
+                f"\nPORTFOLIO HOLDINGS NOTE (Neptune Paper Trading):\n"
+                f"The firm does NOT currently hold {ticker_upper}. This is a "
+                f"normal state, not missing data — assess it as a prospective "
+                f"position.\n\n"
+            )
 
     # ── Jansky trade feedback preamble ────────────────────────────────────
     feedback_preamble = ""
@@ -590,9 +630,21 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
             dollars  = fb.get("dollars", 0)
             rat      = fb.get("rationale", "")
             date     = fb.get("date", "unknown date")
+            # Oct 2026: say whether an approval was actually executed.
+            # Without this, "Jansky APPROVED a pitch to ADD $X" read as
+            # a done deal and agents treated unexecuted approvals as held.
+            exec_note = ""
+            if fb.get("decision") == "APPROVE":
+                exec_note = (
+                    "This approved trade has been EXECUTED and is reflected in the holdings.\n"
+                    if fb.get("settlement_status") == "settled" else
+                    "This approved trade has NOT been executed — it is NOT a held position "
+                    "unless a PORTFOLIO HOLDINGS NOTE above says so.\n"
+                )
             feedback_preamble = (
                 f"\nJANSKY TRADE FEEDBACK (from {date}):\n"
                 f"Jansky {decision}D a pitch to {action} ${dollars:,.0f} of {ticker.upper()}.\n"
+                f"{exec_note}"
                 f"Jansky's rationale: {rat}\n"
                 f"Use this context when forming your analysis — if APPROVED, note what "
                 f"strengthened the thesis; if REJECTED, address the concern raised.\n\n"

@@ -43,9 +43,11 @@ Data sources:
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import asyncio
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -147,6 +149,44 @@ def _pct_change(obs_list: list[dict], periods: int = 1) -> Optional[float]:
     return ((vals[-1] - vals[-(periods + 1)]) / vals[-(periods + 1)]) * 100
 
 
+_MONTHS = {m: i for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
+
+
+async def _nass_query(client: httpx.AsyncClient, **params) -> list[dict]:
+    """
+    Query USDA NASS Quick Stats. Returns the 'data' rows ([] when NASS reports
+    no matching records). NASS answers HTTP 400 with {"error": [...]} both for a
+    bad parameter value and for "no records" — surface that text instead of the
+    bare 'Bad Request' so a wrong commodity_desc is diagnosable.
+    """
+    q = {"key": USDA_API_KEY, "format": "JSON", **params}
+    r = await client.get(USDA_NASS, params=q)
+    if r.status_code == 400:
+        try:
+            msg = "; ".join(r.json().get("error", [])) or r.text[:120]
+        except Exception:
+            msg = r.text[:120]
+        if "no data" in msg.lower():
+            return []
+        raise RuntimeError(f"NASS 400: {msg}")
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def _nass_sort_key(row: dict) -> tuple:
+    """Chronological key: (year, month, week_ending) — NASS rows are unordered."""
+    month = _MONTHS.get((row.get("reference_period_desc") or "")[:3].upper(), 0)
+    return (row.get("year", "0"), month, row.get("week_ending") or "")
+
+
+def _nass_val(row: dict) -> Optional[float]:
+    try:
+        return float(str(row.get("Value", "")).replace(",", ""))
+    except ValueError:
+        return None
+
+
 # ============================================================================
 # MCP Server
 # ============================================================================
@@ -173,6 +213,7 @@ async def get_forex_rates() -> str:
     Sources: Frankfurter API (ECB reference rates), FRED (DXY)
     """
     lines = ["=== FOREX RATES ===\n"]
+    dxy_synth = None
 
     # ── ECB rates via Frankfurter (base USD, latest) ──────────────────────
     try:
@@ -198,6 +239,19 @@ async def get_forex_rates() -> str:
             ("USD/BRL", "BRL", False),
         ]
 
+        # Synthetic ICE DXY from the same-day ECB rates (standard formula).
+        # FRED's DTWEXBGS is a different index (Fed broad trade-weighted, ~120
+        # level, weekly with a ~1 week lag) and was being labeled "DXY", which
+        # gave Jansky a level and a date that disagreed with the FX table.
+        dxy_synth = None
+        try:
+            eurusd = 1 / rates["EUR"]; gbpusd = 1 / rates["GBP"]
+            dxy_synth = (50.14348112 * eurusd ** -0.576 * rates["JPY"] ** 0.136
+                         * gbpusd ** -0.119 * rates["CAD"] ** 0.091
+                         * rates["SEK"] ** 0.042 * rates["CHF"] ** 0.036)
+        except Exception:
+            pass
+
         lines.append(f"ECB Reference Rates  [{date_str}]")
         lines.append(f"{'Pair':<12} {'Rate':>10}")
         lines.append("-" * 25)
@@ -213,12 +267,17 @@ async def get_forex_rates() -> str:
     except Exception as e:
         lines.append(f"Frankfurter API error: {e}")
 
-    # ── DXY (Broad Dollar Index) from FRED ───────────────────────────────
+    if dxy_synth is not None:
+        lines.append(f"\nICE-style DXY (computed from the ECB rates above):  {dxy_synth:.2f}  [{date_str}]")
+        lines.append("  (6-currency basket, same date as the FX table — use this as 'DXY'.)")
+
+    # ── Fed broad trade-weighted dollar index from FRED ──────────────────
     try:
         dxy = await _fred_series("DTWEXBGS", limit=30)
         dxy_val, dxy_date = _latest(dxy)
 
-        lines.append(f"\nDXY Broad Dollar Index:  {dxy_val:.3f}  [{dxy_date}]")
+        lines.append(f"\nFed Broad Dollar Index (FRED DTWEXBGS, ~120 scale, NOT the ICE DXY):  "
+                     f"{dxy_val:.3f}  [{dxy_date}]  — weekly series, lags the FX table by days")
 
         # 4-week and 13-week trend
         vals = [o["value"] for o in dxy if o["value"] is not None]
@@ -230,7 +289,7 @@ async def get_forex_rates() -> str:
             chg_13w = ((vals[-1] - vals[-14]) / vals[-14]) * 100
             lines.append(f"  13-week change:        {chg_13w:+.2f}%")
 
-        lines.append("\nDXY recent history (last 10 obs):")
+        lines.append("\nFed Broad Dollar Index recent history (last 10 obs):")
         for obs in dxy[-10:]:
             if obs["value"] is not None:
                 lines.append(f"  {obs['date']}  {obs['value']:.3f}")
@@ -239,7 +298,7 @@ async def get_forex_rates() -> str:
         lines.append("Source: Frankfurter/ECB, FRED DTWEXBGS")
 
     except Exception as e:
-        lines.append(f"\nDXY fetch error: {e}")
+        lines.append(f"\nFed Broad Dollar Index fetch error: {e}")
 
     return "\n".join(lines)
 
@@ -259,61 +318,88 @@ async def get_central_bank_rates() -> str:
     """
     lines = ["=== CENTRAL BANK POLICY RATES ===\n"]
 
+    # (label, series_id, freq, max_age_days)
+    # Verified on FRED Oct 2026. The OECD "IRSTCB01..." central-bank series
+    # for Japan, Canada and China (and IR3TIB01GBM156N for the UK) have
+    # STOPPED UPDATING (Dec 2023 / Dec 2023 / Nov 2023 / Jan 2026), so they
+    # were silently returning years-old rates. Replacements:
+    #   JPY: IRSTCI01JPM156N  call money overnight (tracks BoJ policy rate)
+    #   CAD: IRSTCI01CAM156N  call money overnight (tracks BoC target)
+    #   GBP: IUDSOIA          SONIA, daily from the Bank of England
+    #   CNY: IR3TIB01CNM156N  3-month interbank (no live policy-rate series)
+    # OECD monthly series lag ~6-8 weeks, hence the 100-day staleness limit.
+    # Anything older than max_age_days is printed as STALE and is excluded
+    # from the spread commentary below rather than treated as current.
     cb_series = [
-        # Fed row uses DFF (daily effective rate), not FEDFUNDS (monthly
-        # average), unlike every other central bank below. FEDFUNDS is a
-        # finalized calendar-month average that FRED doesn't publish until
-        # early the following month, so right after an FOMC move it still
-        # reports last month's pre-hike level for weeks. That's exactly
-        # what produced the Sept 2026 cross-agent split Jansky flagged:
-        # Atlas's get_interest_rates()/build_macro_backdrop() both read
-        # DFEDTARU/DFEDTARL (current target range, 3.75-4.00% post
-        # 9/17 hike) while this tool was reporting FEDFUNDS's stale
-        # pre-hike monthly average (3.63-3.88% area) for the same week.
-        # DFF is FRED's daily effective-rate series — same source family
-        # Atlas already uses, updates same-day, and needs no change to
-        # this function's single-value-per-row shape.
-        ("Federal Reserve (USD)",          "DFF",         ""),
-        ("European Central Bank (EUR)",    "ECBDFR",      "m"),
-        ("Bank of Japan (JPY)",            "IRSTCB01JPM156N", "m"),
-        ("Bank of England (GBP)",          "IR3TIB01GBM156N", "m"),  # IR3TIB01 series — BIS-sourced, lags ~1 quarter; BoJ/BoC may show stale values
-        ("Bank of Canada (CAD)",           "IRSTCB01CAM156N", "m"),
-        ("Reserve Bank of Australia (AUD)","IR3TIB01AUM156N", "m"),
-        ("Swiss National Bank (CHF)",      "IR3TIB01CHM156N", "m"),
-        ("People's Bank of China (CNY)",   "IRSTCB01CNM156N", "m"),
+        ("Federal Reserve (USD)",          "DFF",              "",  10),
+        ("European Central Bank (EUR)",    "ECBDFR",           "",  10),
+        ("Bank of Japan (JPY)",            "IRSTCI01JPM156N",  "m", 100),
+        ("Bank of England (GBP)",          "IUDSOIA",          "",  10),
+        ("Bank of Canada (CAD)",           "IRSTCI01CAM156N",  "m", 100),
+        ("Reserve Bank of Australia (AUD)","IR3TIB01AUM156N",  "m", 100),
+        ("Swiss National Bank (CHF)",      "IR3TIB01CHM156N",  "m", 100),
+        ("People's Bank of China (CNY)",   "IR3TIB01CNM156N",  "m", 100),
     ]
+    proxy_note = {
+        "Bank of Japan (JPY)":       "overnight call money (BoJ policy-rate proxy)",
+        "Bank of England (GBP)":     "SONIA overnight",
+        "Bank of Canada (CAD)":      "overnight call money (BoC policy-rate proxy)",
+        "Reserve Bank of Australia (AUD)": "3-mo interbank (policy-rate proxy)",
+        "Swiss National Bank (CHF)": "3-mo interbank (policy-rate proxy)",
+        "People's Bank of China (CNY)": "3-mo interbank (proxy; no live policy series)",
+    }
 
-    rates = {}
-    for label, series_id, freq in cb_series:
+    def _age_days(date_str: str) -> Optional[int]:
+        try:
+            return (datetime.now() - datetime.strptime(date_str[:10], "%Y-%m-%d")).days
+        except Exception:
+            return None
+
+    rates = {}      # label -> (value, date)  — FRESH values only
+    stale = []
+    for label, series_id, freq, max_age in cb_series:
         try:
             obs = await _fred_series(series_id, limit=6, frequency=freq)
             val, date = _latest(obs)
-            rates[label] = (val, date)
-            if val is not None:
-                lines.append(f"  {label:<40} {val:.2f}%  [{date}]")
-            else:
+            if val is None:
                 lines.append(f"  {label:<40} N/A")
+                continue
+            age = _age_days(date)
+            note = proxy_note.get(label, "")
+            note = f"  ({note})" if note else ""
+            if age is not None and age > max_age:
+                lines.append(f"  {label:<40} {val:.2f}%  [{date}]  "
+                             f"⚠ STALE ({age} days old) — NOT used in comparisons{note}")
+                stale.append(label)
+            else:
+                rates[label] = (val, date)
+                lines.append(f"  {label:<40} {val:.2f}%  [{date}]{note}")
         except Exception as e:
             lines.append(f"  {label:<40} Error: {e}")
 
-    # Policy divergence commentary
-    lines.append("\nPolicy Divergence Analysis:")
-    fed   = rates.get("Federal Reserve (USD)",    (None, ""))[0]
-    ecb   = rates.get("European Central Bank (EUR)", (None, ""))[0]
-    boj   = rates.get("Bank of Japan (JPY)",      (None, ""))[0]
-    boe   = rates.get("Bank of England (GBP)",    (None, ""))[0]
+    if stale:
+        lines.append(f"\nData-quality warning: {len(stale)} series stale ({', '.join(stale)}). "
+                     "Do not cite those as current policy rates.")
 
-    if fed is not None and ecb is not None:
-        spread = fed - ecb
-        direction = "USD bullish vs EUR" if spread > 0 else "EUR bullish vs USD"
-        lines.append(f"  Fed vs ECB spread:      {spread:+.2f}%  → {direction}")
-    if fed is not None and boj is not None:
-        spread = fed - boj
-        lines.append(f"  Fed vs BoJ spread:      {spread:+.2f}%  → carry trade favors USD/JPY longs")
-    if fed is not None and boe is not None:
-        spread = fed - boe
-        direction = "USD bullish vs GBP" if spread > 0 else "GBP bullish vs USD"
-        lines.append(f"  Fed vs BoE spread:      {spread:+.2f}%  → {direction}")
+    # Policy divergence — yield differentials only. No directional FX call is
+    # hardcoded: a spread is one input; intervention/policy-path risk matters.
+    lines.append("\nPolicy Divergence Analysis (Fed minus other bank; fresh data only):")
+    fed = rates.get("Federal Reserve (USD)", (None, ""))[0]
+    if fed is None:
+        lines.append("  Fed rate unavailable — no spreads computed.")
+    else:
+        for label, short in [("European Central Bank (EUR)", "ECB"),
+                             ("Bank of Japan (JPY)", "BoJ"),
+                             ("Bank of England (GBP)", "BoE"),
+                             ("Bank of Canada (CAD)", "BoC"),
+                             ("Reserve Bank of Australia (AUD)", "RBA"),
+                             ("Swiss National Bank (CHF)", "SNB")]:
+            other = rates.get(label, (None, ""))[0]
+            if other is None:
+                continue
+            spread = fed - other
+            side = "USD yield advantage" if spread > 0 else "USD yield disadvantage"
+            lines.append(f"  Fed vs {short:<4} spread:  {spread:+.2f}%  → {side}")
 
     lines.append("\nSource: FRED — central bank policy rate series")
     return "\n".join(lines)
@@ -1164,40 +1250,59 @@ async def get_livestock_prices() -> str:
         except Exception as e:
             lines.append(f"{label}: Error — {e}\n")
 
-    # ── USDA NASS cattle and hog prices (if key available) ────────────────
+    # ── USDA NASS cattle and hog prices received (if key available) ───────
+    # commodity_desc "CATTLE, BEEF" does not exist in Quick Stats (NASS returned
+    # HTTP 400, swallowed as an error line). Prices received are published as
+    # commodity "CATTLE" (class "INCL CALVES") and "HOGS", monthly, in $ / CWT.
     if USDA_API_KEY:
-        lines.append("── USDA NASS Livestock Prices Received ──")
+        lines.append("── USDA NASS Prices Received (national, monthly, $/cwt) ──")
+        # Each entry: label, commodity, preferred short_desc fragment, param
+        # variants tried in order (NASS answers 400 "invalid query" when ANY
+        # filter value isn't valid for the commodity — class_desc "INCL CALVES"
+        # was rejected live, hogs worked with no class filter).
         nass_livestock = [
-            ("Live Cattle", "CATTLE, BEEF"),
-            ("Hogs",        "HOGS"),
+            ("Cattle", "CATTLE", "INCL CALVES"),
+            ("Hogs",   "HOGS",   ""),
         ]
-        async with httpx.AsyncClient(timeout=20) as client:
-            for label, commodity in nass_livestock:
-                try:
-                    r = await client.get(
-                        USDA_NASS,
-                        params={
-                            "key":               USDA_API_KEY,
-                            "commodity_desc":    commodity,
-                            "statisticcat_desc": "PRICE RECEIVED",
-                            "agg_level_desc":    "NATIONAL",
-                            "year__GE":          str(datetime.now().year - 1),
-                            "format":            "JSON",
-                        },
-                    )
-                    r.raise_for_status()
-                    items = r.json().get("data", [])
-                    if items:
-                        latest_item = sorted(items,
-                                             key=lambda x: x.get("year", "0"),
-                                             reverse=True)[0]
-                        val  = latest_item.get("Value", "N/A")
-                        unit = latest_item.get("unit_desc", "")
-                        yr   = latest_item.get("year", "")
-                        lines.append(f"  {label:<14} ${val} {unit}  [{yr}]")
-                except Exception as e:
-                    lines.append(f"  {label}: NASS error — {e}")
+        base = dict(statisticcat_desc="PRICE RECEIVED", agg_level_desc="NATIONAL",
+                    freq_desc="MONTHLY", year__GE=str(datetime.now().year - 1))
+        async with httpx.AsyncClient(timeout=25) as client:
+            for label, commodity, prefer in nass_livestock:
+                items, err = [], None
+                for extra in ({"unit_desc": "$ / CWT"}, {}):
+                    try:
+                        items = await _nass_query(client, commodity_desc=commodity, **base, **extra)
+                        err = None
+                        if items:
+                            break
+                    except Exception as e:
+                        err = e
+                items = [i for i in items if _nass_val(i) is not None
+                         and (i.get("reference_period_desc") or "")[:3].upper() in _MONTHS
+                         and "CWT" in (i.get("unit_desc") or "CWT").upper()]
+                if not items:
+                    lines.append(f"  {label:<8} NASS UNAVAILABLE — {err or 'no monthly price rows returned'}")
+                    continue
+                # Rows span several series (cattle: steers & heifers, cows, calves...).
+                # They are NOT interchangeable ($455 calves vs ~$215 steers), so
+                # print every series by name instead of guessing one.
+                for series in sorted({i.get("short_desc", "") for i in items}):
+                    rows = sorted((i for i in items if i.get("short_desc", "") == series),
+                                  key=_nass_sort_key)
+                    last = rows[-1]
+                    val = _nass_val(last)
+                    name = series.split(" - ")[0] if series else label
+                    msg = f"  {name:<40} ${val:,.2f}/cwt  [{last.get('reference_period_desc')} {last.get('year')}]"
+                    prior = [i for i in rows if i.get("year") == str(int(last["year"]) - 1)
+                             and i.get("reference_period_desc") == last.get("reference_period_desc")]
+                    if prior and _nass_val(prior[0]):
+                        msg += f"   YoY {((val / _nass_val(prior[0])) - 1) * 100:+.1f}%"
+                    lines.append(msg)
+        lines.append("  (Series are not interchangeable: CALVES are young animals priced far higher per cwt; "
+                     "'GE 500 LBS' = cattle 500 lb and over, the closest to feeder/fed cattle.)")
         lines.append("")
+    else:
+        lines.append("(USDA NASS cattle/hog prices skipped: USDA_API_KEY not set)\n")
 
     lines.append("Source: FRED (BLS retail meat prices), USDA NASS (if key set)")
     return "\n".join(lines)
@@ -1222,38 +1327,138 @@ async def get_wasde_summary() -> str:
     lines.append("is published monthly by USDA. It is the primary document")
     lines.append("that moves grain, oilseed, and soft commodity markets.\n")
 
-    # ── SearXNG search for latest WASDE highlights ────────────────────────
-    # Direct WASDE API access requires parsing large binary files;
-    # SearXNG gives us actionable headline summary faster
+    esmis_ok = False
+    # ── The actual latest WASDE report (USDA ESMIS text file) ─────────────
+    # The publication page lists release-files/<id>/wasdeMMYY.txt per release;
+    # the newest one is fetched and its Highlights narrative printed, so agents
+    # get USDA's own numbers rather than only search-engine headlines.
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(
-                f"{SEARXNG_URL}/search",
-                params={
-                    "q":          "USDA WASDE report latest corn soybeans wheat supply demand",
-                    "format":     "json",
-                    "time_range": "month",
-                },
-            )
-            r.raise_for_status()
-            results = r.json().get("results", [])[:5]
+        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
+            page = await client.get(
+                "https://esmis.nal.usda.gov/publication/world-agricultural-supply-and-demand-estimates")
+            page.raise_for_status()
+            found = re.findall(r'(https?://[^"\']*?/release-files/\d+/wasde(\d{2})(\d{2})\.txt|'
+                               r'/sites/default/release-files/\d+/wasde(\d{2})(\d{2})\.txt)', page.text)
+            cands = []
+            for full, m1, y1, m2, y2 in found:
+                mm, yy = (m1, y1) if m1 else (m2, y2)
+                url = full if full.startswith("http") else "https://esmis.nal.usda.gov" + full
+                cands.append((int(yy), int(mm), url))
+            if not cands:
+                raise RuntimeError("no wasde*.txt links found on ESMIS page")
+            yy, mm, url = max(cands)
+            doc = await client.get(url)
+            doc.raise_for_status()
+            text = doc.text
+        text = text.replace("\f", "\n")
+        hdr = re.search(r"WASDE\s*-\s*\d+\s*-\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", text)
+        released = re.sub(r"\s+", " ", hdr.group(1)) if hdr else f"{mm:02d}/20{yy:02d}"
+        lines.append(f"── USDA WASDE {released} — U.S. supply & use (source {url}) ──")
+        lines.append("(Each table: prior month's projection vs this month's; units shown in table headers.)")
+        # The ESMIS .txt is fixed-width tables, not narrative. Pull the three
+        # big U.S. balance sheets down to their 'Ending Stocks' row.
+        all_lines = text.split("\n")
+        # (name, title regex, optional marker line where the commodity's own
+        # block starts — the corn table opens with a FEED GRAINS aggregate in
+        # metric tons, and the CORN block (bushels) follows it)
+        titles = [("Wheat",    r"U\.S\. Wheat Supply and Use", None),
+                  ("Corn",     r"U\.S\. Feed Grain and Corn Supply and Use", r"^\s*CORN\s*$"),
+                  ("Soybeans", r"U\.S\. Soybeans and Products Supply and Use", None)]
+        got_tables = 0
+        for name, pat, marker in titles:
+            idx = next((i for i, ln in enumerate(all_lines) if re.search(pat, ln)), None)
+            if idx is None:
+                lines.append(f"({name} table not found in report text)")
+                continue
+            window = all_lines[idx: idx + 90]
+            block, begin = [], 0
+            if marker:
+                m_i = next((i for i, ln in enumerate(window) if re.search(marker, ln)), None)
+                if m_i is None:
+                    lines.append(f"({name} block not found in report text)")
+                    continue
+                # keep the title + column headers (up to 5 lines), then jump to the block
+                block = [ln.rstrip() for ln in window[:5]]
+                begin = m_i
+            for ln in window[begin:]:
+                block.append(ln.rstrip())
+                if re.match(r"\s*Ending Stocks", ln) and len(block) > 5:
+                    break
+            lines.extend(l for l in block if l.strip())
+            lines.append("")
+            got_tables += 1
+        if not got_tables:
+            body = re.sub(r"[ \t]+", " ", text[:5000])
+            lines.append("(U.S. tables not found; showing start of report)")
+            lines.append(body)
+            lines.append("")
+        esmis_ok = got_tables > 0
+        try:
+            if (datetime.now() - datetime.strptime(released, "%d %B %Y")).days > 45:
+                lines.append(f"⚠ This is the {released} report — a newer WASDE may have been released.")
+        except Exception:
+            pass
+    except Exception as e:
+        lines.append(f"(USDA WASDE report text UNAVAILABLE this run: {e}; web coverage below only)\n")
 
-        lines.append("── Latest WASDE Coverage (via web search) ──")
-        if results:
-            for item in results:
-                title   = item.get("title", "No title")
-                content = item.get("content", "")[:220]
-                url     = item.get("url", "")
-                lines.append(f"• {title}")
+    # ── Web search for the latest WASDE coverage ──────────────────────────
+    # Raw WASDE data needs the (keyed) USDA PSD API, so this stays headline
+    # coverage. Fixes: queries are dated (the generic query returned old or
+    # off-topic pages), results must actually mention WASDE, SearXNG's
+    # publishedDate is shown, and the output says plainly when nothing recent
+    # was found instead of presenting old articles as current.
+    now = datetime.now()
+    prev = now.replace(day=1) - timedelta(days=1)
+    queries = [
+        f"USDA WASDE {now.strftime('%B %Y')} corn soybeans wheat ending stocks yield",
+        f"USDA WASDE {prev.strftime('%B %Y')} report ending stocks",
+        f"wasde{prev.strftime('%m%y')}.pdf World Agricultural Supply and Demand Estimates",
+    ]
+    seen, kept = set(), []
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            for q in queries:
+                try:
+                    r = await client.get(f"{SEARXNG_URL}/search",
+                                         params={"q": q, "format": "json", "time_range": "month"})
+                    r.raise_for_status()
+                    for item in r.json().get("results", []):
+                        url = item.get("url", "")
+                        text = f"{item.get('title', '')} {item.get('content', '')}".lower()
+                        if url in seen or "wasde" not in text and "supply and demand" not in text:
+                            continue
+                        seen.add(url)
+                        kept.append(item)
+                except Exception as e:
+                    lines.append(f"(search '{q[:40]}…' failed: {e})")
+        # Newest dated items first; undated (landing pages) last.
+        kept.sort(key=lambda i: str(i.get("publishedDate") or ""), reverse=True)
+        kept = kept[:6]
+        newest = max((str(i.get("publishedDate") or "")[:10] for i in kept), default="")
+
+        lines.append("── Latest WASDE Coverage (via web search — headlines, not USDA tables) ──")
+        if kept:
+            for item in kept:
+                lines.append(f"• {item.get('title', 'No title')}")
+                pub = str(item.get("publishedDate") or "")[:10]
+                if pub:
+                    lines.append(f"  published {pub}")
+                content = item.get("content", "")[:260]
                 if content:
                     lines.append(f"  {content}")
-                lines.append(f"  {url}")
+                lines.append(f"  {item.get('url', '')}")
                 lines.append("")
+            try:
+                if not esmis_ok and newest and (now - datetime.strptime(newest, "%Y-%m-%d")).days > 45:
+                    lines.append(f"⚠ Newest dated coverage is {newest} — the most recent WASDE "
+                                 "may NOT be reflected above; treat figures as possibly out of date.")
+            except Exception:
+                pass
         else:
-            lines.append("No recent WASDE coverage found in search results.")
-
+            lines.append("No WASDE coverage found for the last ~2 months — WASDE figures "
+                         "UNAVAILABLE this run; do not assume current balance-sheet numbers.")
     except Exception as e:
-        lines.append(f"SearXNG search error: {e}")
+        lines.append(f"WASDE search UNAVAILABLE: {e}")
 
     lines.append("Source: SearXNG web search for USDA WASDE report coverage")
     lines.append("Note: For raw USDA PSD data, visit apps.fas.usda.gov/psdonline")
@@ -1279,43 +1484,52 @@ async def get_crop_progress() -> str:
         lines.append("Winter wheat progress may still be available.\n")
 
     # ── USDA NASS crop progress (if key available) ────────────────────────
+    # Each (commodity, category) has MANY unit_desc rows per week (PCT EXCELLENT,
+    # PCT GOOD, ... or PCT PLANTED, PCT EMERGED, ...). The old code printed one
+    # arbitrary row; this prints the full latest-week breakdown. The invalid
+    # numeric_desc parameter was dropped.
     if USDA_API_KEY:
         crops_progress = [
-            ("Corn",         "CORN",         "PROGRESS"),
-            ("Corn",         "CORN",         "CONDITION"),
-            ("Soybeans",     "SOYBEANS",     "CONDITION"),
-            ("Winter Wheat", "WHEAT",        "CONDITION"),
+            ("Corn",         {"commodity_desc": "CORN"},                          "PROGRESS"),
+            ("Corn",         {"commodity_desc": "CORN"},                          "CONDITION"),
+            ("Soybeans",     {"commodity_desc": "SOYBEANS"},                      "CONDITION"),
+            ("Winter Wheat", {"commodity_desc": "WHEAT", "class_desc": "WINTER"}, "CONDITION"),
         ]
-        async with httpx.AsyncClient(timeout=20) as client:
-            for label, commodity, stat in crops_progress:
+        async with httpx.AsyncClient(timeout=25) as client:
+            for label, extra, stat in crops_progress:
                 try:
-                    r = await client.get(
-                        USDA_NASS,
-                        params={
-                            "key":               USDA_API_KEY,
-                            "commodity_desc":    commodity,
-                            "statisticcat_desc": stat,
-                            "agg_level_desc":    "NATIONAL",
-                            "year__GE":          str(datetime.now().year - 1),
-                            "format":            "JSON",
-                            "numeric_desc":      "GE 0",
-                        },
+                    items = await _nass_query(
+                        client,
+                        statisticcat_desc=stat,
+                        agg_level_desc="NATIONAL",
+                        freq_desc="WEEKLY",
+                        year=str(datetime.now().year),
+                        **extra,
                     )
-                    r.raise_for_status()
-                    items = r.json().get("data", [])
-                    if items:
-                        latest = sorted(items,
-                                        key=lambda x: (x.get("year","0"),
-                                                       x.get("week_ending","0")),
-                                        reverse=True)[0]
-                        val  = latest.get("Value", "N/A")
-                        week = latest.get("week_ending", "N/A")
-                        unit = latest.get("unit_desc", "%")
-                        lines.append(f"{label} — {stat.split(',')[0].strip()}:")
-                        lines.append(f"  {val} {unit}  [week ending {week}]")
-                        lines.append("")
+                    items = [i for i in items if i.get("week_ending") and _nass_val(i) is not None]
+                    if not items:
+                        lines.append(f"{label} — {stat}: no NASS rows for {datetime.now().year} "
+                                     "(out of season or not yet reported)\n")
+                        continue
+                    week = max(i["week_ending"] for i in items)
+                    latest = sorted((i for i in items if i["week_ending"] == week),
+                                    key=lambda x: x.get("unit_desc", ""))
+                    stale_note = ""
+                    try:
+                        age = (datetime.now() - datetime.strptime(week[:10], "%Y-%m-%d")).days
+                        if age > 21:
+                            stale_note = (f"  ⚠ STALE: last NASS report was {age} days ago "
+                                          "(season reporting has ended) — not current conditions")
+                    except Exception:
+                        pass
+                    lines.append(f"{label} — {stat}  [week ending {week}]{stale_note}")
+                    for row in latest:
+                        lines.append(f"  {row.get('unit_desc', '?'):<28} {_nass_val(row):g}")
+                    lines.append("")
                 except Exception as e:
-                    lines.append(f"{label} {stat}: NASS error — {e}")
+                    lines.append(f"{label} {stat}: NASS UNAVAILABLE — {e}\n")
+    else:
+        lines.append("(USDA NASS crop data skipped: USDA_API_KEY not set)\n")
 
     # ── SearXNG fallback / supplement ────────────────────────────────────
     try:
@@ -1363,24 +1577,79 @@ async def get_noaa_drought() -> str:
     lines.append("Key regions: Corn Belt (IA/IL/IN), Great Plains (KS/NE/SD),")
     lines.append("California (almonds, oranges, rice), Southeast (cotton, peanuts).\n")
 
-    # ── US Drought Monitor data (JSON API) ────────────────────────────────
+    # ── US Drought Monitor data (official JSON web service) ───────────────
+    # The old code requested an HTML page, ignored the response, and printed
+    # "Visit: droughtmonitor.unl.edu" — so no drought numbers ever reached the
+    # agents. The USDM data service returns percent-area by category.
+    async def _usdm(client: httpx.AsyncClient, aoi: str) -> dict:
+        """Latest + prior USDM rows for an area. CONUS lives under /USStatistics,
+        states under /StateStatistics (the US endpoint returned nothing for
+        'IA' etc.). JSON key casing is not guaranteed, so keys are lowercased."""
+        end   = datetime.now()
+        start = end - timedelta(days=21)
+        scope = "USStatistics" if aoi == "conus" else "StateStatistics"
+        r = await client.get(
+            f"https://usdmdataservices.unl.edu/api/{scope}/GetDroughtSeverityStatisticsByAreaPercent",
+            params={
+                "aoi":            aoi,
+                "startdate":      f"{start.month}/{start.day}/{start.year}",
+                "enddate":        f"{end.month}/{end.day}/{end.year}",
+                "statisticsType": "1",
+            },
+            headers={"Accept": "application/json"},
+        )
+        r.raise_for_status()
+        rows = [{str(k).lower(): v for k, v in row.items()} for row in r.json()]
+        if not rows:
+            raise RuntimeError("empty response")
+        rows.sort(key=lambda x: str(x.get("mapdate") or x.get("validstart") or ""))
+        for row in rows:
+            if not any(k in row for k in ("d0", "d1", "d2")):
+                raise RuntimeError(f"unrecognized fields: {sorted(row)[:8]}")
+        return {"latest": rows[-1], "prior": rows[-2] if len(rows) > 1 else None}
+
+    def _cum(row: dict) -> dict:
+        """Percent of area in D0+ ... D4 (cumulative) from a lowercased USDM row.
+        statisticsType=1 is USDM's 'traditional' (already cumulative) output;
+        the check below also copes with categorical rows."""
+        g = lambda k: float(row.get(k) or 0)
+        cats = [g("d0"), g("d1"), g("d2"), g("d3"), g("d4")]
+        # Single-category rows sum (none + D0..D4) to ~100 -> accumulate them.
+        # Cumulative rows don't (none + D0 alone is already ~100), so use as-is
+        # rather than double-accumulating.
+        if abs(g("none") + sum(cats) - 100) <= 2.0:
+            return {f"D{i}": sum(cats[i:]) for i in range(5)}
+        return {f"D{i}": cats[i] for i in range(5)}
+
+    # StateStatistics wants the two-digit state FIPS code (abbreviations return
+    # an empty list — verified against the USDM web-service docs / live run).
+    regions = [("CONUS", "conus"), ("Iowa", "19"), ("Illinois", "17"), ("Nebraska", "31"),
+               ("Kansas", "20"), ("Texas", "48"), ("California", "06")]
+    got_any = False
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            # National summary — percent area in drought categories
-            r = await client.get(
-                "https://droughtmonitor.unl.edu/DmData/DataTables.aspx",
-                params={
-                    "mode":  "table",
-                    "aoi":   "conus",
-                    "date":  datetime.now().strftime("%Y%m%d"),
-                },
-            )
-            # DM serves HTML tables; fall through to SearXNG
-            lines.append("── US Drought Monitor (current week) ──")
-            lines.append("Visit: https://droughtmonitor.unl.edu for current map")
-            lines.append("")
-    except Exception:
-        pass
+        async with httpx.AsyncClient(timeout=25) as client:
+            results = await asyncio.gather(*[_usdm(client, aoi) for _, aoi in regions],
+                                           return_exceptions=True)
+        lines.append("── US Drought Monitor — % of area in drought (cumulative) ──")
+        lines.append(f"  {'Region':<12} {'D1+':>6} {'D2+':>6} {'D3+':>6} {'D4':>6}   {'D1+ wk/wk':>10}   Map date")
+        for (name, _), res in zip(regions, results):
+            if isinstance(res, Exception):
+                lines.append(f"  {name:<12} unavailable — {type(res).__name__}: {str(res)[:90]}")
+                continue
+            got_any = True
+            cur = _cum(res["latest"])
+            chg = ""
+            if res["prior"]:
+                chg = f"{cur['D1'] - _cum(res['prior'])['D1']:+.1f} pts"
+            md = str(res["latest"].get("mapdate") or res["latest"].get("validstart") or "")[:10]
+            lines.append(f"  {name:<12} {cur['D1']:>5.1f}% {cur['D2']:>5.1f}% {cur['D3']:>5.1f}% "
+                         f"{cur['D4']:>5.1f}%   {chg:>10}   {md}")
+        if not got_any:
+            lines.append("  Drought Monitor service returned no data this run — "
+                         "drought levels UNAVAILABLE (web coverage below is qualitative only).")
+        lines.append("")
+    except Exception as e:
+        lines.append(f"Drought Monitor UNAVAILABLE: {e}\n")
 
     # ── SearXNG for current drought conditions and ag impact ─────────────
     try:
@@ -1878,7 +2147,7 @@ async def build_mercury_backdrop() -> str:
         f"generated_date: \"{now}\"",
         f"",
         f"# ─────────────────────────────────────────────────────────────────",
-        f"# US DOLLAR (DXY)",
+        f"# US DOLLAR (Fed Broad Dollar Index, DTWEXBGS — not ICE DXY)",
         f"# ─────────────────────────────────────────────────────────────────",
         f"dollar_index:",
         f"  stance: {dxy_stance}",

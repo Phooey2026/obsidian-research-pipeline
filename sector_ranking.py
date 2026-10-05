@@ -281,8 +281,14 @@ def pitch_trades_for_sector(sector_name: str, tickers: list[str],
     for ticker in tickers:
         fb = feedback.get(ticker, {})
         if fb:
+            # Oct 2026: an approval is not a holding. Say whether it ran.
+            exec_note = ""
+            if fb.get("decision") == "APPROVE":
+                exec_note = (" [EXECUTED]" if fb.get("settlement_status") == "settled"
+                             else " [NOT EXECUTED — not a held position]")
             feedback_lines.append(
-                f"  {ticker}: Jansky previously {fb.get('decision','?')} "
+                f"  {ticker}: Jansky previously {fb.get('decision','?')}"
+                f"{exec_note} "
                 f"a {fb.get('action','?')} pitch on {fb.get('date','?')} — "
                 f"{fb.get('rationale','')[:120]}"
             )

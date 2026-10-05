@@ -141,15 +141,41 @@ def refresh_prices(holdings: dict, dry_run: bool) -> dict:
     return holdings
 
 
-def already_settled(trade_log: list, ticker: str, date: str, action: str, dollars) -> bool:
-    """Idempotency guard — has this exact decision already been logged?"""
+def already_settled(trade_log: list, ticker: str, date: str, action: str,
+                    dollars, pitch_id=None) -> bool:
+    """Idempotency guard — has this exact decision already been logged?
+
+    Oct 2026: this used to match on the Jansky REVIEW date. Re-running
+    jansky_review.py on a later day re-approves the same pitch under a new
+    review date, so the same trade was settled again (duplicate fills).
+    Now matches on the PITCH's own identity (pitched_at / run_date, carried
+    through jansky_trade_feedback.json) when both sides have one; the
+    review-date match is kept only as a fallback for log entries written
+    before pitch_id existed.
+    """
     for entry in trade_log:
-        if (entry.get("ticker") == ticker
-                and entry.get("decision_date") == date
-                and entry.get("action") == action
-                and entry.get("dollars") == dollars):
+        if (entry.get("ticker") != ticker
+                or entry.get("action") != action
+                or entry.get("dollars") != dollars):
+            continue
+        logged_pitch = entry.get("pitch_id")
+        if pitch_id and logged_pitch:
+            if logged_pitch == pitch_id:
+                return True
+            continue  # same ticker/action/size but a different, newer pitch
+        if entry.get("decision_date") == date:
             return True
     return False
+
+
+def _mark(decision: dict, status: str, note: str = "") -> None:
+    """Record what settlement did with this approval, on the feedback entry
+    itself. Jupiter/Mercury read jansky_trade_feedback.json, and before this
+    they could not tell an executed approval from one that never ran — so
+    they treated every approved pitch as a held position."""
+    decision["settlement_status"] = status          # settled | cash_floor_rejected | not_executed
+    decision["settlement_note"]   = note
+    decision["settlement_checked"] = datetime.date.today().isoformat()
 
 
 def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
@@ -203,13 +229,16 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
         action  = decision.get("action")
         dollars = decision.get("dollars")
         d_date  = decision.get("date", today)
+        pitch_id = decision.get("pitched_at") or decision.get("run_date")
 
         if not action or not dollars:
             print(f"  ⚠ {ticker}: missing action/dollars, skipping")
+            _mark(decision, "not_executed", "missing action/dollars")
             continue
 
-        if already_settled(trade_log, ticker, d_date, action, dollars):
+        if already_settled(trade_log, ticker, d_date, action, dollars, pitch_id):
             print(f"  – {ticker}: already settled ({action}, ${dollars:,.0f} on {d_date}) — skipping")
+            _mark(decision, "settled", "already settled in an earlier run")
             skipped += 1
             continue
 
@@ -227,11 +256,14 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
                 cash_floor_rejected.append(
                     f"{ticker} ({action}, ${dollars:,.0f} → projected {projected_pct:.1f}%)"
                 )
+                _mark(decision, "cash_floor_rejected",
+                      f"would drop cash to {projected_pct:.1f}%")
                 continue
 
         price = fetch_latest_close(ticker)
         if price is None:
             print(f"  ⚠ {ticker}: could not fetch price, skipping settlement this run")
+            _mark(decision, "not_executed", "price fetch failed")
             continue
 
         pos = positions.get(ticker)
@@ -239,6 +271,7 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
         if action == "NEW_POSITION":
             if pos is not None:
                 print(f"  ⚠ {ticker}: NEW_POSITION but already held — skipping (use ADD_TO_POSITION next run)")
+                _mark(decision, "not_executed", "NEW_POSITION but already held")
                 continue
             shares = dollars / price
             positions[ticker] = {
@@ -261,6 +294,7 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
         elif action == "ADD_TO_POSITION":
             if pos is None:
                 print(f"  ⚠ {ticker}: ADD_TO_POSITION but not currently held — skipping")
+                _mark(decision, "not_executed", "ADD_TO_POSITION but not held")
                 continue
             add_shares    = dollars / price
             new_shares    = pos["shares"] + add_shares
@@ -280,6 +314,7 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
         elif action == "REDUCE_POSITION":
             if pos is None:
                 print(f"  ⚠ {ticker}: REDUCE_POSITION but not currently held — skipping")
+                _mark(decision, "not_executed", "REDUCE_POSITION but not held")
                 continue
             sell_shares = dollars / price
             if sell_shares >= pos["shares"]:
@@ -309,11 +344,14 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
                 print(f"  ✓ {ticker}: REDUCE_POSITION  -{sell_shares:,.2f} sh @ ${price:.2f}  (${dollars:,.0f})")
         else:
             print(f"  ⚠ {ticker}: unrecognized action '{action}', skipping")
+            _mark(decision, "not_executed", f"unrecognized action {action}")
             continue
 
+        _mark(decision, "settled", f"executed {today}")
         trade_log.append({
             "settled_date":  today,
             "decision_date": d_date,
+            "pitch_id":      pitch_id,
             "ticker":        ticker,
             "action":        action,
             "dollars":       dollars,
@@ -414,6 +452,14 @@ def main():
         with open(NEPTUNE_HOLDINGS, "w") as f:
             json.dump(holdings, f, indent=2)
         print(f"\n✓ Saved: {NEPTUNE_HOLDINGS}")
+        # Write each approval's settlement status back so downstream
+        # prompts can tell executed approvals from unexecuted ones.
+        if not args.skip_settlement and feedback:
+            tmp = TRADE_FEEDBACK + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(feedback, f, indent=2)
+            os.replace(tmp, TRADE_FEEDBACK)
+            print(f"✓ Settlement status written back: {TRADE_FEEDBACK}")
 
     print("═" * 56)
 

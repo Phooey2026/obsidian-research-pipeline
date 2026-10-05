@@ -619,8 +619,14 @@ def pitch_etf_trades(holdings: dict, etf_data: str, config: dict,
     for etf in allowed_etfs:
         fb = feedback.get(etf, {})
         if fb:
+            # Oct 2026: an approval is not a holding. Say whether it ran.
+            exec_note = ""
+            if fb.get("decision") == "APPROVE":
+                exec_note = (" [EXECUTED]" if fb.get("settlement_status") == "settled"
+                             else " [NOT EXECUTED — not a held position]")
             feedback_lines.append(
-                f"  {etf}: Jansky previously {fb.get('decision','?')} "
+                f"  {etf}: Jansky previously {fb.get('decision','?')}"
+                f"{exec_note} "
                 f"a {fb.get('action','?')} pitch on {fb.get('date','?')} — "
                 f"{fb.get('rationale','')[:120]}"
             )

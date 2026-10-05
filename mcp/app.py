@@ -721,9 +721,22 @@ def get_institutional(ticker: str, top_n: int = 15) -> str:
         inst_pct = info.get('institutionPercent') or info.get('heldPercentInstitutions')
         insider_pct = info.get('insiderPercent') or info.get('heldPercentInsiders')
         lines.append("── Ownership Summary ──")
-        lines.append(f"  Institutional:  {inst_pct*100:.1f}%" if inst_pct else "  Institutional:  N/A")
+        # Oct 2026: Yahoo's institutional % adds up overlapping 13F filings
+        # (the same shares reported by several filers), so it can exceed
+        # 100% — it showed up in six Packaging tickers plus CFG and cost an
+        # analyst flag per ticker per week. Label it as an artifact instead
+        # of printing it as a fact, and don't derive "% public" from it.
+        inst_ok = bool(inst_pct) and 0 < inst_pct <= 1.0
+        if inst_pct and not inst_ok:
+            lines.append(
+                f"  Institutional:  {inst_pct*100:.1f}%  ⚠ EXCEEDS 100% — Yahoo/13F "
+                f"double-counting artifact, not a real ownership level. "
+                f"Use the top-holder % Out figures below instead.")
+        else:
+            lines.append(f"  Institutional:  {inst_pct*100:.1f}%" if inst_pct else "  Institutional:  N/A")
         lines.append(f"  Insider:        {insider_pct*100:.1f}%" if insider_pct else "  Insider:        N/A")
-        lines.append(f"  Float:          {((1 - (inst_pct or 0) - (insider_pct or 0))*100):.1f}% public" if inst_pct else "")
+        if inst_ok:
+            lines.append(f"  Float:          {max(0.0, (1 - inst_pct - (insider_pct or 0))*100):.1f}% public")
 
         # Top institutional holders
         try:
@@ -810,19 +823,48 @@ def get_earnings(ticker: str) -> str:
         info = t.info
 
         # Next earnings date
-        next_date = info.get('earningsTimestamp')
-        if next_date:
-            next_str = datetime.fromtimestamp(
-                next_date, tz=timezone.utc).strftime('%Y-%m-%d')
+        # Oct 2026: yfinance's earningsTimestamp is often the LAST report
+        # date rather than the next one (XEL showed 2026-07-30 in October;
+        # AMGN, ELV, V and DVN had the same problem), and nothing checked it
+        # against today. A date in the past is never reported as "next":
+        # fall back to the estimate window, then the earnings calendar, then
+        # an explicit "not yet published".
+        def _fmt_ts(ts):
+            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d')
+
+        cutoff_ts = datetime.now(timezone.utc).timestamp() - 86400  # today still counts
+        ts_main = info.get('earningsTimestamp')
+        ts_low = info.get('earningsTimestampStart')
+        ts_high = info.get('earningsTimestampEnd')
+
+        next_str = None
+        if ts_main and ts_main >= cutoff_ts:
+            next_str = _fmt_ts(ts_main)
+        elif ts_low and ts_high and ts_high >= cutoff_ts:
+            low_str, high_str = _fmt_ts(ts_low), _fmt_ts(ts_high)
+            next_str = (f"{low_str} (estimate)" if low_str == high_str
+                        else f"{low_str} to {high_str} (estimate)")
         else:
-            next_date_low = info.get('earningsTimestampStart')
-            next_date_high = info.get('earningsTimestampEnd')
-            if next_date_low and next_date_high:
-                low_str = datetime.fromtimestamp(
-                    next_date_low, tz=timezone.utc).strftime('%Y-%m-%d')
-                high_str = datetime.fromtimestamp(
-                    next_date_high, tz=timezone.utc).strftime('%Y-%m-%d')
-                next_str = f"{low_str} to {high_str} (estimate)"
+            try:
+                ed = t.get_earnings_dates(limit=12)
+                if ed is not None and not ed.empty:
+                    now_utc = datetime.now(timezone.utc)
+                    upcoming = []
+                    for d in ed.index:
+                        py = d.to_pydatetime()
+                        if py.tzinfo is None:
+                            py = py.replace(tzinfo=timezone.utc)
+                        if py.timestamp() >= cutoff_ts:
+                            upcoming.append(py)
+                    if upcoming:
+                        next_str = (min(upcoming).strftime('%Y-%m-%d')
+                                    + " (from earnings calendar)")
+            except Exception:
+                pass
+        if next_str is None:
+            if ts_main:
+                next_str = (f"N/A — next date not yet published "
+                            f"(Yahoo's last listed date was {_fmt_ts(ts_main)}, now past)")
             else:
                 next_str = "N/A"
 
@@ -845,32 +887,45 @@ def get_earnings(ticker: str) -> str:
         # tickers on the next run.
         try:
             hist = t.earnings_history
-            if hist is None or hist.empty:
+            # Oct 2026: also fall back when earnings_history is merely
+            # sparse (MU came back with 3 odd rows, not empty), and when
+            # using get_earnings_dates() keep only REPORTED quarters, oldest
+            # to newest — it returns newest-first with future (NaN) rows
+            # first, so the old .tail(8) kept the OLDEST rows on the page.
+            if hist is None or hist.empty or len(hist) < 4:
                 try:
-                    hist = t.get_earnings_dates(limit=8)
-                    if hist is not None and not hist.empty:
-                        hist = hist.rename(columns={
+                    alt = t.get_earnings_dates(limit=12)
+                    if alt is not None and not alt.empty:
+                        alt = alt.rename(columns={
                             'Reported EPS': 'epsActual',
                             'EPS Estimate': 'epsEstimate',
                             'Surprise(%)':  'surprisePct',
                         })
+                        if 'epsActual' in alt.columns:
+                            alt = alt[alt['epsActual'].notna()].sort_index()
+                        if hist is None or hist.empty or len(alt) > len(hist):
+                            hist = alt
                 except Exception:
-                    hist = None
+                    if hist is not None and hist.empty:
+                        hist = None
             if hist is not None and not hist.empty:
                 hist = hist.tail(8)
                 lines.append("\nQuarterly EPS (last 8 quarters):")
                 lines.append(f"  {'Quarter':<12} {'Actual':>8} {'Estimate':>10} {'Surprise':>10} {'Beat?':>6}")
                 lines.append("  " + "-" * 50)
+                def _clean(v):
+                    return None if (v is None or (isinstance(v, float) and v != v)) else v
                 for idx, row in hist.iterrows():
-                    quarter = str(row.get('quarter', idx))
-                    actual = row.get('epsActual')
-                    estimate = row.get('epsEstimate')
+                    q = row.get('quarter', idx)
+                    quarter = q.strftime('%Y-%m-%d') if hasattr(q, 'strftime') else str(q)
+                    actual = _clean(row.get('epsActual'))
+                    estimate = _clean(row.get('epsEstimate'))
                     # get_earnings_dates() gives surprisePct (%), not the
                     # raw EPS-dollar diff epsDifference gives — compute the
                     # dollar surprise from actual/estimate when only the
                     # percent form is available, so downstream formatting
                     # (and the beat/miss sign) stays consistent either way.
-                    surprise = row.get('epsDifference')
+                    surprise = _clean(row.get('epsDifference'))
                     if surprise is None and actual is not None and estimate is not None:
                         surprise = actual - estimate
                     beat = "✓" if surprise and surprise > 0 else "✗"
@@ -1276,64 +1331,183 @@ def compare_stocks(tickers: str, period: str = "30d") -> str:
     except Exception as e:
         return f"Error comparing stocks: {str(e)}"
 
+_NEWS_NAME_NOISE = re.compile(
+    r"\b(inc|corp|corporation|co|company|ltd|plc|holdings|group|the|llc|sa|nv|ag)\b\.?,?",
+    re.IGNORECASE)
+
+
+_NEWS_GENERIC_WORDS = {
+    "gaming", "technology", "technologies", "financial", "energy", "systems",
+    "international", "resources", "services", "brands", "pharmaceuticals",
+    "healthcare", "global", "industries", "partners", "capital", "bancorp",
+    "bank", "american", "united", "national", "first", "general",
+}
+
+
+def _news_name_words(name: str) -> list:
+    """Up to two distinguishing words from a company name ('Boyd Gaming
+    Corporation' -> ['Boyd']; 'Walt Disney Company' -> ['Walt', 'Disney'])."""
+    words = [w for w in re.sub(r"[^\w\s&-]", " ", _NEWS_NAME_NOISE.sub(" ", name or "")).split()
+             if len(w) >= 3 and w.lower() not in _NEWS_GENERIC_WORDS]
+    return words[:2]
+
+
+def _news_score(text: str, ticker: str, name: str) -> int:
+    """How surely an article concerns THIS company: 2 = strong, 1 = weak,
+    0 = unrelated. Strong needs a distinguishing word from the company name
+    or an exchange-qualified ticker ("NYSE: BYD"). A bare ticker match is
+    only weak — short or common tickers (BYD, B, V, C) collide with unrelated
+    things constantly, and BYD returned the Chinese automaker."""
+    text = text or ""
+    for w in _news_name_words(name):
+        if re.search(rf"\b{re.escape(w)}", text, re.IGNORECASE):
+            return 2
+    if re.search(rf"\b(?:NYSE|NASDAQ|NYSEARCA|NYSE American)\s*:\s*{re.escape(ticker)}\b", text):
+        return 2
+    if len(ticker) >= 3 and re.search(rf"\b{re.escape(ticker)}\b", text):
+        # With no company name known there is nothing better to check against.
+        return 2 if not _news_name_words(name) else 1
+    return 0
+
+
+def _news_searxng(query: str, limit: int) -> list:
+    """News via the local SearXNG instance (already carries the paid Brave
+    engine). Tries the news category first, then general results."""
+    base = (SEARXNG_URL or "http://localhost:8080").rstrip("/")
+    results = []
+    for params in ({"q": query, "format": "json", "categories": "news", "time_range": "month"},
+                   {"q": query, "format": "json"}):
+        r = httpx.get(f"{base}/search", params=params, timeout=20,
+                      headers={"User-Agent": "webmcp/1.0"})
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        if results:
+            break
+    return [{"title": x.get("title", ""), "url": x.get("url", ""),
+             "summary": x.get("content", "")} for x in results]
+
+
 @mcp.tool()
 def get_stock_news(ticker: str, max_results: int = 5) -> str:
-    """Fetch recent news articles for a stock ticker from Yahoo Finance.
+    """Fetch recent news articles for a stock ticker.
+    Tries Yahoo Finance first, then SearXNG, then DuckDuckGo. Articles are
+    filtered to the actual company (not same-ticker lookalikes), and if every
+    source fails the result says so explicitly instead of looking like "no news".
     ticker: stock symbol e.g. AVGO, NVDA, TSLA
-    max_results: number of news items to return (default 8)
+    max_results: number of news items to return (default 5)
     """
+    sym = ticker.upper()
+    errors = []
     try:
-        import re
         import yfinance as yf
-        from datetime import datetime, timezone
 
-        t = yf.Ticker(ticker.upper())
-        news = t.news
+        t = yf.Ticker(sym)
+        try:
+            name = (t.info or {}).get("shortName") or (t.info or {}).get("longName") or ""
+        except Exception:
+            name = ""
 
-        if not news:
+        # ── 1. Yahoo Finance ────────────────────────────────────────────
+        items = []
+        try:
+            for item in (t.news or []):
+                if not item:
+                    continue
+                content = item.get('content', item)
+                if not content or not isinstance(content, dict):
+                    continue
+                canonical = content.get('canonicalUrl') or {}
+                clickthrough = content.get('clickThroughUrl') or {}
+                items.append({
+                    "title": content.get('title', 'No title'),
+                    "publisher": (content.get('provider') or {}).get('displayName', 'Unknown'),
+                    "date": content.get('pubDate', 'Unknown date'),
+                    "url": canonical.get('url', '') or clickthrough.get('url', ''),
+                    "summary": re.sub(r'<[^>]+>', '',
+                                      content.get('summary', content.get('description', '')) or '')[:200],
+                })
+        except Exception as e:
+            errors.append(f"Yahoo error: {str(e)[:80]}")
+
+        # Articles that only match on the bare ticker are kept aside as a
+        # low-confidence last resort, never preferred over a name match.
+        weak_pool = []   # (source label, formatted block)
+
+        def _yahoo_block(n, i):
+            return (f"{n}. [{i['publisher']}] {i['title']}\n"
+                    f"   Published: {i['date']}\n   URL: {i['url']}\n"
+                    f"   Summary: {i['summary']}\n")
+
+        scored = [(_news_score(f"{i['title']} {i['summary']}", sym, name), i) for i in items]
+        strong = [i for s, i in scored if s == 2]
+        weak = [i for s, i in scored if s == 1]
+        if strong:
+            lines = [f"=== {sym} News (Yahoo Finance) ===\n"]
+            lines += [_yahoo_block(n, i) for n, i in enumerate(strong[:max_results], 1)]
+            return "\n".join(lines)
+        weak_pool += [("Yahoo Finance", _yahoo_block(0, i)) for i in weak]
+        if items:
+            errors.append(f"Yahoo returned {len(items)} items, none clearly about {name or sym}")
+        elif not any(e.startswith("Yahoo") for e in errors):
+            errors.append("Yahoo returned no items")
+
+        # ── 2. SearXNG ──────────────────────────────────────────────────
+        query = f'"{name}" {sym} stock news' if name else f"{sym} stock news"
+        def _web_block(n, title, url, summary):
+            return f"{n}. {title}\n   URL: {url}\n   Summary: {summary[:200]}\n"
+
+        try:
+            res = _news_searxng(query, max_results * 3)
+            sc = [(_news_score(f"{x['title']} {x['summary']}", sym, name), x) for x in res]
+            found = [x for s, x in sc if s == 2][:max_results]
+            if found:
+                lines = [f"=== {sym} News (SearXNG web search — Yahoo unavailable) ===\n"]
+                lines += [_web_block(n, x['title'], x['url'], x['summary'])
+                          for n, x in enumerate(found, 1)]
+                return "\n".join(lines)
+            weak_pool += [("SearXNG", _web_block(0, x['title'], x['url'], x['summary']))
+                          for s, x in sc if s == 1]
+            errors.append("SearXNG returned nothing clearly about the company")
+        except Exception as e:
+            errors.append(f"SearXNG error: {str(e)[:80]}")
+
+        # ── 3. DuckDuckGo (last resort) ─────────────────────────────────
+        try:
             from ddgs import DDGS
-            results = []
-            query = (f"{ticker} stock news site:cnbc.com OR site:finance.yahoo.com "
-                     f"OR site:marketwatch.com OR site:reuters.com OR site:bloomberg.com")
+            ddg_query = ((f'"{name}" ' if name else f"{sym} ")
+                         + "stock news site:cnbc.com OR site:finance.yahoo.com "
+                           "OR site:marketwatch.com OR site:reuters.com OR site:bloomberg.com")
             with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_results):
-                    results.append(
-                        f"Title: {r['title']}\n"
-                        f"Source: {r['href']}\n"
-                        f"Summary: {r['body']}\n"
-                    )
-            return (f"=== {ticker.upper()} News (web search fallback) ===\n\n" +
-                    "\n---\n".join(results) if results else "No news found.")
+                raw = list(ddgs.text(ddg_query, max_results=max_results * 2))
+            sc = [(_news_score(f"{r.get('title', '')} {r.get('body', '')}", sym, name), r) for r in raw]
+            found = [r for s, r in sc if s == 2][:max_results]
+            if found:
+                lines = [f"=== {sym} News (DuckDuckGo fallback — Yahoo and SearXNG unavailable) ===\n"]
+                lines += [_web_block(n, r.get('title', ''), r.get('href', ''), r.get('body', ''))
+                          for n, r in enumerate(found, 1)]
+                return "\n".join(lines)
+            weak_pool += [("DuckDuckGo", _web_block(0, r.get('title', ''), r.get('href', ''), r.get('body', '')))
+                          for s, r in sc if s == 1]
+            errors.append("DuckDuckGo returned nothing clearly about the company")
+        except Exception as e:
+            errors.append(f"DuckDuckGo error: {str(e)[:80]}")
 
-        lines = [f"=== {ticker.upper()} News (Yahoo Finance) ===\n"]
-        count = 0
-        for item in news:
-            if count >= max_results:
-                break
-            if not item:
-                continue
-            content = item.get('content', item)
-            if not content or not isinstance(content, dict):
-                continue
-            title = content.get('title', 'No title')
-            publisher = content.get('provider', {}).get('displayName', 'Unknown')
-            pub_date = content.get('pubDate', 'Unknown date')
-            canonical = content.get('canonicalUrl') or {}
-            clickthrough = content.get('clickThroughUrl') or {}
-            url = canonical.get('url', '') or clickthrough.get('url', '')
-            summary = content.get('summary', content.get('description', ''))
-            summary = re.sub(r'<[^>]+>', '', summary)[:200]
-            lines.append(
-                f"{count+1}. [{publisher}] {title}\n"
-                f"   Published: {pub_date}\n"
-                f"   URL: {url}\n"
-                f"   Summary: {summary}\n"
-            )
-            count += 1
-        return "\n".join(lines) if len(lines) > 1 else f"No readable news found for {ticker.upper()}."
+        # ── Last resort: ticker-only matches, clearly labeled ───────────
+        if weak_pool:
+            lines = [f"=== {sym} News (LOW CONFIDENCE — matched on the ticker symbol only; "
+                     f"may be about a different company) ===\n"]
+            for n, (src, block) in enumerate(weak_pool[:max_results], 1):
+                lines.append(f"[{src}] " + block.replace("0. ", f"{n}. ", 1))
+            return "\n".join(lines)
+
+        return (f"=== {sym} News UNAVAILABLE ===\n"
+                f"All news sources failed this run: {'; '.join(errors)}.\n"
+                f"Treat news/catalyst coverage for {sym} as MISSING this week — "
+                f"this is a feed outage, not evidence that there is no news.")
 
     except Exception as e:
-        return f"Error fetching news for {ticker}: {str(e)}"
+        return (f"=== {sym} News UNAVAILABLE ===\nError fetching news: {str(e)}. "
+                f"Treat news coverage as MISSING this week.")
 
 @mcp.tool()
 def get_short_interest(ticker: str) -> str:
@@ -1360,25 +1534,55 @@ def get_short_interest(ticker: str) -> str:
         short_ratio = info.get('shortRatio')
         short_pct = info.get('shortPercentOfFloat')
 
+        # Oct 2026: plausibility check. Yahoo periodically returns garbage
+        # here (BAC showed 766 shares short; WFC/CFG/ALL were flagged too),
+        # and it was reaching the analyst as a real figure — each report then
+        # spent a caveat quarantining it by hand. Reject physically
+        # implausible values up front and say so explicitly.
+        bad_reason = None
+        try:
+            if shares_short is not None and float_shares:
+                ratio = shares_short / float_shares
+                if ratio < 1e-5:
+                    bad_reason = (f"shares short ({shares_short:,.0f}) is only "
+                                  f"{ratio*100:.5f}% of the float ({float_shares:,.0f})")
+                elif ratio > 1.0:
+                    bad_reason = (f"shares short ({shares_short:,.0f}) exceeds the "
+                                  f"float ({float_shares:,.0f})")
+            if not bad_reason and short_pct is not None and short_pct > 1.0:
+                bad_reason = f"short % of float is {short_pct*100:,.0f}% (over 100%)"
+        except Exception:
+            pass
+
         # Calculate month-over-month change
         mom_change = ""
-        if shares_short and prior_month and prior_month > 0:
+        if not bad_reason and shares_short and prior_month and prior_month > 0:
             chg = ((shares_short - prior_month) / prior_month) * 100
             arrow = "↑" if chg > 0 else "↓"
             mom_change = f"{arrow} {abs(chg):.1f}% vs prior month"
 
         lines = [f"=== {ticker.upper()} Short Interest ===\n"]
-        lines.append(
-            f"Shares Short:          "
-            f"{fmt(shares_short, ' shares')} {mom_change}")
-        lines.append(
-            f"Prior Month Short:     {fmt(prior_month, ' shares')}")
-        lines.append(
-            f"Short % of Float:      "
-            f"{f'{short_pct*100:.2f}%' if short_pct else 'N/A'}")
-        lines.append(
-            f"Short Ratio (days):    "
-            f"{f'{short_ratio:.2f}' if short_ratio else 'N/A'}")
+        if bad_reason:
+            lines.append(
+                f"⚠ DATA QUALITY: Yahoo's short-interest figures failed a "
+                f"plausibility check ({bad_reason}). Treat short interest as "
+                f"UNAVAILABLE this week — do not cite or interpret these numbers.\n")
+            lines.append("Shares Short:          N/A (implausible source value)")
+            lines.append("Prior Month Short:     N/A")
+            lines.append("Short % of Float:      N/A")
+            lines.append("Short Ratio (days):    N/A")
+        else:
+            lines.append(
+                f"Shares Short:          "
+                f"{fmt(shares_short, ' shares')} {mom_change}")
+            lines.append(
+                f"Prior Month Short:     {fmt(prior_month, ' shares')}")
+            lines.append(
+                f"Short % of Float:      "
+                f"{f'{short_pct*100:.2f}%' if short_pct else 'N/A'}")
+            lines.append(
+                f"Short Ratio (days):    "
+                f"{f'{short_ratio:.2f}' if short_ratio else 'N/A'}")
         lines.append(
             f"Float Shares:          {fmt(float_shares, ' shares')}")
         lines.append(
@@ -1386,6 +1590,10 @@ def get_short_interest(ticker: str) -> str:
 
         # Interpretation
         lines.append("\nInterpretation:")
+        if bad_reason:
+            lines.append("  Not available — source data failed a plausibility check.")
+            short_pct = None
+            short_ratio = None
         if short_pct:
             pct = short_pct * 100
             if pct < 2:

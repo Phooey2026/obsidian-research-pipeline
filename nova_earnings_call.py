@@ -16,8 +16,9 @@ Already-current records are skipped to avoid redundant token spend.
 
 Usage:
     python3 nova_earnings_call.py                   # full watchlist
-    python3 nova_earnings_call.py TICKER [TICKER]   # specific tickers only
-    python3 nova_earnings_call.py --force TICKER    # force refresh even if current
+    python3 nova_earnings_call.py TICKER [TICKER]   # specific tickers only (bypasses
+                                                    # staleness check AND no-data cooldown)
+    python3 nova_earnings_call.py --force           # whole watchlist, ignore staleness/cooldown
     python3 nova_earnings_call.py --stale-only      # only refresh stale/pending
 """
 
@@ -813,9 +814,16 @@ def main():
     skipped_current  : list[str] = []  # genuinely recent call_date
     skipped_cooldown : list[str] = []  # no data found recently, waiting out cooldown
 
+    # Oct 2026: naming tickers on the command line now really does bypass the
+    # staleness check AND the no-data cooldown (it always claimed to, but
+    # `nova_earnings_call.py ABBV` was skipped as "1 no-data cooldown" even
+    # though ABBV's record was ~32 months old). --force does the same for
+    # the whole watchlist.
+    forced = force or bool(explicit_tickers)
+
     for ticker in tickers:
         current = earnings_is_current(nova_data, ticker)
-        if current and not force:
+        if current and not forced:
             earnings = nova_data.get(ticker.upper(), {}).get("earnings", {})
             in_cooldown = (
                 earnings.get("last_search_result") == "no_new_data_found"
@@ -823,7 +831,7 @@ def main():
             )
             (skipped_cooldown if in_cooldown else skipped_current).append(ticker)
         else:
-            if stale_only and current:
+            if stale_only and current and not forced:
                 earnings = nova_data.get(ticker.upper(), {}).get("earnings", {})
                 in_cooldown = (
                     earnings.get("last_search_result") == "no_new_data_found"
@@ -840,6 +848,8 @@ def main():
           f" {len(skipped_cooldown)} no-data cooldown within {NO_DATA_RETRY_DAYS} days)")
     if force:
         print(f"  Mode: FORCE REFRESH")
+    elif explicit_tickers:
+        print(f"  Mode: named tickers — staleness check and no-data cooldown bypassed")
     print()
 
     if not to_research:
