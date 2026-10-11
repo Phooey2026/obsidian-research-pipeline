@@ -767,8 +767,16 @@ not be trusted without checking against what the article itself states.
         "no substantive content",
     )
     _summary_lower = summary.lower()
-    if any(sig in _summary_lower for sig in _failure_signatures):
-        print(f"✗ (Nova reported no usable content in its own summary)")
+    # A press release legitimately has no Q&A, so ONE "cannot be assessed" in a
+    # single section (Analyst Reception) must not discard an otherwise full
+    # summary. Treat it as a failure only if the phrases repeat across sections
+    # or the whole summary is short.
+    _hits = [sig for sig in _failure_signatures if sig in _summary_lower]
+    _hit_count = sum(_summary_lower.count(sig) for sig in _failure_signatures)
+    if _hits and (_hit_count >= 3 or len(summary) < 1000):
+        print(f"✗ (Nova reported no usable content in its own summary — "
+              f"matched {_hits}, {len(summary):,} chars)")
+        print(f"      Nova said: {summary[:300].replace(chr(10), ' ')}...")
         return "no_data"
 
     print(f"✓ ({len(summary):,} chars)")
