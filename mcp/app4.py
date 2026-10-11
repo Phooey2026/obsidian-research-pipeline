@@ -793,8 +793,14 @@ async def get_energy_prices() -> str:
         for label, series_id, limit, freq in fred_fallback:
             # Fetch if the label doesn't appear with a dollar value
             # (EIA error lines contain the label but no price)
+            # Oct 2026 fix: the old test was `label in ln and "$" in ln`, but the
+            # labels themselves contain "($/gal)", so ANY line mentioning the label
+            # counted as "has a price" — including "N/A" and EIA-error lines. The
+            # FRED fallback therefore never ran and heating oil (and RBOB when EIA
+            # failed) was silently missing. Require a real value on a line that
+            # starts with the label.
             label_has_price = any(
-                label in ln and "$" in ln
+                ln.startswith(label) and "N/A" not in ln and "error" not in ln.lower()
                 for ln in lines
             )
             if not label_has_price:
@@ -802,6 +808,10 @@ async def get_energy_prices() -> str:
                     obs = await _fred_series(series_id, limit=limit, frequency=freq)
                     val, date = _latest(obs)
                     if val is not None:
+                        # drop the failed EIA line for this label (N/A / error)
+                        lines[:] = [ln for ln in lines
+                                    if not (ln.startswith(label)
+                                            and ("N/A" in ln or "error" in ln.lower()))]
                         lines.append(f"{label:<45} ${val:.3f}  [{date}] (FRED fallback)")
                 except Exception:
                     pass
@@ -930,6 +940,11 @@ async def get_metals_prices() -> str:
             ("Silver (USD/troy oz)",    "SI=F"),
             ("Platinum (USD/troy oz)",  "PL=F"),
             ("Palladium (USD/troy oz)", "PA=F"),
+            # Live industrial-metal futures: the World Bank monthly series below
+            # lags ~2+ months (July 2026 still the latest in October), so these
+            # give a current price. Copper is quoted in USD/lb on COMEX.
+            ("Copper Futures (USD/lb)",     "HG=F"),
+            ("Aluminum Futures (USD/mt)",   "ALI=F"),
         ]
         for label, ticker in precious:
             try:
@@ -969,7 +984,13 @@ async def get_metals_prices() -> str:
             mom  = _pct_change(obs, 1)
             yoy  = _pct_change(obs, min(12, len([o for o in obs if o["value"] is not None]) - 1))
             if val is not None:
-                lines.append(f"{label:<28} ${val:>10,.2f}  [{date}]")
+                try:
+                    _age = (datetime.now() - datetime.strptime(date[:10], "%Y-%m-%d")).days
+                except Exception:
+                    _age = 0
+                _stale = f"  ⚠ STALE: monthly World Bank average, {_age} days old" if _age > 75 else \
+                         "  (monthly World Bank average)"
+                lines.append(f"{label:<28} ${val:>10,.2f}  [{date}]{_stale}")
                 if mom is not None:
                     lines.append(f"  MoM:  {mom:+.2f}%")
                 if yoy is not None:
@@ -983,7 +1004,8 @@ async def get_metals_prices() -> str:
     # ── Key ratios ────────────────────────────────────────────────────────
     gold_price = next((v for k, v in prices.items() if "Gold" in k), None)
     silv_price = next((v for k, v in prices.items() if "Silver" in k), None)
-    copp_price = next((v for k, v in prices.items() if "Copper" in k), None)
+    copp_price = next((v for k, v in prices.items() if k.startswith("Copper (")), None)  # monthly, USD/mt
+    copp_live  = prices.get("Copper Futures (USD/lb)")                                   # live, USD/lb
 
     lines.append("── Key Ratios ──")
     if gold_price and silv_price:
@@ -994,7 +1016,7 @@ async def get_metals_prices() -> str:
         elif gs_ratio < 50:
             lines.append("  ✓ Low ratio (<50) — risk-on / silver outperforming")
 
-    if gold_price and copp_price:
+    if gold_price and (copp_live or copp_price):
         # Sept 2026 fix: this previously divided by (copp_price * 100)
         # assuming copp_price was already USD/lb — but the FRED series
         # feeding it (PCOPPUSDM, labeled "Copper (USD/mt)" a few lines up)
@@ -1003,9 +1025,15 @@ async def get_metals_prices() -> str:
         # 0.00 every single time — exactly the self-flagged bug. Standard
         # gold-oz/copper-lb ratio needs copper actually converted to
         # USD/lb first (1 metric ton = 2204.62 lb).
-        copper_usd_per_lb = copp_price / 2204.62
+        # Oct 2026: prefer live COMEX copper (same-day as the gold price). The
+        # monthly series is 2+ months old, so dividing today's gold by it mixed
+        # dates and misstated the ratio.
+        if copp_live:
+            copper_usd_per_lb, _src = copp_live, "live COMEX copper"
+        else:
+            copper_usd_per_lb, _src = copp_price / 2204.62, "monthly World Bank copper (STALE)"
         gc_ratio = gold_price / copper_usd_per_lb
-        lines.append(f"Gold/Copper Ratio:    {gc_ratio:.2f}  (rising = risk-off)")
+        lines.append(f"Gold/Copper Ratio:    {gc_ratio:.2f}  (rising = risk-off; uses {_src})")
 
     # ── Gold ETF (IAU) via yfinance ────────────────────────────────────────
     try:

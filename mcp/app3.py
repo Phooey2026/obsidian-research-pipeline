@@ -925,7 +925,24 @@ async def get_earnings_transcript_search(ticker: str,
             "TSLA": "https://ir.tesla.com/press-releases",
             "NVDA": "https://investor.nvidia.com/financial-information/press-releases",
             "AAPL": "https://investor.apple.com/news/press-releases/default.aspx",
+            # Oct 2026: ODFL posts results on its own IR site, not a wire service
+            # the site: queries cover, so searches found only Old Navy/dictionary pages.
+            "ODFL": "https://ir.odfl.com/news-events/press-releases",
         }
+
+        # Company name without the legal suffix ("Old Dominion Freight Line, Inc."
+        # -> "Old Dominion Freight Line"): headlines say "Old Dominion Freight Line
+        # Reports Second Quarter 2026 ...", so an exact-phrase query that includes
+        # ", Inc." can miss them.
+        import re as _re_name
+        short_name = company_name.strip()
+        _suffix = r",?\s+(?:Inc\.?|Incorporated|Corporation|Corp\.?|Company|Co\.?|Ltd\.?|plc|N\.V\.|S\.A\.|Holdings?)\s*$"
+        while True:
+            _new = _re_name.sub(_suffix, "", short_name, flags=_re_name.IGNORECASE).strip()
+            if _new == short_name:
+                break
+            short_name = _new
+        _ORD = {1: "first", 2: "second", 3: "third", 4: "fourth"}
 
         queries = []
 
@@ -941,6 +958,17 @@ async def get_earnings_transcript_search(ticker: str,
             f'"{company_name}" quarterly earnings results '
             f"site:businesswire.com OR site:globenewswire.com OR site:prnewswire.com"
         )
+
+        # ── Tier 2b: headline-style query with no site filter ──────────────
+        # Matches how companies actually title releases ("<Name> Reports Second
+        # Quarter 2026 Results"), and finds IR-site / nasdaq.com copies when the
+        # wire services don't carry the release.
+        for q_label in recent_qs[:2]:
+            try:
+                _qn, _qy = int(q_label[1]), q_label.split()[1]
+                queries.append(f"{short_name} reports {_ORD[_qn]} quarter {_qy} results")
+            except Exception:
+                pass
 
         # ── Tier 3: Transcript aggregators ────────────────────────────────
         # Motley Fool and Seeking Alpha have reliable free transcripts
@@ -971,7 +999,8 @@ async def get_earnings_transcript_search(ticker: str,
                             s in url for s in (
                                 "businesswire.com", "globenewswire.com",
                                 "prnewswire.com", "fool.com", "seekingalpha.com",
-                                "ir.", "investor.", "investors."
+                                "ir.", "investor.", "investors.",
+                                "nasdaq.com/press-release"
                             )
                         )
                         if is_priority:

@@ -138,6 +138,30 @@ def _days_ago(date_str: str) -> int:
     except Exception:
         return 9999
 
+EARNINGS_ANCIENT_DAYS   = 365  # older than this is ALWAYS flagged, even during a retry cooldown
+HOLDINGS_STALE_PRICE_DAYS = 5   # holdings prices older than this make weights/concentration unreliable
+
+
+def _holdings_price_age(holdings: dict) -> tuple[int, str]:
+    """(days since the NEWEST position price_date, that date). (9999, "") if none."""
+    dates = [p.get("price_date", "") for p in (holdings or {}).get("positions", {}).values()
+             if p.get("price_date")]
+    if not dates:
+        return 9999, ""
+    newest = max(dates)
+    return _days_ago(newest), newest
+
+
+def _holdings_price_warning(holdings: dict) -> str:
+    age, newest = _holdings_price_age(holdings)
+    if age <= HOLDINGS_STALE_PRICE_DAYS:
+        return ""
+    return (f"⚠ HOLDINGS PRICES ARE STALE: newest position price is {newest} ({age} days old). "
+            f"Market values, position weights and concentration percentages below are NOT "
+            f"current — do not cite them as today's figures. (Run "
+            f"`python3 settle_portfolio.py --skip-settlement` to refresh prices first.)")
+
+
 NOVA_NO_DATA_RETRY_DAYS = 30  # must mirror nova_earnings_call.py's own
                               # NO_DATA_RETRY_DAYS constant — see fix note below
 
@@ -223,10 +247,16 @@ def _check_stale_language(summary: str) -> list[str]:
     explicitly handling/excluding old data), not evidence Jupiter is
     describing live stale data.
     """
-    DATA_QUALITY_CONTEXT = [
-        "nova", "earnings call", "transcript", "api", "data feed",
-        "record", "filing", "sec", "edgar",
-    ]
+    # Oct 2026: these were plain substrings, so "sec" matched "sector"/"second",
+    # "api" matched "capital"/"rapid", and "record" matched "record revenue" —
+    # nearly every window "confirmed" a data-quality context, which is why
+    # benign prose ("no longer ..." on PFE/CVX/TSLA) kept being flagged. Match
+    # whole words / specific phrases only.
+    DATA_QUALITY_RE = re.compile(
+        r"\b(?:nova|earnings call|transcripts?|api|data feeds?|feeds?|edgar|"
+        r"sec (?:filings?|data|edgar)|10-[kq]|filings?|"
+        r"(?:nova|earnings|legal|data|news|call|transcript)\s+records?|records?\s+(?:is|are|was|were)\s+\w*\s*(?:old|stale|outdated))\b",
+        re.IGNORECASE)
     EXCLUSION_CONTEXT = [
         "not used", "discarded", "discard", "pre-dates", "predates",
         "ignored", "superseded", "excluded", "per protocol",
@@ -251,7 +281,7 @@ def _check_stale_language(summary: str) -> list[str]:
                 # but keep scanning in case a later occurrence is genuine
                 idx += len(phrase_lower)
                 continue
-            if any(ctx in window for ctx in DATA_QUALITY_CONTEXT):
+            if DATA_QUALITY_RE.search(window):
                 found.append(phrase)
                 break  # Only flag once per phrase
             idx += len(phrase_lower)
@@ -374,6 +404,9 @@ def load_all_data() -> dict:
             result["holdings"] = json.load(f)
         print(f"    ✓ neptune_holdings.json  — "
               f"{len(result['holdings'].get('positions', {}))} positions")
+        _pw = _holdings_price_warning(result["holdings"])
+        if _pw:
+            print(f"    {_pw}")
     else:
         result["holdings"] = {}
         print("    ⚠ neptune_holdings.json not found")
@@ -525,10 +558,19 @@ def pass_nova(data: dict) -> str:
         call_date = earnings.get("call_date", "")
         if not call_date:
             missing_earnings.append(ticker)
-        elif _days_ago(call_date) > EARNINGS_STALE_DAYS and not _earnings_recently_attempted(earnings):
-            stale_earnings.append(
-                f"{ticker} ({call_date}, {_days_ago(call_date)}d ago)"
-            )
+        elif _days_ago(call_date) > EARNINGS_STALE_DAYS:
+            _age = _days_ago(call_date)
+            _attempted = _earnings_recently_attempted(earnings)
+            if _age > EARNINGS_ANCIENT_DAYS:
+                # Never hide an ancient record behind the retry cooldown: the
+                # cooldown only means a re-run would be skipped, not that the
+                # data is usable (PGR's 2024 record showed as "0 stale").
+                stale_earnings.append(
+                    f"{ticker} ({call_date}, {_age}d ago — ANCIENT"
+                    f"{'; no-data cooldown active, use the named-ticker CLI to force' if _attempted else ''})"
+                )
+            elif not _attempted:
+                stale_earnings.append(f"{ticker} ({call_date}, {_age}d ago)")
 
         # Legal staleness + risk
         legal = record.get("legal", {})
@@ -969,11 +1011,14 @@ def pass_synthesis(pass_notes: dict, data: dict) -> str:
             f"{top_str}\n"
             f"  Total positions tracked: {len(pos)}\n"
         )
+        _pw = _holdings_price_warning(holdings_data)
+        if _pw:
+            holdings_summary += f"  {_pw}\n"
 
     # Compile all sector notes
     sector_notes_list = [
         (key, note) for key, note in pass_notes.items()
-        if key not in ("atlas", "mercury", "nova", "synthesis")
+        if key not in ("atlas", "mercury", "nova", "synthesis", "trade_review")
     ]
 
     n_tickers = data.get("n_tickers", len(data.get("by_ticker", {})))
@@ -1209,15 +1254,48 @@ def pass_trade_review(data: dict) -> tuple[str, list[dict]]:
         if flags:
             pre_flags[ticker] = flags
 
-    # Cash floor check (aggregate)
+    # Cash floor check (aggregate). Settlement processes APPROVED sells first,
+    # so sell proceeds fund buys; the old check compared buys alone against
+    # starting cash and told Jansky the floor would be breached when the same
+    # batch's sells more than covered it (Oct 10: "$9.2M of buys -> 8.4%" while
+    # $6.6M of pitched sells kept cash above 12%) — which pushed him to reject
+    # buys unnecessarily.
+    total_sell_dollars = sum(
+        t.get("dollars", 0) for t in all_trades if t.get("action") == "REDUCE_POSITION"
+    )
+    floor_dollars = total_val * cash_floor_pct / 100 if total_val else 0
+    headroom      = cash_val - floor_dollars
+    cash_after_all_pct = (
+        ((cash_val - total_buy_dollars + total_sell_dollars) / total_val * 100) if total_val else 0
+    )
     cash_warning = ""
-    if total_buy_dollars > 0 and post_buy_cash_pct < cash_floor_pct:
+    if total_buy_dollars > 0 and total_val:
         cash_warning = (
-            f"⚠ CASH FLOOR WARNING: If all buy pitches approved (${total_buy_dollars:,.0f}), "
-            f"cash drops to {post_buy_cash_pct:.1f}% — below {cash_floor_pct:.0f}% floor. "
-            f"Jansky must prioritize which buys to approve."
+            f"CASH PLAN: cash ${cash_val:,.0f} ({cash_pct:.1f}%); {cash_floor_pct:.0f}% floor = "
+            f"${floor_dollars:,.0f}, so ${headroom:,.0f} of buying room before any sells. "
+            f"Pitched buys ${total_buy_dollars:,.0f}; pitched sells ${total_sell_dollars:,.0f}. "
+            f"Settlement runs APPROVED sells first, so the rule is: total APPROVED buys <= "
+            f"${headroom:,.0f} + total APPROVED sells. If every pitch were approved, cash would "
+            f"end at {cash_after_all_pct:.1f}%."
         )
+        if cash_after_all_pct < cash_floor_pct:
+            needed = total_buy_dollars - total_sell_dollars - headroom
+            cash_warning = (
+                "⚠ CASH FLOOR WARNING (even counting every pitched sell): " + cash_warning +
+                f" Approving everything would breach the floor by ${needed:,.0f}; "
+                f"prioritize which buys to approve."
+            )
+        elif total_buy_dollars > headroom:
+            cash_warning += (
+                f" Buys alone exceed the room by ${total_buy_dollars - headroom:,.0f} — fine as long "
+                f"as at least that much in sells is APPROVED. Do not reject buys just because of the "
+                f"gross buy total."
+            )
         print(f"    {cash_warning}")
+    _pw = _holdings_price_warning(holdings)
+    if _pw:
+        cash_warning = (cash_warning + "\n" + _pw).strip()
+        print(f"    {_pw}")
 
     print(f"    Pre-checks: {len(all_trades)} trades, {len(pre_flags)} flagged")
     for ticker, flags in pre_flags.items():
@@ -1530,6 +1608,15 @@ def write_trade_feedback(decisions: list[dict], config: dict) -> None:
         ticker: entry for ticker, entry in existing.items()
         if entry.get("date", "") >= cutoff[:10]
     }
+
+    # A new review replaces the previous one: approvals from an earlier run
+    # that were never executed must not be settled alongside this run's
+    # decisions (they stay in the file only as context for Jupiter).
+    _new_tickers = {d.get("ticker") for d in decisions}
+    for _t, _e in pruned.items():
+        if (_t not in _new_tickers and _e.get("decision") == "APPROVE"
+                and _e.get("settlement_status") != "settled"):
+            _e["superseded"] = True
 
     # Add this week's decisions
     today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -2153,7 +2240,10 @@ def main():
     trade_decisions_list: list[dict] = []
 
     # ── Try to load existing pass_notes (for --pass synthesis reruns) ─────
-    if os.path.exists(JANSKY_LATEST):
+    # Only for partial reruns (--pass / --sector). A full run recomputes every
+    # note, and carrying over yesterday-morning's trade_review (or any other
+    # leftover key) contaminates the synthesis.
+    if (PASS_FILTER or SECTOR_FILTER) and os.path.exists(JANSKY_LATEST):
         try:
             with open(JANSKY_LATEST) as f:
                 existing = json.load(f)

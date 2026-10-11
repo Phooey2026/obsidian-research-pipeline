@@ -64,6 +64,11 @@ def _load_config() -> dict:
 _config = _load_config()
 CASH_FLOOR_PCT = _config.get("cash_floor", {}).get("min_cash_pct", 10.0)
 
+# A REDUCE that would leave less than this in the position closes it out instead.
+# A $500K "exit" of an ADSK position bought at $209.40 and sold at $212.00 used to
+# leave 29 shares ($6K) behind forever; a stub that small is never a deliberate hold.
+DUST_EXIT_DOLLARS = 25_000
+
 # Known ETF tickers this pipeline tracks — used to classify a brand-new
 # NEW_POSITION as "etf" vs "equity" (matches mercurymcp's DEFAULT_ETFS list).
 KNOWN_ETFS = {
@@ -195,7 +200,13 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
     # check below rather than recomputing (and drifting) mid-loop.
     total_value = cash + sum(p.get("market_value", 0) for p in positions.values())
 
-    approved = {t: d for t, d in feedback.items() if d.get("decision") == "APPROVE"}
+    approved = {t: d for t, d in feedback.items()
+                if d.get("decision") == "APPROVE" and not d.get("superseded")}
+    _sup = [t for t, d in feedback.items()
+            if d.get("decision") == "APPROVE" and d.get("superseded")]
+    if _sup:
+        print(f"  (ignoring {len(_sup)} approval(s) from an earlier review that a "
+              f"newer Jansky run replaced: {', '.join(_sup)})")
     if not approved:
         print("  No approved trades in jansky_trade_feedback.json.")
         return holdings
@@ -312,17 +323,23 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
             print(f"  ✓ {ticker}: ADD_TO_POSITION  +{add_shares:,.2f} sh @ ${price:.2f}  (${dollars:,.0f})")
 
         elif action == "REDUCE_POSITION":
+            executed_dollars = dollars
             if pos is None:
                 print(f"  ⚠ {ticker}: REDUCE_POSITION but not currently held — skipping")
                 _mark(decision, "not_executed", "REDUCE_POSITION but not held")
                 continue
             sell_shares = dollars / price
-            if sell_shares >= pos["shares"]:
-                # Full exit
+            _remaining_value = (pos["shares"] - sell_shares) * price
+            if sell_shares >= pos["shares"] or _remaining_value < DUST_EXIT_DOLLARS:
+                # Full exit (including a would-be sliver below the dust threshold)
                 proceeds = pos["shares"] * price
                 cash += proceeds
+                executed_dollars = proceeds
+                _dust = (f"  [remainder ${max(_remaining_value, 0):,.0f} < "
+                         f"${DUST_EXIT_DOLLARS:,.0f} dust threshold, closed out]"
+                         if sell_shares < pos["shares"] else "")
                 print(f"  ✓ {ticker}: REDUCE_POSITION → FULL EXIT  "
-                      f"{pos['shares']:,.2f} sh @ ${price:.2f}  (${proceeds:,.0f})")
+                      f"{pos['shares']:,.2f} sh @ ${price:.2f}  (${proceeds:,.0f}){_dust}")
                 del positions[ticker]
             else:
                 frac_sold = sell_shares / pos["shares"]
@@ -348,7 +365,7 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
             continue
 
         _mark(decision, "settled", f"executed {today}")
-        trade_log.append({
+        _entry = {
             "settled_date":  today,
             "decision_date": d_date,
             "pitch_id":      pitch_id,
@@ -358,7 +375,12 @@ def settle_trades(holdings: dict, feedback: dict, dry_run: bool,
             "price":         round(price, 2),
             "rationale":     decision.get("rationale", "")[:300],
             "pitched_by":    decision.get("pitched_by"),
-        })
+        }
+        # A full exit credits the position's real value, which can differ from the
+        # pitched dollars; record it so the log reconciles with cash.
+        if action == "REDUCE_POSITION" and abs(executed_dollars - dollars) > 1:
+            _entry["executed_dollars"] = round(executed_dollars, 2)
+        trade_log.append(_entry)
         applied += 1
 
     summary["cash_value"] = round(cash, 2)

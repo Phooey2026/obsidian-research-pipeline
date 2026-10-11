@@ -65,7 +65,8 @@ def extract_summary_verdict(summary: str) -> str | None:
 def load_config() -> dict:
     """Load obsidian_config.json. Returns defaults if missing."""
     defaults = {
-        "trade_limits": {"min_trade_dollars": 250000, "max_trade_dollars": 1000000},
+        "trade_limits": {"min_trade_dollars": 250000, "max_trade_dollars": 1000000,
+                         "max_weekly_pitches": 7},
         "position_limits": {"max_etf_position_pct": 15.0, "max_equity_position_pct": 10.0},
         "cash_floor": {"min_cash_pct": 10.0},
         "fragment_dir": "fragments",
@@ -272,6 +273,7 @@ def pitch_trades_for_sector(sector_name: str, tickers: list[str],
     total_val = holdings.get("summary", {}).get("total_portfolio_value", 0) if holdings else 0
     min_trade = config.get("trade_limits", {}).get("min_trade_dollars", 250000)
     max_trade = config.get("trade_limits", {}).get("max_trade_dollars", 1000000)
+    max_weekly = config.get("trade_limits", {}).get("max_weekly_pitches", 7)
 
     holdings_context = build_holdings_context(holdings, config)
     briefs_text = "\n\n".join(b for _, b in briefs)
@@ -309,8 +311,22 @@ the best case the data supports.
 {holdings_context}{feedback_block}
 
 TRADE PITCH RULES:
+- WEEKLY BUDGET: the whole desk (all sectors together) may send Jansky only
+  about {max_weekly} trade pitches this week. Most sectors should therefore
+  pitch NOTHING. "NO_TRADES" is the expected answer for a typical sector;
+  pitch only if this idea would rank among the best {max_weekly} ideas in the
+  entire portfolio, not merely the best in this sector.
+- Pitch at most 1 trade for this sector. Pitch a 2nd only if the two are a
+  linked rotation (a trim that funds a buy in the same sector) and both are
+  score 8 or higher.
 - Only pitch trades where conviction is HIGH based on the data below
-- Pitch 0-3 trades per sector maximum (quality over quantity)
+- Give every pitch a "conviction_score" from 1 to 10 for the whole portfolio:
+  10 = once-a-year idea, 8 = clearly better than most of what we hold,
+  6 = decent but not urgent (do not pitch below 7). Be honest — scores are
+  used to pick the best {max_weekly} pitches across all sectors.
+- A NEW_POSITION or ADD_TO_POSITION on a name whose verdict is WATCH should be
+  rare and needs a specific, dated catalyst or a score of 9+. Never buy an
+  AVOID name.
 - Dollar amounts must be between ${min_trade:,.0f} and ${max_trade:,.0f}
 - For ADD_TO_POSITION: ticker must already appear in holdings above
 - For REDUCE_POSITION: ticker must already appear in holdings above
@@ -318,21 +334,17 @@ TRADE PITCH RULES:
 - Be explicit about the action: e.g. "I recommend we buy $X of TICKER
   because..." for a new or added position, or "I recommend we trim $X
   from our TICKER position because..." for a reduce.
-- REQUIRED: before pitching anything, review every ticker in this sector
-  that we currently HOLD (see holdings above) for signs it should be
-  trimmed — overbought technicals (RSI, extended well above moving
-  averages), weakening fundamentals, deteriorating legal/regulatory
-  risk, or a thesis that's played out or broken. A REDUCE_POSITION
-  pitch is just as valuable as a buy pitch and should be given equal
-  weight, not treated as a fallback only considered when nothing else
-  looks attractive.
-- Cash is a scarce, shared resource across the whole portfolio: if the
-  case for a new or added position isn't clearly stronger than the
-  case for trimming a weaker held position in this sector, prefer
-  proposing the reduce. The portfolio cannot fund every buy pitch
-  without selling something first, and there have not been enough
-  reduce candidates proposed to do that.
-- If no compelling trade exists this week, respond with: NO_TRADES
+- Before pitching anything, check every ticker in this sector that we
+  currently HOLD for signs it should be trimmed — overbought technicals
+  (RSI, extended well above moving averages), weakening fundamentals,
+  deteriorating legal/regulatory risk, or a thesis that has played out or
+  broken. A REDUCE_POSITION pitch is as valuable as a buy pitch and is
+  scored on the same scale.
+- Cash is a scarce, shared resource: if the case for a buy isn't clearly
+  stronger than the case for trimming a weaker held position in this sector,
+  prefer the reduce.
+- If no compelling trade exists this week, respond with the JSON below with
+  an empty trades list (this is the normal outcome).
 
 REQUIRED OUTPUT FORMAT — respond with valid JSON only:
 {{
@@ -344,6 +356,7 @@ REQUIRED OUTPUT FORMAT — respond with valid JSON only:
       "dollars": 500000,
       "rationale": "Full analyst pitch — 3-5 sentences citing specific data: P/E, earnings trend, technical setup, catalyst. Make the case.",
       "conviction": "HIGH",
+      "conviction_score": 8,
       "key_risk": "One sentence on biggest risk to this trade"
     }},
     {{
@@ -352,6 +365,7 @@ REQUIRED OUTPUT FORMAT — respond with valid JSON only:
       "dollars": 500000,
       "rationale": "Full analyst pitch for TRIMMING an existing position — 3-5 sentences citing specific data: why it's overbought or the fundamentals/legal picture has weakened, what changed since we bought it, and why now. Make the sell case as rigorously as a buy case.",
       "conviction": "HIGH",
+      "conviction_score": 8,
       "key_risk": "One sentence on the biggest risk to trimming this position (e.g. selling too early if the thesis re-accelerates)"
     }}
   ]
@@ -399,6 +413,93 @@ will break JSON parsing entirely.
     except Exception as e:
         print(f"✗ ({e})")
         return []
+
+
+# ─── Weekly pitch cap ─────────────────────────────────────────────────────────
+def _pitch_score(trade: dict, verdicts: dict, rank_scores: dict) -> float:
+    """Higher = better. Jupiter's own conviction_score drives it; the sector
+    verdict and rank score only break ties / nudge buys."""
+    try:
+        base = float(trade.get("conviction_score"))
+    except (TypeError, ValueError):
+        base = 6.0                       # unscored pitches rank below scored ones
+    t = str(trade.get("ticker", "")).upper()
+    is_buy = trade.get("action") in ("NEW_POSITION", "ADD_TO_POSITION")
+    v = verdicts.get(t)
+    if is_buy:
+        if v == "ACCUMULATE":
+            base += 1.5
+        elif v == "WATCH":
+            base -= 0.5
+    elif v == "AVOID":                   # trimming an AVOID holding is on-thesis
+        base += 1.0
+    # Tiny tie-break from the sector rank score (0-10). Buys prefer the
+    # STRONGER name; trims prefer the WEAKER one.
+    try:
+        rs = float(rank_scores.get(t))
+        base += (rs if is_buy else (10.0 - rs)) / 100.0
+    except (TypeError, ValueError):
+        pass
+    return base
+
+
+def select_weekly_pitches(trades: list, verdicts: dict, rank_scores: dict,
+                          holdings: dict, config: dict) -> tuple[list, list]:
+    """
+    Cap the week's Jupiter pitches. Returns (kept, dropped[with reason]).
+      1. drop buys on AVOID names
+      2. keep the top `max_weekly_pitches` by score
+      3. cash check: kept buys must fit within (cash - floor) + kept sells;
+         drop the lowest-scored buys until they do
+    """
+    limits = config.get("trade_limits", {})
+    max_n = int(limits.get("max_weekly_pitches", 7))
+    dropped: list = []
+
+    watch_min = float(limits.get("watch_buy_min_score", 9))
+    pool = []
+    for t in trades:
+        tk = str(t.get("ticker", "")).upper()
+        is_buy = t.get("action") in ("NEW_POSITION", "ADD_TO_POSITION")
+        if is_buy and verdicts.get(tk) == "AVOID":
+            dropped.append({**t, "dropped_reason": "buy on an AVOID-verdict name"})
+            continue
+        if is_buy and verdicts.get(tk) == "WATCH":
+            try:
+                sc = float(t.get("conviction_score"))
+            except (TypeError, ValueError):
+                sc = 0.0
+            if sc < watch_min:
+                dropped.append({**t, "dropped_reason":
+                                f"buy on a WATCH name needs score >= {watch_min:g}"})
+                continue
+        pool.append(t)
+
+    pool.sort(key=lambda t: _pitch_score(t, verdicts, rank_scores), reverse=True)
+    kept, over = pool[:max_n], pool[max_n:]
+    for t in over:
+        dropped.append({**t, "dropped_reason": f"below weekly cap of {max_n}"})
+
+    summary = (holdings or {}).get("summary", {})
+    total = summary.get("total_portfolio_value", 0)
+    cash = summary.get("cash_value", 0)
+    floor_pct = config.get("cash_floor", {}).get("min_cash_pct", 10.0)
+    if total:
+        room = cash - total * floor_pct / 100.0
+        def _d(t):
+            try:
+                return float(t.get("dollars", 0))
+            except (TypeError, ValueError):
+                return 0.0
+        while True:
+            buys = [t for t in kept if t.get("action") in ("NEW_POSITION", "ADD_TO_POSITION")]
+            sells = [t for t in kept if t.get("action") == "REDUCE_POSITION"]
+            if sum(map(_d, buys)) <= room + sum(map(_d, sells)) or not buys:
+                break
+            worst = min(buys, key=lambda t: _pitch_score(t, verdicts, rank_scores))
+            kept.remove(worst)
+            dropped.append({**worst, "dropped_reason": "kept buys would breach the cash floor"})
+    return kept, dropped
 
 
 # ─── Rank Sector via Hermes ────────────────────────────────────────────────────
@@ -1458,6 +1559,8 @@ def main(json_path: str = None):
 
     all_rankings   = []
     all_trade_pitches = []   # Accumulates Jupiter trade pitches across all sectors
+    global_verdicts: dict = {}     # ticker -> ACCUMULATE/WATCH/AVOID (for the weekly cap)
+    global_rank_scores: dict = {}  # ticker -> sector-rank score
 
     for sector_name, tickers in sectors.items():
         print(f"\n  {sector_name}")
@@ -1480,6 +1583,7 @@ def main(json_path: str = None):
             brief = build_brief(res)
             briefs.append((ticker, brief))
             verdict_map[ticker.upper()] = extract_summary_verdict(res.get("summary", ""))
+            global_verdicts[ticker.upper()] = verdict_map[ticker.upper()]
             print(f"    ✓ Brief built for {ticker} ({len(brief):,} chars)")
 
         # ── Pass A: Sector ranking ─────────────────────────────────────────
@@ -1492,6 +1596,7 @@ def main(json_path: str = None):
                 v = s.get("verdict", "?")
                 t = s.get("ticker", "?")
                 score = s.get("score", "?")
+                global_rank_scores[str(t).upper()] = score
                 print(f"    {'🟢' if v=='ACCUMULATE' else '🟡' if v=='WATCH' else '🔴'} "
                       f"{t:6s} {v:10s} score={score}/10")
         else:
@@ -1532,11 +1637,27 @@ def main(json_path: str = None):
         except Exception:
             existing_decisions = {}
 
+    # Weekly cap: Jupiter pitches per sector independently, so cut to the best N
+    n_raw = len(all_trade_pitches)
+    all_trade_pitches, dropped_pitches = select_weekly_pitches(
+        all_trade_pitches, global_verdicts, global_rank_scores, holdings, config)
+    if dropped_pitches:
+        print(f"\n  Weekly pitch cap: {n_raw} pitched -> {len(all_trade_pitches)} kept")
+        for t in all_trade_pitches:
+            print(f"    KEEP  {t.get('ticker','?'):6s} {t.get('action','?'):16s} "
+                  f"${float(t.get('dollars',0) or 0):>9,.0f}  score={t.get('conviction_score','?')}")
+        for t in dropped_pitches:
+            print(f"    drop  {t.get('ticker','?'):6s} {t.get('action','?'):16s} "
+                  f"${float(t.get('dollars',0) or 0):>9,.0f}  score={t.get('conviction_score','?')}"
+                  f"  ({t['dropped_reason']})")
+
     existing_decisions["jupiter"] = {
         "run_date":   run_date,
         "generated_at": datetime.datetime.now().isoformat(),
         "trade_count": len(all_trade_pitches),
         "trades":     all_trade_pitches,
+        "pitched_before_cap": n_raw,
+        "dropped_by_cap": dropped_pitches,
     }
     existing_decisions["_meta"] = {
         "last_updated": datetime.datetime.now().isoformat(),

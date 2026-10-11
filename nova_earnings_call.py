@@ -364,7 +364,11 @@ def parse_call_date(transcript_text: str) -> str:
                             return parsed.strftime('%Y-%m-%d')
                     except ValueError:
                         continue
-    return datetime.date.today().isoformat()
+    # No recognizable date in the text. Previously this returned TODAY, so an
+    # undated page (e.g. an IR "quarterly results" landing page) was saved as if
+    # the call happened today and never looked stale again (DUK, Oct 2026).
+    # Unknown is "" — callers must handle it.
+    return ""
 
 
 def parse_fiscal_quarter(transcript_text: str) -> str:
@@ -604,8 +608,13 @@ JSON only. No preamble."""
                 continue
             _cdate     = parse_call_date(_result)
             _sort_date = _sanitize_sort_date(_cdate)
-            flag = " → out of range, low priority" if (_sort_date == "1900-01-01" and _cdate != _today_str) else ""
-            print(f"✓ ({len(_result):,} chars, date={_cdate}{flag})")
+            if not _cdate:
+                flag = " → NO DATE FOUND in page text, low priority"
+            elif _sort_date == "1900-01-01":
+                flag = " → out of range, low priority"
+            else:
+                flag = ""
+            print(f"✓ ({len(_result):,} chars, date={_cdate or 'unknown'}{flag})")
             candidates.append((_sort_date, _url, _result))
         else:
             if not _result:
@@ -637,7 +646,8 @@ JSON only. No preamble."""
     fetch_result = candidates[0][2]
     fetch_url    = candidates[0][1]
     source_url   = candidates[0][1]
-    print(f"    → Selected candidate dated {candidates[0][0]} ({fetch_url[:60]})")
+    _sel = candidates[0][0]
+    print(f"    → Selected candidate dated {'undated/out-of-range' if _sel == '1900-01-01' else _sel} ({fetch_url[:60]})")
 
 
     transcript_text = fetch_result
@@ -659,7 +669,7 @@ JSON only. No preamble."""
 
     _prompt = f"""You are Nova, Obsidian Capital's intelligence assistant.
 You have retrieved the most recent earnings call for {company_name} ({ticker.upper()}).
-Auto-parsed call date (UNVERIFIED — may be wrong, check against the content below): {call_date}
+Auto-parsed call date (UNVERIFIED — may be wrong, check against the content below): {call_date or 'NOT FOUND'}
 Auto-parsed fiscal quarter (UNVERIFIED — may be wrong, check against the content below): {fiscal_quarter}
 Source: {source}
 
@@ -720,7 +730,16 @@ not be trusted without checking against what the article itself states.
         _raw, _re.IGNORECASE)
 
     if _date_match:
-        call_date = _date_match.group(1).strip()
+        _nd = _date_match.group(1).strip()
+        # Only trust Nova's date if it is a plausible earnings-call date.
+        try:
+            _p = datetime.date.fromisoformat(_nd)
+            if datetime.date(2015, 1, 1) <= _p <= datetime.date.today() + datetime.timedelta(days=1):
+                call_date = _nd
+            else:
+                print(f"(ignoring implausible CALL_DATE {_nd})", end=" ")
+        except ValueError:
+            pass
     if _fq_match:
         fiscal_quarter = _fq_match.group(1).strip()
 
@@ -753,6 +772,9 @@ not be trusted without checking against what the article itself states.
         return "no_data"
 
     print(f"✓ ({len(summary):,} chars)")
+    if not call_date:
+        print(f"    ⚠ no call date found in the page or in Nova's answer — saving with an "
+              f"UNKNOWN date (will be re-checked on the next run; Jupiter is told the date is unknown)")
 
     # ── Step 4: Save to Nova JSON ──────────────────────────────────────────
     today  = datetime.date.today().isoformat()

@@ -1030,9 +1030,22 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             return f"No US-GAAP financial data found for {ticker_upper} "\
                    f"(CIK: {cik}). Company may use IFRS reporting."
 
+        def _unit_items(concept, unit):
+            """Facts for a concept in `unit`. Per-share concepts are not always filed
+            under the literal 'USD/shares' key (e.g. partnership per-unit tags), so any
+            'USD/…' unit is accepted for them."""
+            units = facts.get(concept, {}).get('units', {})
+            if unit in units:
+                return units[unit]
+            if unit.startswith('USD/'):
+                for k, v in units.items():
+                    if k.startswith('USD/'):
+                        return v
+            return []
+
         # Step 3: Extract quarterly data helper
         def get_quarterly(concept, unit):
-            items = facts.get(concept, {}).get('units', {}).get(unit, [])
+            items = _unit_items(concept, unit)
             seen = {}
             for x in items:
                 if x.get('form') in ('10-Q', '10-Q/A'):
@@ -1072,7 +1085,7 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
                 concepts = [concepts]
             seen = {}
             for concept in concepts:
-                items = facts.get(concept, {}).get('units', {}).get(unit, [])
+                items = _unit_items(concept, unit)
                 for x in items:
                     if x.get('form') not in ('10-K', '10-K/A'):
                         continue
@@ -1091,23 +1104,40 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             return sorted(seen.values(),
                          key=lambda x: x['end'], reverse=True)
 
+        def best_quarterly(concepts, unit):
+            """Quarterly series from whichever candidate tag has the NEWEST data.
+
+            The old code took the first tag that returned ANYTHING, so a filer that
+            used a tag years ago and a different one now got its ancient series
+            (EPD showed 2010/2011 quarters). First-listed wins ties, so preferred
+            tags (diluted before basic) still win when equally current."""
+            best = []
+            for c in concepts:
+                q = get_quarterly(c, unit)
+                if q and (not best or q[0]['end'] > best[0]['end']):
+                    best = q
+            return best
+
         quarters = min(quarters, 12)
         lines = [f"=== {company_name} ({ticker_upper}) — SEC EDGAR ===\n"]
 
-        # Step 5: Quarterly EPS
-        eps_q = get_quarterly('EarningsPerShareDiluted', 'USD/shares')
-        if not eps_q:
-            eps_q = get_quarterly('EarningsPerShareBasic', 'USD/shares')
+        # Step 5: Quarterly EPS — newest-data tag wins (see best_quarterly)
+        eps_q = best_quarterly(
+            ['EarningsPerShareDiluted', 'EarningsPerShareBasic',
+             'IncomeLossFromContinuingOperationsPerDilutedShare',
+             'IncomeLossFromContinuingOperationsPerBasicShare',
+             'NetIncomeLossPerOutstandingLimitedPartnershipUnit',
+             'IncomeLossFromContinuingOperationsPerOutstandingLimitedPartnershipUnit'],
+            'USD/shares')
 
-        # Step 6: Quarterly Revenue — try multiple GAAP concepts
-        rev_q = get_quarterly(
-            'RevenueFromContractWithCustomerExcludingAssessedTax', 'USD')
-        if not rev_q:
-            rev_q = get_quarterly('Revenues', 'USD')
-        if not rev_q:
-            rev_q = get_quarterly('SalesRevenueNet', 'USD')
-        if not rev_q:
-            rev_q = get_quarterly('RevenueFromContractWithCustomerIncludingAssessedTax', 'USD')
+        # Step 6: Quarterly Revenue — newest-data tag wins. Utility tags added:
+        # utilities (XEL etc.) often report under RegulatedAndUnregulatedOperatingRevenue.
+        rev_q = best_quarterly(
+            ['RevenueFromContractWithCustomerExcludingAssessedTax',
+             'Revenues', 'SalesRevenueNet',
+             'RevenueFromContractWithCustomerIncludingAssessedTax',
+             'RegulatedAndUnregulatedOperatingRevenue', 'ElectricUtilityRevenue'],
+            'USD')
 
         # Bank/thrift revenue override (Sept 2026 fix — confirmed on HBAN,
         # MTB, CFG). ASC 606 "contract with customer" revenue explicitly
@@ -1168,7 +1198,8 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
         rev_annual_for_q4 = get_annual(
             ['RevenueFromContractWithCustomerExcludingAssessedTax',
              'Revenues', 'SalesRevenueNet',
-             'RevenueFromContractWithCustomerIncludingAssessedTax'],
+             'RevenueFromContractWithCustomerIncludingAssessedTax',
+             'RegulatedAndUnregulatedOperatingRevenue', 'ElectricUtilityRevenue'],
             'USD')
         bank_rev_annual = _bank_revenue(quarterly=False)
         if bank_rev_annual:
@@ -1235,6 +1266,17 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
 
         if displayed == 0:
             lines.append("  No quarterly EPS data found in SEC filings.")
+        elif eps_q:
+            _newest_q = max(q['end'] for q in eps_q)
+            try:
+                _qage = (datetime.now() - datetime.strptime(_newest_q, '%Y-%m-%d')).days
+            except Exception:
+                _qage = 0
+            if _qage > 200:
+                lines.append(
+                    f"  ⚠ STALE: newest quarterly EPS on file is {_newest_q} ({_qage} days old) — "
+                    f"this filer likely reports under XBRL tags not covered here; do NOT treat "
+                    f"this table as current.")
 
         # Step 9: Annual revenue trend — merged across all known revenue
         # tags (see get_annual() fix note above), not a sequential fallback
@@ -1242,7 +1284,8 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             ['RevenueFromContractWithCustomerExcludingAssessedTax',
              'Revenues',
              'SalesRevenueNet',
-             'RevenueFromContractWithCustomerIncludingAssessedTax'],
+             'RevenueFromContractWithCustomerIncludingAssessedTax',
+             'RegulatedAndUnregulatedOperatingRevenue', 'ElectricUtilityRevenue'],
             'USD')
         # Bank/thrift override — see the _bank_revenue() note above.
         if bank_rev_annual:
