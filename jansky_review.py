@@ -481,15 +481,30 @@ def pass_mercury(data: dict) -> str:
     summary = mercury.get("summary", "")
     run_date = mercury.get("run_date", "unknown")
 
-    # Extract Mercury's self-reported data gap section
+    # Extract Mercury's self-reported data gap section. Oct 2026: Mercury now
+    # writes a mandatory "## 5. Data Gaps & Confidence" section; the older
+    # "Data gaps: ..." pattern is kept as a fallback for earlier reports.
     gap_section = ""
-    if "Data gaps" in summary or "DATA GAPS" in summary:
+    _sec = re.search(
+        r'(?ims)^#{1,4}\s*(?:\d+\.?\s*)?data gaps.*?$(.*?)(?=^#{1,4}\s|\Z)', summary)
+    if _sec:
+        gap_section = _sec.group(1).strip()[:2500]
+    elif "Data gaps" in summary or "DATA GAPS" in summary:
         gap_match = re.search(
             r'(Data gaps?[^\n]*:.*?)(?=\n---|\n#|\Z)',
             summary, re.IGNORECASE | re.DOTALL
         )
         if gap_match:
             gap_section = gap_match.group(1)[:800]
+
+    # Gaps detected in Python from the feeds' own warnings (STALE, unavailable...)
+    detected = mercury.get("data_gaps")
+    if detected:
+        detected_text = "\n".join(f"  - [{g.get('feed')}] {g.get('issue')}" for g in detected)
+    elif detected == []:
+        detected_text = "  (none detected)"
+    else:
+        detected_text = "  (not recorded — report predates the automated scan)"
 
     # Extract confidence rating if present
     confidence = "UNKNOWN"
@@ -512,7 +527,9 @@ Report date: {run_date}
 
 Your job:
 1. Is the data gap list acceptable, or are any gaps critical enough to
-   affect the usefulness of Mercury's analysis?
+   affect the usefulness of Mercury's analysis? Compare Mercury's own
+   gap section with the AUTOMATED SCAN below and name any detected gap
+   Mercury left out or understated.
 2. Did Mercury use the Atlas macro backdrop appropriately as context?
 3. Is Mercury's cross-market synthesis coherent and useful?
 4. Rate Mercury's output: STRONG / ADEQUATE / NEEDS IMPROVEMENT
@@ -524,6 +541,9 @@ Be concise — 200-250 words. Write as a section of your weekly briefing to Jay.
 
 MERCURY'S SELF-REPORTED DATA GAPS:
 {gap_section if gap_section else '(none explicitly flagged)'}
+
+AUTOMATED SCAN OF THE FEEDS (what the data tools themselves flagged):
+{detected_text}
 
 MERCURY FULL REPORT (first 200000 chars):
 {summary[:20000]}

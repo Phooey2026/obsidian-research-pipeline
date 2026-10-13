@@ -471,7 +471,7 @@ def get_stock_info(ticker: str) -> str:
             f"Analyst Target:    {fmt(info.get('targetMeanPrice'), prefix='$')}\n"
             f"Recommendation:    {info.get('recommendationKey', 'N/A').upper()}\n"
             f"Revenue (TTM):     {fmt(info.get('totalRevenue'), billions=True)}\n"
-            f"Profit Margin:     {fmt(info.get('profitMargins', 0) * 100, suffix='%')}\n"
+            f"Profit Margin:     {fmt(info.get('profitMargins') * 100 if info.get('profitMargins') is not None else None, suffix='%')}\n"
         )
     except Exception as e:
         return f"Error fetching info for {ticker}: {str(e)}"
@@ -973,12 +973,28 @@ def get_earnings(ticker: str) -> str:
         lines.append(f"  EPS (Forward):    ${info.get('forwardEps', 'N/A')}")
         lines.append(f"  Revenue (TTM):    ${info.get('totalRevenue', 0)/1e9:.2f}B"
                     if info.get('totalRevenue') else "  Revenue (TTM):    N/A")
-        lines.append(f"  Revenue Growth:   {info.get('revenueGrowth', 'N/A')}")
-        lines.append(f"  Earnings Growth:  {info.get('earningsGrowth', 'N/A')}")
-        lines.append(f"  Profit Margin:    {info.get('profitMargins', 'N/A')}")
+        # Oct 2026: Yahoo returns growth and margin as raw RATIOS (0.608 means
+        # 60.8%). Printed bare, the analyst read "Revenue Growth: 3.793" as
+        # 3.8% when it is 379%. Always show percentages, label the basis, and
+        # flag values that are almost certainly Yahoo data artifacts.
+        def _pct_str(v, flag_over=None, basis=""):
+            if not isinstance(v, (int, float)) or v != v:
+                return "N/A"
+            out = f"{v * 100:,.1f}%" + (f"  ({basis})" if basis else "")
+            if flag_over is not None and abs(v) > flag_over:
+                out += "  ⚠ extreme — likely a tiny-base or one-off effect, verify before use"
+            return out
+
+        lines.append(f"  Revenue Growth:   {_pct_str(info.get('revenueGrowth'), 2.0, 'latest quarter vs same quarter last year')}")
+        lines.append(f"  Earnings Growth:  {_pct_str(info.get('earningsGrowth'), 2.0, 'latest quarter vs same quarter last year')}")
+        lines.append(f"  Profit Margin:    {_pct_str(info.get('profitMargins'), None, 'net income / revenue, TTM')}")
         lines.append(f"  P/E (TTM):        {info.get('trailingPE', 'N/A')}")
         lines.append(f"  P/E (Forward):    {info.get('forwardPE', 'N/A')}")
-        lines.append(f"  PEG Ratio:        {info.get('pegRatio', 'N/A')}")
+        _peg = info.get('pegRatio')
+        _peg_note = ""
+        if isinstance(_peg, (int, float)) and (_peg <= 0 or _peg > 10):
+            _peg_note = "  ⚠ implausible PEG (Yahoo data artifact) — do not use"
+        lines.append(f"  PEG Ratio:        {_peg if _peg is not None else 'N/A'}{_peg_note}")
 
         return "\n".join(lines)
 

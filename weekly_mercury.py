@@ -217,6 +217,45 @@ def load_macro_backdrop() -> str:
     except Exception:
         return ""
 
+# ─── Python-side data-gap detection ──────────────────────────────────────────
+
+_GAP_MARKERS = ("stale", "unavailable", "error", "failed", "could not",
+                "no recent", "returned no", "not available", "missing",
+                "may not be reflected")
+
+
+def detect_data_gaps(collected_data: dict, max_per_feed: int = 4) -> list:
+    """
+    Scan every collected feed for the warnings the MCP tools themselves emit
+    (STALE, unavailable, error, ...). Oct 2026: Mercury's report was asked to
+    "flag missing data" but had nowhere to put it, so Jansky saw an empty gap
+    list while the body described six. Detecting these in Python makes the
+    list complete regardless of what the model remembers to write.
+    Returns [{"feed": ..., "issue": ...}, ...].
+    """
+    gaps = []
+    for feed, text in collected_data.items():
+        if feed == "mercury_backdrop" or not isinstance(text, str):
+            continue
+        if text.startswith("ERROR"):
+            gaps.append({"feed": feed, "issue": text[:160].strip()})
+            continue
+        seen, n = set(), 0
+        for line in text.split("\n"):
+            low = line.lower().strip()
+            if low.startswith("data-quality warning"):
+                continue      # summary of series lines already captured above it
+            if any(m in low for m in _GAP_MARKERS):
+                issue = " ".join(line.split())[:200]
+                if issue and issue not in seen:
+                    seen.add(issue)
+                    gaps.append({"feed": feed, "issue": issue})
+                    n += 1
+                    if n >= max_per_feed:
+                        break
+    return gaps
+
+
 # ─── Mercury LLM Summary ─────────────────────────────────────────────────────
 
 def generate_mercury_summary(collected_data: dict,
@@ -279,6 +318,12 @@ Use this context to tailor your analysis — these are live portfolio exposures.
     # Serialize collected data, omitting the backdrop YAML (already in preamble)
     data_for_prompt = {k: v for k, v in collected_data.items()
                        if k != "mercury_backdrop"}
+
+    detected_gaps = detect_data_gaps(collected_data)
+    if detected_gaps:
+        gaps_block = "\n".join(f"  - [{g['feed']}] {g['issue']}" for g in detected_gaps)
+    else:
+        gaps_block = "  (none detected by the automated scan)"
 
     prompt = f"""{macro_preamble}{holdings_preamble}You are Mercury, the Currencies, Cryptocurrencies & Commodities analyst
 at Obsidian Capital. Analyze the data provided below and produce your weekly
@@ -357,6 +402,26 @@ For each: instrument, rationale, what to watch for confirmation, key risk.
 
 **Risk Warnings (Top 1-2)**
 Specific asymmetric risks in the CCC universe this week.
+
+---
+
+## 5. Data Gaps & Confidence
+
+This section is MANDATORY — never omit it and never write "none" unless the
+AUTOMATED DATA-GAP SCAN below is empty AND you found nothing else. Write it as
+plain text (no bold, no tables) in exactly this form:
+
+Data gaps: <total number of gaps>
+- <feed or instrument> — <what is missing, stale or unreliable> — impact: HIGH/MEDIUM/LOW on <which conclusion above>
+- ... one line per gap
+Analysis confidence: HIGH, MEDIUM or LOW — <one sentence on why>
+
+Include EVERY item from the automated scan (you may merge duplicates) plus any
+other gap you noticed while writing sections 1-4. The count on the first line
+must equal the number of bullet lines.
+
+AUTOMATED DATA-GAP SCAN (warnings the data feeds themselves raised this week):
+{gaps_block}
 
 ---
 
@@ -1036,6 +1101,7 @@ def main():
         "run_date":      run_date,
         "generated_at":  datetime.datetime.now().isoformat(),
         "summary":       summary,
+        "data_gaps":     detect_data_gaps(collected),
         "data":          collected,
     }
 

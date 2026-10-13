@@ -320,6 +320,28 @@ def load_nova_supplemental() -> dict:
 
 # Age (days since the earnings CALL) at which a Nova earnings summary gets a
 # staleness warning in Jupiter's prompt, and the age at which it is omitted.
+# REITs: GAAP EPS / GAAP P/E mislead (real-estate depreciation, property-sale
+# gains), so Jupiter is told to use FFO/AFFO. Keep in sync with
+# REIT_TICKERS in nova_earnings_call.py.
+REIT_TICKERS = {"WELL", "PLD", "EQIX", "AMT", "SPG", "DLR", "PSA", "GLPI"}
+
+
+def _reit_note(ticker: str) -> str:
+    if ticker.upper() not in REIT_TICKERS:
+        return ""
+    return (
+        f"REIT VALUATION NOTE: {ticker.upper()} is a REIT. GAAP EPS and GAAP P/E are "
+        f"distorted by real-estate depreciation and gains/losses on property sales, "
+        f"so they are NOT the primary valuation lens. Use FFO/AFFO per share — the "
+        f"reported figures appear in the Nova earnings summary (section 'REIT Metrics') "
+        f"when Nova has researched this company. Always name the basis (NAREIT FFO, "
+        f"Core FFO or AFFO). Compute P/FFO only from a per-share figure you can see "
+        f"(annualize a single quarter x4 and say you did). If no FFO/AFFO figure is "
+        f"available, state 'FFO/AFFO not available this week' in your data-gaps "
+        f"section and do not present GAAP P/E as the valuation conclusion.\n\n"
+    )
+
+
 EARNINGS_WARN_DAYS = 120
 EARNINGS_DROP_DAYS = 365
 
@@ -559,7 +581,7 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
 """
 
     # ── Nova supplemental preamble ─────────────────────────────────────────
-    nova_preamble = _build_nova_preamble(ticker, nova_data)
+    nova_preamble = _reit_note(ticker) + _build_nova_preamble(ticker, nova_data)
 
     # ── Neptune portfolio holdings preamble ────────────────────────────────
     holdings_preamble = ""

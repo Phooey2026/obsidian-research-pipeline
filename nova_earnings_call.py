@@ -38,6 +38,24 @@ NOVAMCP_URL   = "http://localhost:8644/mcp"
 BASE_DIR      = "/home/jay/stock_dashboard"
 DATA_DIR      = f"{BASE_DIR}/data"
 NOVA_JSON     = f"{BASE_DIR}/nova_supplemental.json"
+
+# REITs report FFO/AFFO, not GAAP EPS, as their headline earnings measure.
+# Keep in sync with REIT_TICKERS in weekly_research.py.
+REIT_TICKERS = {"WELL", "PLD", "EQIX", "AMT", "SPG", "DLR", "PSA", "GLPI"}
+
+REIT_PROMPT_BLOCK = """
+8. **REIT Metrics** (this company is a REIT): Copy the figures EXACTLY as the
+   company reports them — do not compute or estimate any of them.
+   - FFO per share and/or AFFO per share (or Core FFO) for the quarter, and the
+     same quarter last year if given
+   - Which measure it is (NAREIT FFO, Core FFO, Normalized FFO or AFFO) — name
+     the company's own label
+   - Full-year FFO/AFFO per share guidance (range) and whether it was raised,
+     maintained or lowered
+   - Same-store/same-property NOI growth and occupancy if given
+   - GAAP EPS for the same quarter, so the reader can see the gap to FFO
+   If a figure is not in the text, write "not stated in this source" for it.
+"""
 WATCHLIST_JSON= f"{BASE_DIR}/watchlist.json"
 STALE_DAYS    = 85    # slightly under 90 to avoid missing calls on the edge
 NO_DATA_RETRY_DAYS = 30  # cooldown before re-attempting search on a ticker
@@ -293,7 +311,7 @@ EARNINGS CALL CONTENT:
 {transcript_text[:35000]}
 
 Synthesize this earnings call into a focused summary for our stock analyst Jupiter.
-Write 200-350 words covering:
+Write 200-350 words (up to 450 if section 8 applies) covering:
 
 1. **Management Tone**: Overall sentiment — confident, cautious, defensive, optimistic?
    Note any evasiveness on analyst questions.
@@ -314,7 +332,7 @@ Write 200-350 words covering:
    Any notable tension between management and the analyst community?
 
 7. **Key Risk**: The single most important risk or concern raised on the call.
-
+{REIT_PROMPT_BLOCK if ticker.upper() in REIT_TICKERS else ""}
 Be direct and analytical. This summary will be read by a financial analyst
 making buy/hold/sell decisions. Do not pad or hedge unnecessarily.
 
@@ -346,6 +364,13 @@ def parse_call_date(transcript_text: str) -> str:
         # (article ID, price, etc.) before it reaches a real date.
         for m in re.finditer(pat, transcript_text[:2000], re.IGNORECASE):
             raw = m.group(1)
+            # Oct 2026: a release's first date is often the PERIOD END ("for the
+            # quarter ended June 30, 2026"), not the release date (SPG, AMT were
+            # dated 2026-06-30 for July releases). Skip dates that follow
+            # period-end wording.
+            _ctx = transcript_text[max(0, m.start() - 45):m.start()].lower()
+            if re.search(r'(ended|ending|as of|through|since|from)\s*[,:]?\s*$', _ctx):
+                continue
             # Normalize quirks strptime's %b/%B can't handle directly:
             # "Sept" isn't a valid %b token, a trailing period on the
             # month isn't either, and all-caps/lowercase datelines need
@@ -677,7 +702,7 @@ EARNINGS CALL CONTENT:
 {transcript_text[:35000]}
 
 Synthesize this earnings call into a focused summary for our stock analyst Jupiter.
-Write 200-350 words covering:
+Write 200-350 words (up to 450 if section 8 applies) covering:
 
 1. **Management Tone**: Overall sentiment — confident, cautious, defensive, optimistic?
    Note any evasiveness on analyst questions.
@@ -698,7 +723,7 @@ Write 200-350 words covering:
    Any notable tension between management and the analyst community?
 
 7. **Key Risk**: The single most important risk or concern raised on the call.
-
+{REIT_PROMPT_BLOCK if ticker.upper() in REIT_TICKERS else ""}
 CRITICAL FORMATTING RULES:
 - Begin your response IMMEDIATELY with "**Management Tone**:" — no preamble,
   no "Here is the summary", no "Now I have everything", no meta-commentary.
