@@ -816,6 +816,23 @@ async def get_energy_prices() -> str:
                 except Exception:
                     pass
 
+        # ── Brent–WTI sanity check ───────────────────────────────────────
+        try:
+            def _first_num(prefix):
+                for ln in lines:
+                    if ln.startswith(prefix):
+                        return float(ln[len(prefix):].split()[0].replace("$", ""))
+                return None
+            _wti = _first_num("WTI Crude Oil ($/bbl)")
+            _brent = _first_num("Brent Crude Oil ($/bbl)")
+            if _wti and _brent:
+                _spr = _brent - _wti
+                if _spr < 0 or _spr > 15:
+                    lines.append(f"\nData-quality warning: Brent–WTI spread is ${_spr:.2f} "
+                                 f"(normal range roughly $2–$10). Verify both prints before relying on either.")
+        except Exception:
+            pass
+
         # ── US Crude Inventory (EIA weekly) ──────────────────────────────
         # Facets are required: without them, consecutive rows in the
         # response can be entirely different series (e.g. "Ending Stocks
@@ -827,24 +844,53 @@ async def get_energy_prices() -> str:
         # process series still share that scope; process=SAX pins to
         # exactly WCESTUS1 (Ending Stocks Excluding SPR) — the standard
         # weekly commercial crude inventory figure.
+        # Oct 17 2026 fix: this call failed with an EMPTY error message
+        # (httpx timeouts stringify to ""), so Mercury saw "Crude inventory
+        # error:" and a HIGH data gap. Now: longer timeout, one retry, the
+        # exception type in any message, and a FRED fallback (WCESTUS1 is the
+        # same weekly commercial crude stock series, in thousand barrels).
+        inv_data = []
+        inv_err = ""
+        for _attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=45) as client:
+                    r = await client.get(
+                        f"{EIA_BASE}/petroleum/stoc/wstk/data/",
+                        params={
+                            "api_key": EIA_API_KEY,
+                            "data[]":  "value",
+                            "facets[duoarea][]": "NUS",
+                            "facets[product][]": "EPC0",
+                            "facets[process][]": "SAX",
+                            "sort[0][column]": "period",
+                            "sort[0][direction]": "desc",
+                            "length": "5",
+                        },
+                    )
+                    r.raise_for_status()
+                    inv_data = r.json().get("response", {}).get("data", [])
+                    if inv_data:
+                        break
+                    inv_err = "EIA returned no rows"
+            except Exception as e:
+                inv_err = f"{type(e).__name__}: {e}"
+        if not inv_data:
+            try:
+                obs = await _fred_series("WCESTUS1", limit=6, frequency="")
+                fvals = [(o["date"], o["value"]) for o in obs if o["value"] is not None]
+                if fvals:
+                    d_latest, v_latest = fvals[-1]
+                    lines.append(f"\nUS Crude Inventories (Mbbl, ex-SPR):      {v_latest:,.0f}  [{d_latest}] (FRED fallback; EIA failed: {inv_err})")
+                    if len(fvals) >= 2:
+                        draw = v_latest - fvals[-2][1]
+                        signal = "↓ draw (bullish)" if draw < 0 else "↑ build (bearish)"
+                        lines.append(f"  Weekly change (Mbbl):                   {draw:+.1f}  {signal}")
+                else:
+                    lines.append(f"\nCrude inventory error: {inv_err} (FRED fallback returned no data)")
+            except Exception as e:
+                lines.append(f"\nCrude inventory error: {inv_err}; FRED fallback {type(e).__name__}: {e}")
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.get(
-                    f"{EIA_BASE}/petroleum/stoc/wstk/data/",
-                    params={
-                        "api_key": EIA_API_KEY,
-                        "data[]":  "value",
-                        "facets[duoarea][]": "NUS",
-                        "facets[product][]": "EPC0",
-                        "facets[process][]": "SAX",
-                        "sort[0][column]": "period",
-                        "sort[0][direction]": "desc",
-                        "length": "5",
-                    },
-                )
-                r.raise_for_status()
-                inv_data = r.json().get("response", {}).get("data", [])
-                if inv_data:
+            if inv_data:
                     inv_latest = inv_data[0]
                     inv_val    = inv_latest.get("value")
                     inv_period = inv_latest.get("period", "N/A")
@@ -1906,7 +1952,11 @@ async def get_baltic_dry() -> str:
                     break
 
             if bdi_value:
-                lines.append(f"Baltic Dry Index (BDI):  {bdi_value:,}  [{bdi_source_date}]")
+                if bdi_source_date:
+                    lines.append(f"Baltic Dry Index (BDI):  {bdi_value:,}  [{bdi_source_date}]")
+                else:
+                    lines.append(f"Baltic Dry Index (BDI):  {bdi_value:,}  [date not stated in source snippet — "
+                                 f"web-search reading from the past week; confirm recency before relying on it]")
                 lines.append("")
 
             lines.append("── BDI Current Intelligence ──")
