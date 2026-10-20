@@ -607,6 +607,9 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
                     f"The firm holds {shares:,.0f} shares of {t} "
                     f"at an average cost of ${avg_cost:.2f} (cost basis ${cost_basis:,.0f}).\n"
                     f"Current market value: ${mv:,.0f} ({gl:+.1f}% return).\n"
+                    f"Position values come from the last portfolio price refresh and can lag the "
+                    f"current price in the DATA below; if they differ, value the position as "
+                    f"shares x the DATA price.\n"
                     f"Use this context when assessing conviction — this is a live position.\n\n"
                 )
             else:
@@ -629,6 +632,9 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
                     + "\n".join(lines) + "\n"
                     f"Combined exposure: ${total_mv:,.0f} total market value "
                     f"(cost basis ${total_cost:,.0f}, {total_gl_pct:+.1f}% return).\n"
+                    f"Position values come from the last portfolio price refresh and can lag the "
+                    f"current price in the DATA below; if they differ, value the positions as "
+                    f"shares x the DATA price.\n"
                     f"Use this context when assessing conviction — these are live positions.\n\n"
                 )
         else:
@@ -661,7 +667,9 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
                     "This approved trade has been EXECUTED and is reflected in the holdings.\n"
                     if fb.get("settlement_status") == "settled" else
                     "This approved trade has NOT been executed — it is NOT a held position "
-                    "unless a PORTFOLIO HOLDINGS NOTE above says so.\n"
+                    "unless a PORTFOLIO HOLDINGS NOTE above says so. It is also PROVISIONAL: "
+                    "this week's trade-pitch cap and Jansky review can replace it, so do not "
+                    "describe it as pending or certain to execute.\n"
                 )
             feedback_preamble = (
                 f"\nJANSKY TRADE FEEDBACK (from {date}):\n"
@@ -669,7 +677,9 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
                 f"{exec_note}"
                 f"Jansky's rationale: {rat}\n"
                 f"Use this context when forming your analysis — if APPROVED, note what "
-                f"strengthened the thesis; if REJECTED, address the concern raised.\n\n"
+                f"strengthened the thesis; if REJECTED, address the concern raised. "
+                f"Never cite Jansky's approval or rejection as a reason for your verdict, and never "
+                f"imply Jansky authorizes trades — your verdict is your own analysis.\n\n"
             )
 
     prompt = f"""{macro_preamble}{nova_preamble}{holdings_preamble}{feedback_preamble}You are a financial analyst at Obsidian Capital providing coverage for
@@ -797,6 +807,14 @@ IMPORTANT RULES:
 - Never invent metrics not present in the data
 - Legal risk is a first-class consideration
 - Insider open market trades outweigh analyst ratings
+- PROVENANCE: credit Nova (or any source) only for data actually present above. If a
+  Nova record is blank or absent, write "no Nova record" instead of calling it authoritative.
+- Do not give percentage splits of causes (e.g. "two-thirds sentiment, one-third fundamentals"):
+  they cannot be derived from the data. Describe drivers qualitatively.
+- If your analysis concludes the position should be reduced, say so in the first sentence of
+  the verdict rationale and make sure the verdict word does not contradict it (a broken
+  thesis is AVOID; otherwise WATCH with the trim stated explicitly). Do not leave reduce
+  language buried under a WATCH verdict.
 - NEWS WARNING: Yahoo Finance sometimes returns off-topic articles.
   Only reference news items that clearly relate to {ticker}.
   Ignore any news about other companies entirely.

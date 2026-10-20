@@ -1143,6 +1143,13 @@ async def build_macro_backdrop() -> str:
     be5_val,   be5_date,  _    = await _q("T5YIE", 6)
     be10_val,  be10_date, _    = await _q("T10YIE", 6)
 
+    # Oct 20 2026 (Jansky): headline CPI, Michigan 1Y expectations and oil
+    # levels were in the summary but never reached the YAML Jupiter ingests.
+    hcpi_obs                   = (await _q("CPIAUCSL", 24, "m"))[2]
+    mich1_val, mich1_date, _   = await _q("MICH", 6, "m")
+    wti_val,   wti_date,  wti_obs   = await _q("DCOILWTICO", 30)
+    brent_val, brent_date, brent_obs = await _q("DCOILBRENTEU", 30)
+
     unemp_val, unemp_date,_    = await _q("UNRATE", 6, "m")
     payrolls,  pay_date,  pay_obs = await _q("PAYEMS", 14, "m")
     claims_val,claims_date,_   = await _q("ICSA", 6)
@@ -1173,6 +1180,20 @@ async def build_macro_backdrop() -> str:
     cpi_vals = [o["value"] for o in cpi_obs if o["value"] is not None]
     if len(cpi_vals) >= 13:
         cpi_yoy = ((cpi_vals[-1] - cpi_vals[-13]) / cpi_vals[-13]) * 100
+
+    hcpi_yoy = None
+    hcpi_vals = [o["value"] for o in hcpi_obs if o["value"] is not None]
+    if len(hcpi_vals) >= 13:
+        hcpi_yoy = ((hcpi_vals[-1] - hcpi_vals[-13]) / hcpi_vals[-13]) * 100
+
+    def _chg_4w(obs):
+        """% change over ~20 trading days from a daily FRED series."""
+        v = [o["value"] for o in obs if o["value"] is not None]
+        if len(v) >= 21 and v[-21]:
+            return ((v[-1] - v[-21]) / v[-21]) * 100
+        return None
+    wti_4w, brent_4w = _chg_4w(wti_obs), _chg_4w(brent_obs)
+    brent_wti_spread = (brent_val - wti_val) if (brent_val and wti_val) else None
 
     m2_yoy = None
     m2_vals = [o["value"] for o in m2_obs if o["value"] is not None]
@@ -1331,6 +1352,13 @@ async def build_macro_backdrop() -> str:
         f"  key_metrics:",
         f"    core_pce_yoy: {f'{(pce_yoy):.2f}' if pce_yoy else 'N/A'}",
         f"    core_cpi_yoy: {f'{(cpi_yoy):.2f}' if cpi_yoy else 'N/A'}",
+        f"    headline_cpi_yoy: {f'{(hcpi_yoy):.2f}' if hcpi_yoy else 'N/A'}",
+        f"    michigan_1y_inflation_expectation: {f'{(mich1_val):.1f}' if mich1_val else 'N/A'}",
+        f"    wti_usd_bbl: {f'{(wti_val):.2f}' if wti_val else 'N/A'}",
+        f"    wti_4w_change_pct: {f'{(wti_4w):.1f}' if wti_4w is not None else 'N/A'}",
+        f"    brent_usd_bbl: {f'{(brent_val):.2f}' if brent_val else 'N/A'}",
+        f"    brent_4w_change_pct: {f'{(brent_4w):.1f}' if brent_4w is not None else 'N/A'}",
+        f"    brent_wti_spread_usd: {f'{(brent_wti_spread):.2f}' if brent_wti_spread is not None else 'N/A'}",
         f"    breakeven_5y: {f'{(be5_val):.2f}' if be5_val else 'N/A'}",
         f"    breakeven_10y: {f'{(be10_val):.2f}' if be10_val else 'N/A'}",
         f"    fed_target: 2.00",

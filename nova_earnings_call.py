@@ -27,6 +27,7 @@ import glob
 import json
 import os
 import re
+from urllib.parse import urlparse
 import subprocess
 import sys
 import time
@@ -475,7 +476,31 @@ def research_earnings(ticker: str, company_name: str,
             _url   = _m.group(3).strip()
             _title = _m.group(2).strip()
             _desc  = (_m.group(4) or "").strip()
-            if _url not in seen_urls and not any(bad in _url for bad in _bad_domains):
+            # Oct 20 2026: Google redirect fragments ("http:///url?q=...") have
+            # no host and can never be fetched, yet Nova once "picked" one as
+            # IBM's press release. Require a real hostname.
+            if not urlparse(_url).netloc or '/url?' in _url:
+                continue
+            # A blocked domain stays blocked EXCEPT when it is the company's
+            # own site (wellsfargo.com for WFC, jpmorgan.com for JPM...).
+            _name_key = re.sub(r'[^a-z0-9]', '', company_name.lower())
+            def _is_bad(u):
+                # The company's OWN site is always allowed, including PDFs
+                # (WFC's real Q3 2026 results are wellsfargo.com/.../third-
+                # quarter-2026-earnings.pdf, which the generic '.pdf' rule
+                # discarded, leaving only BusinessWire date announcements).
+                _host = urlparse(u).netloc.lower().split(':')[0].split('.')
+                _label = _host[-2] if len(_host) >= 2 else ''
+                if len(_label) >= 5 and _label in _name_key:
+                    return False
+                for bad in _bad_domains:
+                    if bad in u:
+                        _tok = bad.split('.')[0]
+                        if len(_tok) >= 6 and _tok in _name_key:
+                            continue
+                        return True
+                return False
+            if _url not in seen_urls and not _is_bad(_url):
                 candidate_items.append((_url, _title, _desc))
                 seen_urls.add(_url)
 

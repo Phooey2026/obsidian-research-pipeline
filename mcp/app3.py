@@ -610,35 +610,58 @@ def get_legal_proceedings_deep(ticker: str) -> str:
         # ── Step 1: Resolve CIK ──────────────────────────────────────────────
         tickers_data = _json.loads(sec_get(
             'https://www.sec.gov/files/company_tickers.json'))
-        cik = None
-        company_name = ticker.upper()
-        for entry in tickers_data.values():
-            if entry.get('ticker', '').upper() == ticker.upper():
-                cik = str(entry['cik_str']).zfill(10)
-                company_name = entry.get('title', ticker.upper())
-                break
-        if not cik:
+        # Oct 20 2026 fix: SEC's ticker file can list one ticker under more
+        # than one registrant (e.g. XOM resolved to "ExxonMobil Holdings
+        # Corporation", a holding-company CIK with no 10-Ks, instead of the
+        # operating filer). Take EVERY entry for the ticker and use the first
+        # whose submissions actually contain an annual report.
+        matches = [e for e in tickers_data.values()
+                   if e.get('ticker', '').upper() == ticker.upper()]
+        if not matches:
             return f"Could not find SEC CIK for {ticker.upper()}"
 
-        # ── Step 2: Collect up to 3 recent 10-K/20-F filings to try ─────────
-        subs = _json.loads(sec_get(
-            f'https://data.sec.gov/submissions/CIK{cik}.json'))
-        filings = subs.get('filings', {}).get('recent', {})
-        forms   = filings.get('form', [])
-        accns   = filings.get('accessionNumber', [])
-        dates   = filings.get('filingDate', [])
+        # SEC's ticker file lists XOM only under the new holding company
+        # (ExxonMobil Holdings Corp, CIK 2115436), which has no 10-K/XBRL
+        # history yet. Fall back to the legacy operating registrant that
+        # filed the annual reports (Exxon Mobil Corp, CIK 34088).
+        _LEGACY_CIK = {"XOM": ("34088", "Exxon Mobil Corp (legacy registrant)")}
+        if ticker.upper() in _LEGACY_CIK:
+            _lc = _LEGACY_CIK[ticker.upper()]
+            if not any(str(m['cik_str']).zfill(10) == _lc[0].zfill(10) for m in matches):
+                matches = matches + [{'cik_str': _lc[0], 'title': _lc[1]}]
 
+        cik = None
+        company_name = ticker.upper()
         candidates = []
-        for i, form in enumerate(forms):
-            if form in ('10-K', '20-F', '40-F') and len(candidates) < 3:
-                candidates.append({
-                    'accn':      accns[i],
-                    'date':      dates[i],
-                    'form_type': form,
-                })
+        tried = []
+        for entry in matches:
+            _cik = str(entry['cik_str']).zfill(10)
+            _name = entry.get('title', ticker.upper())
+            tried.append(f"{_name} (CIK {_cik})")
+            try:
+                subs = _json.loads(sec_get(
+                    f'https://data.sec.gov/submissions/CIK{_cik}.json'))
+            except Exception:
+                continue
+            filings = subs.get('filings', {}).get('recent', {})
+            forms   = filings.get('form', [])
+            accns   = filings.get('accessionNumber', [])
+            dates   = filings.get('filingDate', [])
+            _cands = []
+            for i, form in enumerate(forms):
+                if form in ('10-K', '20-F', '40-F') and len(_cands) < 3:
+                    _cands.append({
+                        'accn':      accns[i],
+                        'date':      dates[i],
+                        'form_type': form,
+                    })
+            if _cands:
+                cik, company_name, candidates = _cik, _name, _cands
+                break
 
         if not candidates:
-            return f"No 10-K/20-F/40-F filings found for {ticker.upper()}"
+            return (f"No 10-K/20-F/40-F filings found for {ticker.upper()} "
+                    f"(registrants tried: {'; '.join(tried)})")
 
         # ── Extraction helpers ───────────────────────────────────────────────
         end_markers = [

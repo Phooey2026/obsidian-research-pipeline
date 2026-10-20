@@ -1025,22 +1025,40 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
         tickers_url = 'https://www.sec.gov/files/company_tickers.json'
         tickers_data = sec_get(tickers_url)
         ticker_upper = ticker.upper()
-        cik = None
-        company_name = None
-        for entry in tickers_data.values():
-            if entry.get('ticker', '').upper() == ticker_upper:
-                cik = str(entry['cik_str']).zfill(10)
-                company_name = entry.get('title', ticker_upper)
-                break
-
-        if not cik:
+        matches = [e for e in tickers_data.values()
+                   if e.get('ticker', '').upper() == ticker_upper]
+        if not matches:
             return f"Could not find SEC CIK for ticker {ticker_upper}. "\
                    f"Company may not file with SEC or ticker is incorrect."
 
-        # Step 2: Fetch company facts
-        facts_url = f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
-        data = sec_get(facts_url)
-        facts = data.get('facts', {}).get('us-gaap', {})
+        # SEC's ticker file lists XOM only under the new holding company
+        # (ExxonMobil Holdings Corp, CIK 2115436), which has no 10-K/XBRL
+        # history yet. Fall back to the legacy operating registrant that
+        # filed the annual reports (Exxon Mobil Corp, CIK 34088).
+        _LEGACY_CIK = {"XOM": ("34088", "Exxon Mobil Corp (legacy registrant)")}
+        if ticker_upper in _LEGACY_CIK:
+            _lc = _LEGACY_CIK[ticker_upper]
+            if not any(str(m['cik_str']).zfill(10) == _lc[0].zfill(10) for m in matches):
+                matches = matches + [{'cik_str': _lc[0], 'title': _lc[1]}]
+
+        # Oct 20 2026: a ticker can map to several registrants (e.g. XOM ->
+        # a holding-company CIK with no financial facts). Use the first
+        # registrant that actually has US-GAAP facts.
+        cik = None
+        company_name = None
+        facts = {}
+        for entry in matches:
+            _cik = str(entry['cik_str']).zfill(10)
+            try:
+                _data = sec_get(f'https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik}.json')
+            except Exception:
+                continue
+            _facts = _data.get('facts', {}).get('us-gaap', {})
+            if _facts:
+                cik, company_name, facts = _cik, entry.get('title', ticker_upper), _facts
+                break
+            if cik is None:
+                cik, company_name = _cik, entry.get('title', ticker_upper)
 
         if not facts:
             return f"No US-GAAP financial data found for {ticker_upper} "\
