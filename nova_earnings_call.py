@@ -432,7 +432,37 @@ def research_earnings(ticker: str, company_name: str,
     # suspension rather than permanently failing a ticker with good data.
     candidate_items = []
     picked_urls     = []
-    for _search_attempt in range(2):
+
+    # ── SEC 8-K Item 2.02 / Exhibit 99.1 (primary source for US filers) ────
+    # The filing date is exact, so this avoids the stale / mis-dated web hits
+    # (SO -> 2025 release, FDX -> wrong year, ADSK -> future date). If the
+    # newest SEC release is recent, use it directly and skip web search; if it
+    # is older, keep it as a candidate and let a newer web result win.
+    sec_meta      = None          # dict(date, url, text) when SEC returned a release
+    SEC_FRESH_DAYS = 135          # a quarterly reporter is never legitimately older
+    print(f"    [sec 8-k]...", end=" ", flush=True)
+    _sec_raw = call_tool("get_sec_earnings_release",
+                         {"ticker": ticker, "max_chars": 40000})
+    if _sec_raw and _sec_raw.startswith("=== SEC 8-K"):
+        _dm = re.search(r'^RELEASE_DATE:\s*(\d{4}-\d{2}-\d{2})', _sec_raw, re.M)
+        _um = re.search(r'^URL:\s*(\S+)', _sec_raw, re.M)
+        _body = _sec_raw.split("\n\n", 1)[1] if "\n\n" in _sec_raw else ""
+        if _dm and _um and len(_body) >= 2000:
+            sec_meta = {"date": _dm.group(1), "url": _um.group(1), "text": _sec_raw}
+    if sec_meta:
+        _age = (datetime.date.today() - datetime.date.fromisoformat(sec_meta["date"])).days
+        sec_meta["age"] = _age
+        print(f"✓ (released {sec_meta['date']}, {_age}d ago)")
+    else:
+        _why = (_sec_raw or "empty response").strip().splitlines()[0][:110]
+        print(f"– ({_why})")
+    sec_direct = bool(sec_meta and sec_meta["age"] <= SEC_FRESH_DAYS)
+    if sec_direct:
+        print(f"    → using SEC filing; skipping web search")
+    elif sec_meta:
+        print(f"    → SEC release is {sec_meta['age']}d old; also trying web search")
+
+    for _search_attempt in (range(0) if sec_direct else range(2)):
         print(f"    [search]...", end=" ", flush=True)
         search_result = call_tool("get_earnings_transcript_search", {
             "ticker":       ticker,
@@ -445,7 +475,7 @@ def research_earnings(ticker: str, company_name: str,
                 print(f"    retrying search in 8s...")
                 time.sleep(8)
                 continue
-            return "no_data"
+            break
 
         # Extract candidate URLs + metadata — skip known-bad domains
         _bad_domains = (
@@ -510,7 +540,7 @@ def research_earnings(ticker: str, company_name: str,
                 print(f"    retrying search in 8s...")
                 time.sleep(8)
                 continue
-            return "no_data"
+            break
 
         print(f"✓ ({len(candidate_items)} candidates)")
         for i, (url, title, desc) in enumerate(candidate_items, 1):
@@ -580,7 +610,7 @@ JSON only. No preamble."""
                         print(f"    retrying search in 8s...")
                         time.sleep(8)
                         continue
-                    return "no_data"
+                    break
                 for idx in _picks:
                     if 1 <= idx <= len(candidate_items):
                         picked_urls.append(candidate_items[idx - 1][0])
@@ -590,7 +620,7 @@ JSON only. No preamble."""
                         print(f"    retrying search in 8s...")
                         time.sleep(8)
                         continue
-                    return "no_data"
+                    break
                 print(f"✓ ({len(picked_urls)} picked — {_reason[:80]})")
 
         except subprocess.TimeoutExpired:
@@ -618,6 +648,10 @@ JSON only. No preamble."""
             return "1900-01-01"
 
     candidates: list[tuple[str, str, str]] = []
+    if sec_meta:
+        # SEC release dated by its exact release date; a web page only beats it
+        # by carrying a NEWER valid date.
+        candidates.append((sec_meta["date"], sec_meta["url"], sec_meta["text"]))
     for _url in picked_urls:
         print(f"    [fetch {_url[:60]}]...", end=" ", flush=True)
         _result = call_tool("fetch_url_text", {"url": _url, "max_chars": 40000})
@@ -704,6 +738,10 @@ JSON only. No preamble."""
     call_date       = parse_call_date(fetch_result)
     fiscal_quarter  = parse_fiscal_quarter(fetch_result)
     source          = "web_search"
+    from_sec        = bool(sec_meta and fetch_url == sec_meta["url"])
+    if from_sec:
+        source    = "sec_8k"
+        call_date = sec_meta["date"]      # exact, from the filing metadata
 
     if not transcript_text:
         return "no_data"
@@ -718,8 +756,8 @@ JSON only. No preamble."""
     import subprocess as _sp
 
     _prompt = f"""You are Nova, Obsidian Capital's intelligence assistant.
-You have retrieved the most recent earnings call for {company_name} ({ticker.upper()}).
-Auto-parsed call date (UNVERIFIED — may be wrong, check against the content below): {call_date or 'NOT FOUND'}
+You have retrieved the most recent earnings {"press release (SEC 8-K Item 2.02, Exhibit 99.1 — no Q&A, so say so briefly for Analyst Reception)" if from_sec else "call"} for {company_name} ({ticker.upper()}).
+{"Release date (VERIFIED from SEC filing metadata): " + call_date if from_sec else "Auto-parsed call date (UNVERIFIED — may be wrong, check against the content below): " + (call_date or 'NOT FOUND')}
 Auto-parsed fiscal quarter (UNVERIFIED — may be wrong, check against the content below): {fiscal_quarter}
 Source: {source}
 
@@ -779,7 +817,7 @@ not be trusted without checking against what the article itself states.
         r'FISCAL_QUARTER:\s*(Q[1-4]\s*\d{4}|\d{4}\s*Q[1-4]|FY\s*\d{2,4})',
         _raw, _re.IGNORECASE)
 
-    if _date_match:
+    if _date_match and not from_sec:     # SEC filing date is authoritative
         _nd = _date_match.group(1).strip()
         # Only trust Nova's date if it is a plausible earnings-call date.
         try:

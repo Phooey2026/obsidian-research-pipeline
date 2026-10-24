@@ -1131,6 +1131,236 @@ async def fetch_url_text(url: str, max_chars: int = 40000) -> str:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# SEC 8-K ITEM 2.02 EARNINGS RELEASE (primary source for US filers)
+# ────────────────────────────────────────────────────────────────────────────
+
+# SEC's ticker file lists XOM only under the new holding company, which has no
+# filing history; the legacy operating registrant filed the 8-Ks.
+_SEC_LEGACY_CIK = {"XOM": ("34088", "Exxon Mobil Corp (legacy registrant)")}
+
+
+def _sec_exhibit_score(name: str):
+    """Rank a filing-index file name as a press-release exhibit.
+    0 = Exhibit 99.1, 1 = other Exhibit 99.x, None = not a candidate."""
+    n = name.lower()
+    if not n.endswith(('.htm', '.html', '.txt')) or 'index' in n:
+        return None
+    if re.search(r'ex(hibit)?[-_ ]?99[-_.]?0?1(?!\d)', n):
+        return 0
+    if re.search(r'ex(hibit)?[-_ ]?99', n):
+        return 1
+    return None
+
+
+def _sec_doc_to_text(raw: bytes, name: str) -> str:
+    """Decode an EDGAR document and reduce it to readable text."""
+    try:
+        html = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        html = raw.decode('windows-1252', errors='replace')
+    text = html if name.lower().endswith('.txt') else _html_to_clean(html)
+    lines = text.splitlines()
+    for i, ln in enumerate(lines[:15]):                    # EDGAR header junk
+        if ln.strip() == 'Document':
+            lines = lines[i + 1:]
+            break
+    out = []
+    for line in lines:
+        line = re.sub(r'\|(\s*\|)+', '|', line)          # empty table cells
+        line = re.sub(r'\$\s*\|\s*', '$', line)            # "$ | 1,174" -> "$1,174"
+        line = re.sub(r'\s*\|\s*%', '%', line)              # "3.9 | %" -> "3.9%"
+        if line.strip() and not re.search(r'[A-Za-z0-9]', line):
+            continue                                       # pure |---| / rule lines
+        out.append(line.rstrip())
+    return re.sub(r'\n{3,}', '\n\n', "\n".join(out)).strip()
+
+
+@mcp.tool()
+def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
+    """Fetch the company's newest earnings press release straight from SEC EDGAR:
+    the most recent 8-K carrying Item 2.02 (Results of Operations), reading its
+    Exhibit 99.1. US domestic filers only (foreign private issuers file 6-K).
+
+    The filing date is exact, so this avoids stale or mis-dated web-search hits.
+    Output starts with header lines (FORM, FILING_DATE, REPORT_DATE, RELEASE_DATE,
+    ITEMS, URL, ACCESSION, RECENT_2.02_FILINGS) followed by the release text.
+
+    ticker:    stock symbol e.g. SO, ADSK, FDX
+    max_chars: maximum release text characters to return (default 40000)
+    """
+    try:
+        import urllib.request
+        from datetime import date as _date
+
+        headers = {'User-Agent': 'Jay jay@example.com'}
+
+        def sec_get(url):
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+
+        tickers_data = json.loads(sec_get(
+            'https://www.sec.gov/files/company_tickers.json'))
+        matches = [e for e in tickers_data.values()
+                   if e.get('ticker', '').upper() == ticker.upper()]
+        if ticker.upper() in _SEC_LEGACY_CIK:
+            _lc = _SEC_LEGACY_CIK[ticker.upper()]
+            if not any(str(m['cik_str']).zfill(10) == _lc[0].zfill(10) for m in matches):
+                matches = matches + [{'cik_str': _lc[0], 'title': _lc[1]}]
+        if not matches:
+            return f"Could not find SEC CIK for {ticker.upper()}"
+
+        tried, saw_6k, hit = [], False, None
+        for entry in matches:
+            cik = str(entry['cik_str']).zfill(10)
+            name = entry.get('title', ticker.upper())
+            tried.append(f"{name} (CIK {cik})")
+            try:
+                subs = json.loads(sec_get(
+                    f'https://data.sec.gov/submissions/CIK{cik}.json'))
+            except Exception:
+                continue
+            rec = subs.get('filings', {}).get('recent', {})
+            forms = rec.get('form', [])
+            if any(f in ('6-K', '20-F', '40-F') for f in forms):
+                saw_6k = True
+            rows = []
+            for i, form in enumerate(forms):
+                if form not in ('8-K', '8-K/A'):
+                    continue
+                its = rec.get('items', [])
+                its = its[i] if i < len(its) else ''
+                if '2.02' not in [x.strip() for x in its.split(',')]:
+                    continue
+                rows.append({
+                    'form': form, 'items': its,
+                    'filed': rec['filingDate'][i],
+                    'report': (rec.get('reportDate') or [''] * len(forms))[i],
+                    'accn': rec['accessionNumber'][i],
+                    'primary': (rec.get('primaryDocument') or [''] * len(forms))[i],
+                })
+            if rows:
+                pick = next((r for r in rows if r['form'] == '8-K'), rows[0])
+                hit = (cik, name, pick, rows)
+                break
+
+        if not hit:
+            extra = (" (this filer reports on Form 6-K/20-F/40-F — foreign private "
+                     "issuer, use web search)") if saw_6k else ""
+            return (f"No 8-K Item 2.02 earnings release found for {ticker.upper()}"
+                    f"{extra}. Registrants tried: {'; '.join(tried)}")
+
+        cik, name, _first, rows = hit
+
+        def _reject_reason(text: str, fname: str) -> str:
+            """'' if this looks like a results release, else why not. Catches
+            recasts/supplements that also carry Item 2.02 (FDX filed a 'recast'
+            exhibit on 2026-07-21, a month after its real results) and bare
+            8-K cover pages."""
+            head = text[:3000].lower()
+            if 'recast' in fname.lower():
+                return 'recast'
+            if re.search(r'\brecast', head) and not re.search(
+                    r'(reports?|announces?|reported)\b.{0,80}\b(results|earnings)', head):
+                return 'recast'
+            if not re.search(r'results|earnings', head):
+                return 'no results text'
+            return ''
+
+        found, skipped, seen = None, [], []
+        ordered = [r for r in rows if r['form'] == '8-K'] + \
+                  [r for r in rows if r['form'] != '8-K']
+        for pick in ordered[:5]:
+            accn_nd = pick['accn'].replace('-', '')
+            base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accn_nd}/"
+
+            # Release date: the 8-K's event date is the release date when it sits
+            # within a week before the filing; otherwise use the filing date.
+            release = pick['filed']
+            try:
+                rd = _date.fromisoformat(pick['report'])
+                fd = _date.fromisoformat(pick['filed'])
+                if 0 <= (fd - rd).days <= 7:
+                    release = pick['report']
+            except ValueError:
+                pass
+
+            # Candidate documents: Exhibit 99.1 first, then other 99.x, then any
+            # other sizeable HTML file in the filing (some filers name the
+            # release e.g. "fdx-earningsrelease.htm"), then the 8-K main document.
+            files = []          # (name, size)
+            try:
+                idx = json.loads(sec_get(base + 'index.json'))
+                for it in idx.get('directory', {}).get('item', []):
+                    try:
+                        sz = int(it.get('size') or 0)
+                    except ValueError:
+                        sz = 0
+                    files.append((it.get('name', ''), sz))
+            except Exception:
+                pass
+            scored = sorted((_sec_exhibit_score(n), n) for n, _ in files
+                            if _sec_exhibit_score(n) is not None)
+            order = [n for _, n in scored]
+            others = sorted(
+                ((sz, n) for n, sz in files
+                 if n.lower().endswith(('.htm', '.html')) and n not in order
+                 and n != pick['primary'] and 'index' not in n.lower()
+                 and not re.match(r'r\d+\.htm', n.lower())),
+                reverse=True)
+            order += [n for _, n in others[:3]]
+            if pick['primary'] and pick['primary'] not in order:
+                order.append(pick['primary'])
+
+            text, used = "", ""
+            for n in order[:7]:
+                try:
+                    t = _sec_doc_to_text(sec_get(base + n), n)
+                except Exception:
+                    continue
+                if len(t) < 1500:
+                    continue
+                why = _reject_reason(t, n)
+                if why:
+                    skipped.append(f"{pick['filed']} {n} ({why})")
+                    continue
+                text, used = t, n
+                break
+            if not text:
+                seen.append(f"{pick['filed']}: " + (", ".join(
+                    f"{n}[{sz}]" for n, sz in files[:12]) or "index unavailable"))
+            if text:
+                found = (pick, base, release, text, used)
+                break
+
+        if not found:
+            return (f"8-K Item 2.02 filings exist for {ticker.upper()} "
+                    f"({', '.join(r['filed'] for r in rows[:5])}) but none has a readable "
+                    f"results exhibit. Skipped: {'; '.join(skipped) or 'none'}. "
+                    f"Files seen: {' | '.join(seen) or 'n/a'}")
+
+        pick, base, release, text, used = found
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n\n[Truncated]"
+        recent = ", ".join(r['filed'] for r in rows[:4])
+        skip_line = f"SKIPPED_NEWER: {'; '.join(skipped)}\n" if skipped else ""
+        return (f"=== SEC 8-K Item 2.02 earnings release — {name} ({ticker.upper()}) ===\n"
+                f"FORM: {pick['form']}\n"
+                f"FILING_DATE: {pick['filed']}\n"
+                f"REPORT_DATE: {pick['report'] or 'n/a'}\n"
+                f"RELEASE_DATE: {release}\n"
+                f"ITEMS: {pick['items']}\n"
+                f"URL: {base}{used}\n"
+                f"ACCESSION: {pick['accn']}\n"
+                f"RECENT_2.02_FILINGS: {recent}\n"
+                f"{skip_line}\n"
+                f"{text}")
+
+    except Exception as e:
+        return f"Error in get_sec_earnings_release for {ticker}: {e}"
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # NOVA DATA MANAGEMENT TOOLS
 # ────────────────────────────────────────────────────────────────────────────
 

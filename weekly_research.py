@@ -447,7 +447,16 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
             summary_text = ""   # too old to be useful — omit rather than mislead
 
         if summary_text:
-            source_note = f"Quartr" if source == "quartr" else "web transcript"
+            is_release = (source == "sec_8k")
+            if source == "quartr":
+                source_note = "Quartr"
+            elif is_release:
+                # Oct 24 2026: SEC 8-K Item 2.02 / Exhibit 99.1 is the company's
+                # own results press release: exact date, but NO Q&A or call.
+                source_note = ("SEC 8-K press release — company-written results, "
+                               "no analyst Q&A or live call")
+            else:
+                source_note = "web transcript"
             age_warning = ""
             if call_age is None:
                 age_warning = (" ⚠ CALL DATE UNKNOWN — do not treat this as the "
@@ -456,10 +465,17 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
                 age_warning = (f" ⚠ STALE: this call is {call_age} days old and is NOT "
                                f"the most recent quarter — use only as background, "
                                f"and say so if you rely on it.\n")
+            release_note = ""
+            if is_release:
+                release_note = (" NOTE: this is a company press release. Treat any "
+                                "'management tone' wording as the company's own framing, "
+                                "not evidence of confidence or analyst reaction; do not "
+                                "cite analyst pushback or Q&A from it.\n")
             earnings_block = (
-                f"📞 NOVA EARNINGS CALL SUMMARY  "
-                f"({fiscal_q}, call date {call_date}, source: {source_note})\n"
-                f"{age_warning}"
+                f"📞 NOVA EARNINGS {'RELEASE' if is_release else 'CALL'} SUMMARY  "
+                f"({fiscal_q}, {'release' if is_release else 'call'} date {call_date}, "
+                f"source: {source_note})\n"
+                f"{age_warning}{release_note}"
                 f"{summary_text}"
             )
             sections.append(earnings_block)
