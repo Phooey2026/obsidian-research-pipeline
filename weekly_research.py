@@ -824,8 +824,10 @@ DATA:
 """
 
     try:
+        # --reasoning removed Oct 24 2026: the current Jupiter model (deepseek-v4.1-flash
+        # via OpenRouter) rejects it with "Error: invalid_params" and returns nothing.
         result = subprocess.run(
-            ["jupiter", "-z", prompt, "--reasoning", "med"],   # Jupiter — default Hermes profile
+            ["jupiter", "-z", prompt],   # Jupiter — default Hermes profile
             capture_output=True, text=True, timeout=600
         )
         output = _strip_harness_noise(result.stdout.strip())
@@ -837,7 +839,7 @@ DATA:
     except FileNotFoundError:
         return "Summary unavailable (hermes not found in PATH — check cron environment)"
     except subprocess.TimeoutExpired:
-        return "Summary unavailable (Jupiter/hermes timed out after 420s)"
+        return "Summary unavailable (Jupiter/hermes timed out after 600s)"
     except Exception as e:
         return f"Summary unavailable: {e}"
         
@@ -2004,6 +2006,7 @@ def main():
             print(f"  ⚠ Could not load trade feedback: {e}")
 
     all_results = []
+    _bad_summaries = 0
 
     for ticker in tickers:
         res = research_ticker(ticker)
@@ -2017,7 +2020,22 @@ def main():
                                    sectors=sectors,
                                    trade_feedback=trade_feedback)
         res["summary"] = summary
-        print(f"✓ ({len(summary)} chars)")
+        # Oct 24 2026: a 61-char "summary" used to print a green check and the
+        # run carried on for 128 tickers. A real report is several thousand
+        # characters; anything tiny is a failed call (model/provider error,
+        # refusal, CLI problem). Show what came back and stop after 3 in a row.
+        if summary.startswith("Summary unavailable") or len(summary) < 800:
+            print(f"✗ ({len(summary)} chars — NOT a real summary)")
+            print(f"      Jupiter returned: {summary[:300]!r}")
+            _bad_summaries += 1
+            if _bad_summaries >= 3:
+                print("\n  ✗ 3 consecutive failed summaries — stopping. Check "
+                      "`jupiter model`, the OpenRouter key/credits, and run "
+                      "`jupiter -z \"Reply OK\" --reasoning med` by hand.")
+                sys.exit(1)
+        else:
+            _bad_summaries = 0
+            print(f"✓ ({len(summary)} chars)")
 
         all_results.append(res)
         print()

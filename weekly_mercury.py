@@ -438,7 +438,7 @@ DATA:
 
     try:
         result = subprocess.run(
-            ["mercury", "-z", prompt, "--reasoning", "high"],
+            ["mercury", "-z", prompt],
             capture_output=True, text=True, timeout=420
         )
         output = result.stdout.strip()
@@ -784,7 +784,7 @@ ETF DATA (from get_etf_data tool):
     print(f"    [trade pitch] asking Mercury...", end=" ", flush=True)
     try:
         result = subprocess.run(
-            ["mercury", "-z", prompt, "--reasoning", "high"],
+            ["mercury", "-z", prompt],
             capture_output=True, text=True, timeout=420
         )
         output = result.stdout.strip()

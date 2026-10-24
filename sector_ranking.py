@@ -1047,7 +1047,7 @@ CHANGE DATA:
     print(f"    [delta summary] asking Hermes...", end=" ", flush=True)
     try:
         result = subprocess.run(
-            ["jupiter", "-z", prompt, "--reasoning", "high"],
+            ["jupiter", "-z", prompt],   # --reasoning removed: current model rejects it
             capture_output=True, text=True, timeout=180
         )
         output = result.stdout.strip()

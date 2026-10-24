@@ -5,7 +5,7 @@ Calls macromcp tools, saves:
   - data/macro_YYYYMMDD.json            raw data from all tools
   - reports/macro_summary_YYYYMMDD.md   human-readable weekly summary + forecast
   - macro_backdrop.yaml                 structured AI context (always latest)
-  - macro_backdrop_YYYYMMDD.yaml        dated archive copy
+  - reports/macro_backdrop_YYYYMMDD.yaml  dated archive copy (moved from root Oct 2026)
 
 Run via cron alongside weekly_research.py:
   0 6 * * 1 /usr/bin/python3 /home/jay/stock_dashboard/weekly_macro.py
@@ -418,7 +418,7 @@ def main():
     if yaml_content and not yaml_content.startswith("Error"):
         # Always-latest copy (for injection into weekly_research.py prompts)
         latest_yaml = f"{BASE_DIR}/macro_backdrop.yaml"
-        dated_yaml  = f"{BASE_DIR}/macro_backdrop_{run_date}.yaml"
+        dated_yaml  = f"{REPORT_DIR}/macro_backdrop_{run_date}.yaml"
 
         with open(latest_yaml, "w") as f:
             f.write(yaml_content)
