@@ -365,8 +365,13 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
     Returns empty string if no relevant Nova data exists for this ticker.
     """
     rec = nova_data.get(ticker.upper(), {})
+    _no_legal_note = (
+        f"\nNOVA STATUS: Nova has NO legal research on file for {ticker.upper()}. "
+        f"Do not attribute any legal finding to Nova; base section 9 on the SEC 10-K "
+        f"legal extraction and say \"no Nova record\" if you mention Nova at all.\n\n"
+    )
     if not rec:
-        return ""
+        return _no_legal_note
 
     sections = []
 
@@ -460,7 +465,9 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
             sections.append(earnings_block)
 
     if not sections:
-        return ""
+        return _no_legal_note
+
+    _has_legal_section = any(sec.startswith("⚖") for sec in sections)
 
     divider = "─" * 69
     preamble = (
@@ -469,6 +476,8 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
         f"(provided by Nova — Obsidian Capital Intelligence Agent)\n"
         f"{divider}\n\n"
         + "\n\n".join(sections)
+        + (f"\n\nNOVA STATUS: Nova has NO legal research on file for {ticker.upper()}; "
+           f"do not attribute any legal finding to Nova." if not _has_legal_section else "")
         + f"\n\n{divider}\n"
         f"END OF NOVA CONTEXT — BEGIN STANDARD ANALYSIS BELOW\n"
         f"{divider}\n\n"
@@ -652,7 +661,10 @@ END OF MACRO CONTEXT — BEGIN STOCK ANALYSIS BELOW
     feedback_preamble = ""
     if trade_feedback:
         fb = trade_feedback.get(ticker.upper(), {})
-        if fb:
+        # Oct 24 2026: an approval that a newer Jansky run replaced (superseded)
+        # is not a live decision. Injecting it leaked "$500K approval" notes into
+        # B's analysis and made PLD's dropped trim look pending.
+        if fb and not fb.get("superseded"):
             decision = fb.get("decision", "?")
             action   = fb.get("action", "?").replace("_", " ")
             dollars  = fb.get("dollars", 0)

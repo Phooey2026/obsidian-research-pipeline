@@ -733,6 +733,7 @@ async def get_energy_prices() -> str:
     Fallback: FRED series for key prices if EIA key not available.
     """
     lines = ["=== ENERGY PRICES ===\n"]
+    _spot_spread = None
 
     # ── EIA API v2 route-based calls ────────────────────────────────────
     if EIA_API_KEY:
@@ -826,10 +827,7 @@ async def get_energy_prices() -> str:
             _wti = _first_num("WTI Crude Oil ($/bbl)")
             _brent = _first_num("Brent Crude Oil ($/bbl)")
             if _wti and _brent:
-                _spr = _brent - _wti
-                if _spr < 0 or _spr > 15:
-                    lines.append(f"\nData-quality warning: Brent–WTI spread is ${_spr:.2f} "
-                                 f"(normal range roughly $2–$10). Verify both prints before relying on either.")
+                _spot_spread = _brent - _wti   # judged below, once futures are known
         except Exception:
             pass
 
@@ -930,6 +928,43 @@ async def get_energy_prices() -> str:
     lines.append("\nSource: EIA open data API (or FRED fallback)")
     lines.append("")
 
+    # ── Front-month futures (Yahoo) — Oct 24 2026 ──────────────────────────
+    # The EIA/FRED prints above are SPOT benchmarks (Cushing WTI, Dated Brent).
+    # Futures can sit far from spot in a tight market (Oct 7: Brent futures ~$101,
+    # WTI ~$89 while spot printed ~$125/$100), so Mercury and Jansky kept reading
+    # the difference as a broken feed. Show both, labeled.
+    try:
+        import yfinance as yf
+        _fut = {}
+        lines.append("\n── Front-month futures (Yahoo) ──")
+        for _lbl, _sym in (("WTI futures (NYMEX CL=F)", "CL=F"),
+                           ("Brent futures (ICE BZ=F)", "BZ=F")):
+            _h = yf.Ticker(_sym).history(period="1mo")
+            if not _h.empty:
+                _last = float(_h["Close"].iloc[-1])
+                _first = float(_h["Close"].iloc[0])
+                _fut[_sym] = _last
+                lines.append(f"{_lbl:<45} {_last:.2f}  [{_h.index[-1].strftime('%Y-%m-%d')}]")
+                if _first:
+                    lines.append(f"  {'~1-month change:':<43} {((_last - _first) / _first) * 100:+.2f}%")
+        if len(_fut) == 2:
+            _fspr = _fut['BZ=F'] - _fut['CL=F']
+            lines.append(f"Futures Brent–WTI spread: ${_fspr:.2f}")
+            if _spot_spread is not None:
+                lines.append(
+                    f"Brent–WTI summary: spot spread ${_spot_spread:.2f} vs futures spread ${_fspr:.2f} "
+                    f"(usual range roughly $2–$10). Both are wide, so the market is pricing a large Brent "
+                    f"premium; the extra ${_spot_spread - _fspr:.2f} on spot reflects physical Dated Brent "
+                    f"trading above Brent futures plus EIA's roughly one-week reporting lag.")
+        elif _spot_spread is not None and (_spot_spread < 0 or _spot_spread > 15):
+            lines.append(f"\nData-quality warning: Brent–WTI SPOT spread is ${_spot_spread:.2f} "
+                         f"(usual range roughly $2–$10) and no futures prices were available to cross-check it.")
+        lines.append("Note: the EIA/FRED prices above are physical SPOT benchmarks; futures can differ "
+                     "materially from spot in a tight market. A wide gap between the two is a market "
+                     "signal (physical premium / backwardation), not necessarily a bad print.")
+    except Exception as e:
+        lines.append(f"Futures lookup problem: {type(e).__name__}")
+
     # ── Energy Sector ETF (VDE) via yfinance ───────────────────────────────
     try:
         import yfinance as yf
@@ -941,9 +976,9 @@ async def get_energy_prices() -> str:
         if vde_price:
             vde_chg_1d = ((vde_price - vde_prev) / vde_prev * 100) if vde_prev else None
             vde_30d = None
-            if not vde_hist.empty and len(vde_hist) > 1:
-                vde_30d = ((vde_hist["Close"].iloc[-1] - vde_hist["Close"].iloc[0])
-                           / vde_hist["Close"].iloc[0]) * 100
+            _vclose = vde_hist["Close"].dropna() if not vde_hist.empty else vde_hist
+            if len(_vclose) > 1:   # dropna: a partial last row once printed "+nan%"
+                vde_30d = ((_vclose.iloc[-1] - _vclose.iloc[0]) / _vclose.iloc[0]) * 100
             lines.append("── Energy Sector ETF (VDE) ──")
             lines.append(f"  Price:  ${vde_price:.2f}")
             if vde_chg_1d is not None:

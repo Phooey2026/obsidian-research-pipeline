@@ -99,8 +99,11 @@ SECTION_START_PATTERN = re.compile(r'(## 8\.|##8\.)', re.IGNORECASE)
 STALE_LANGUAGE = [
     "not used", "stale", "pre-dates", "outdated", "ignored",
     "superseded", "discard", "too old", "historical only",
-    "not current", "no longer",
+    "not current",
 ]
+# Oct 2026: "no longer" removed — it fired on ordinary prose (LNG, CMG, CI) while
+# real staleness (WMT) passed. "not current" is now matched as a whole phrase so it
+# no longer fires on "not currently determinable" (LVS).
 # Note: year strings (2014, 2015, 2016, 2017) removed from STALE_LANGUAGE
 # after Jansky's first run identified them as high false-positive sources.
 # ABBV/2014, AMGN/2015-2016, NVDA/2017 are legitimate historical citations
@@ -267,10 +270,12 @@ def _check_stale_language(summary: str) -> list[str]:
     for phrase in STALE_LANGUAGE:
         phrase_lower = phrase.lower()
         idx = 0
+        _pat = re.compile(r"\b" + re.escape(phrase_lower) + r"\b")
         while True:
-            idx = lower.find(phrase_lower, idx)
-            if idx == -1:
+            _m = _pat.search(lower, idx)
+            if not _m:
                 break
+            idx = _m.start()
             # Check 120-char window around the phrase for context
             window_start = max(0, idx - 120)
             window_end   = min(len(lower), idx + len(phrase_lower) + 120)

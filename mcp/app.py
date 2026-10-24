@@ -1145,24 +1145,53 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             used a tag years ago and a different one now got its ancient series
             (EPD showed 2010/2011 quarters). First-listed wins ties, so preferred
             tags (diluted before basic) still win when equally current."""
-            best = []
+            return best_quarterly_named(concepts, unit)[1]
+
+        def best_quarterly_named(concepts, unit):
+            """Like best_quarterly but also returns WHICH concept won."""
+            best, name = [], None
             for c in concepts:
                 q = get_quarterly(c, unit)
                 if q and (not best or q[0]['end'] > best[0]['end']):
-                    best = q
+                    best, name = q, c
+            return name, best
+
+        def best_annual(concepts, unit):
+            """Annual series from the candidate tag with the NEWEST 10-K data."""
+            best = []
+            for c in concepts:
+                a = get_annual(c, unit)
+                if a and (not best or a[0]['end'] > best[0]['end']):
+                    best = a
             return best
 
         quarters = min(quarters, 12)
         lines = [f"=== {company_name} ({ticker_upper}) — SEC EDGAR ===\n"]
 
         # Step 5: Quarterly EPS — newest-data tag wins (see best_quarterly)
-        eps_q = best_quarterly(
-            ['EarningsPerShareDiluted', 'EarningsPerShareBasic',
-             'IncomeLossFromContinuingOperationsPerDilutedShare',
-             'IncomeLossFromContinuingOperationsPerBasicShare',
-             'NetIncomeLossPerOutstandingLimitedPartnershipUnit',
-             'IncomeLossFromContinuingOperationsPerOutstandingLimitedPartnershipUnit'],
-            'USD/shares')
+        # Oct 24 2026: EPD's SEC facts show per-unit EPS under a tag the fixed list
+        # below never had (its diluted/basic tags stop in 2011, its LP-unit tag in
+        # 2013, while revenue and net income are current), so the table was frozen
+        # at 2011. Besides the fixed preference list, also consider any us-gaap
+        # per-share / per-unit EPS-style concept the filer actually uses. A
+        # discovered concept only wins if it has strictly NEWER quarterly data than
+        # every listed tag (best_quarterly keeps first-listed on ties).
+        _eps_fixed = ['EarningsPerShareDiluted', 'EarningsPerShareBasic',
+                      'IncomeLossFromContinuingOperationsPerDilutedShare',
+                      'IncomeLossFromContinuingOperationsPerBasicShare',
+                      'NetIncomeLossPerOutstandingLimitedPartnershipUnit',
+                      'IncomeLossFromContinuingOperationsPerOutstandingLimitedPartnershipUnit']
+        _eps_name_ok = re.compile(
+            r'(EarningsPerShare|IncomeLoss\w*Per(Basic|Diluted|Outstanding|Share|Unit)|'
+            r'NetIncomeLoss\w*Per(Share|Unit|Outstanding|Basic|Diluted))')
+        _eps_name_bad = re.compile(
+            r'(Discontinued|Extraordinary|CumulativeEffect|Dividend|Distribution|Declared|'
+            r'ProForma|Antidilutive|Redeemable|Preferred|Parent)')
+        _eps_discovered = sorted(
+            (n for n in facts
+             if n not in _eps_fixed and _eps_name_ok.search(n) and not _eps_name_bad.search(n)),
+            key=lambda n: (('Diluted' not in n), n))
+        _eps_concept, eps_q = best_quarterly_named(_eps_fixed + _eps_discovered, 'USD/shares')
 
         # Step 6: Quarterly Revenue — newest-data tag wins. Utility tags added:
         # utilities (XEL etc.) often report under RegulatedAndUnregulatedOperatingRevenue.
@@ -1241,7 +1270,14 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             rev_annual_for_q4 = bank_rev_annual + [
                 r for r in rev_annual_for_q4 if r['end'] not in bank_ends_a]
         ni_annual_for_q4  = get_annual('NetIncomeLoss', 'USD')
-        eps_annual_for_q4 = get_annual('EarningsPerShareDiluted', 'USD/shares')
+        # Annual EPS: prefer the SAME tag the quarterly series came from (so a derived
+        # Q4 = FY - Q1..Q3 never mixes basic and diluted), else whichever EPS tag has
+        # the newest 10-K data. EPD's annual table used to print 2011 and its Q4 rows
+        # were never derived because the fixed tag had no recent annual facts.
+        def _eps_annual_series():
+            a = get_annual(_eps_concept, 'USD/shares') if _eps_concept else []
+            return a or best_annual(_eps_fixed + _eps_discovered, 'USD/shares')
+        eps_annual_for_q4 = _eps_annual_series()
 
         def _q4_derive(quarterly_items, annual_items, year):
             q123 = [it['val'] for it in quarterly_items
@@ -1307,10 +1343,31 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             except Exception:
                 _qage = 0
             if _qage > 200:
+                # Oct 24 2026: tell "SEC's XBRL API hasn't published this filer's
+                # newest 10-Q(s)" apart from "tag not covered". NEE and C both have
+                # 10-Qs filed in 2026 that are simply absent from companyfacts, so no
+                # tag change can recover them; the filings index shows what exists.
+                _lag_txt = ""
+                try:
+                    _subs = sec_get(f'https://data.sec.gov/submissions/CIK{cik}.json')
+                    _rec = _subs.get('filings', {}).get('recent', {})
+                    for _i, _f in enumerate(_rec.get('form', [])):
+                        if _f == '10-Q':
+                            _lp, _lf = _rec['reportDate'][_i], _rec['filingDate'][_i]
+                            _filed_ends = [q['end'] for q in eps_q if not q.get('derived')]
+                            if _filed_ends and _lp > max(_filed_ends):
+                                _lag_txt = (f"SEC's XBRL API has not published this filer's latest 10-Q "
+                                            f"(period {_lp}, filed {_lf}); the table above lags the "
+                                            f"company's real latest quarter. Use Nova/Yahoo earnings "
+                                            f"for the most recent quarter")
+                            break
+                except Exception:
+                    pass
                 lines.append(
                     f"  ⚠ STALE: newest quarterly EPS on file is {_newest_q} ({_qage} days old) — "
-                    f"this filer likely reports under XBRL tags not covered here; do NOT treat "
-                    f"this table as current.")
+                    + (_lag_txt if _lag_txt else
+                       "this filer likely reports under XBRL tags not covered here")
+                    + "; do NOT treat this table as current.")
 
         # Step 9: Annual revenue trend — merged across all known revenue
         # tags (see get_annual() fix note above), not a sequential fallback
@@ -1350,9 +1407,13 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
                 lines.append(f"  {year}: ${val/1e9:.2f}B")
 
         # Step 10: Annual EPS trend
-        eps_annual = get_annual('EarningsPerShareDiluted', 'USD/shares')
+        eps_annual = eps_annual_for_q4
         if eps_annual:
             lines.append(f"\nAnnual Diluted EPS (from 10-K filings):")
+            if datetime.now().year - int(eps_annual[0]['end'][:4]) > 2:
+                lines.append(
+                    f"  ⚠ Most recent annual EPS on file is FY{eps_annual[0]['end'][:4]} — "
+                    f"this filer likely reports EPS under a tag not covered here; treat with caution.")
             for e in eps_annual[:5]:
                 year = e['end'][:4]
                 lines.append(f"  {year}: ${e['val']:.2f}")
