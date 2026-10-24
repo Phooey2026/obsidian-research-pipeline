@@ -119,6 +119,9 @@ def call_tool(tool_name: str, arguments: dict,
                 "params":  {"name": tool_name, "arguments": arguments}
             }, timeout=150)
 
+            # SSE responses carry no charset, so requests would guess Latin-1 and
+            # turn every curly quote / dash into mojibake ("â€”"). Force UTF-8.
+            r.encoding = "utf-8"
             text   = r.text.strip()
             result = ""
             for line in text.split('\n'):
@@ -439,24 +442,29 @@ def research_earnings(ticker: str, company_name: str,
     # newest SEC release is recent, use it directly and skip web search; if it
     # is older, keep it as a candidate and let a newer web result win.
     sec_meta      = None          # dict(date, url, text) when SEC returned a release
-    SEC_FRESH_DAYS = 135          # a quarterly reporter is never legitimately older
-    print(f"    [sec 8-k]...", end=" ", flush=True)
+    SEC_FRESH_DAYS = 135          # US quarterly reporter is never legitimately older
+    SEC_FRESH_DAYS_6K = 200       # foreign filers may report semi-annually
+    print(f"    [sec 8-k/6-k]...", end=" ", flush=True)
     _sec_raw = call_tool("get_sec_earnings_release",
                          {"ticker": ticker, "max_chars": 40000})
-    if _sec_raw and _sec_raw.startswith("=== SEC 8-K"):
+    if _sec_raw and _sec_raw.startswith("=== SEC "):
         _dm = re.search(r'^RELEASE_DATE:\s*(\d{4}-\d{2}-\d{2})', _sec_raw, re.M)
         _um = re.search(r'^URL:\s*(\S+)', _sec_raw, re.M)
         _body = _sec_raw.split("\n\n", 1)[1] if "\n\n" in _sec_raw else ""
         if _dm and _um and len(_body) >= 2000:
-            sec_meta = {"date": _dm.group(1), "url": _um.group(1), "text": _sec_raw}
+            _fm = re.search(r'^FORM:\s*(\S+)', _sec_raw, re.M)
+            sec_meta = {"date": _dm.group(1), "url": _um.group(1), "text": _sec_raw,
+                        "form": (_fm.group(1) if _fm else "8-K")}
     if sec_meta:
         _age = (datetime.date.today() - datetime.date.fromisoformat(sec_meta["date"])).days
         sec_meta["age"] = _age
-        print(f"✓ (released {sec_meta['date']}, {_age}d ago)")
+        print(f"✓ ({sec_meta['form']} released {sec_meta['date']}, {_age}d ago)")
     else:
         _why = (_sec_raw or "empty response").strip().splitlines()[0][:110]
         print(f"– ({_why})")
-    sec_direct = bool(sec_meta and sec_meta["age"] <= SEC_FRESH_DAYS)
+    _fresh = SEC_FRESH_DAYS_6K if (sec_meta and sec_meta["form"].startswith("6-K")) \
+             else SEC_FRESH_DAYS
+    sec_direct = bool(sec_meta and sec_meta["age"] <= _fresh)
     if sec_direct:
         print(f"    → using SEC filing; skipping web search")
     elif sec_meta:
@@ -740,7 +748,7 @@ JSON only. No preamble."""
     source          = "web_search"
     from_sec        = bool(sec_meta and fetch_url == sec_meta["url"])
     if from_sec:
-        source    = "sec_8k"
+        source    = "sec_6k" if sec_meta["form"].startswith("6-K") else "sec_8k"
         call_date = sec_meta["date"]      # exact, from the filing metadata
 
     if not transcript_text:
@@ -755,8 +763,10 @@ JSON only. No preamble."""
     import re as _re
     import subprocess as _sp
 
+    _what = ("press release (SEC " + sec_meta["form"] + " filing, press-release exhibit — "
+             "no Q&A, so say so briefly for Analyst Reception)") if from_sec else "call"
     _prompt = f"""You are Nova, Obsidian Capital's intelligence assistant.
-You have retrieved the most recent earnings {"press release (SEC 8-K Item 2.02, Exhibit 99.1 — no Q&A, so say so briefly for Analyst Reception)" if from_sec else "call"} for {company_name} ({ticker.upper()}).
+You have retrieved the most recent earnings {_what} for {company_name} ({ticker.upper()}).
 {"Release date (VERIFIED from SEC filing metadata): " + call_date if from_sec else "Auto-parsed call date (UNVERIFIED — may be wrong, check against the content below): " + (call_date or 'NOT FOUND')}
 Auto-parsed fiscal quarter (UNVERIFIED — may be wrong, check against the content below): {fiscal_quarter}
 Source: {source}

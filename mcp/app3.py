@@ -1175,11 +1175,28 @@ def _sec_doc_to_text(raw: bytes, name: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', "\n".join(out)).strip()
 
 
+def _strip_6k_cover(text: str) -> str:
+    """Foreign filers (BHP, VALE, ...) often put the whole release in the main
+    6-K document behind a page of SEC cover boilerplate. Cut everything up to
+    the end of the last cover line (Rule 101(b)(7) / Form 40-F check marks) so
+    the real headline leads the text."""
+    head = text[:9000]
+    for pat in (r'rule\s*101\(b\)\(7\)[^\n]*(\n\s*(yes|no)\b[^\n]*)?', r'form\s*40-f[^\n]*'):
+        last = None
+        for m in re.finditer(pat, head, re.I):
+            last = m
+        if last:
+            return text[last.end():].lstrip()
+    return text
+
+
 @mcp.tool()
 def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
-    """Fetch the company's newest earnings press release straight from SEC EDGAR:
-    the most recent 8-K carrying Item 2.02 (Results of Operations), reading its
-    Exhibit 99.1. US domestic filers only (foreign private issuers file 6-K).
+    """Fetch the company's newest earnings press release straight from SEC EDGAR.
+    US filers: the most recent 8-K carrying Item 2.02 (Results of Operations),
+    reading its Exhibit 99.1. Foreign private issuers (BHP, RIO, NVO, ...) file
+    6-K, which has no item numbers, so the newest 6-K from the last ~200 days
+    whose exhibit reads like a quarterly/half-year/annual results release is used.
 
     The filing date is exact, so this avoids stale or mis-dated web-search hits.
     Output starts with header lines (FORM, FILING_DATE, REPORT_DATE, RELEASE_DATE,
@@ -1210,7 +1227,8 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
         if not matches:
             return f"Could not find SEC CIK for {ticker.upper()}"
 
-        tried, saw_6k, hit = [], False, None
+        tried, saw_6k, hit, hit6 = [], False, None, None
+        today_d = _date.today()
         for entry in matches:
             cik = str(entry['cik_str']).zfill(10)
             name = entry.get('title', ticker.upper())
@@ -1244,13 +1262,39 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
                 hit = (cik, name, pick, rows)
                 break
 
+            # Foreign private issuer: recent 6-Ks (no item numbers to filter on).
+            rows6 = []
+            for i, form in enumerate(forms):
+                if form != '6-K':
+                    continue
+                try:
+                    age = (today_d - _date.fromisoformat(rec['filingDate'][i])).days
+                except ValueError:
+                    continue
+                if age > 200:
+                    break                      # arrays are newest-first
+                rows6.append({
+                    'form': '6-K', 'items': 'n/a',
+                    'filed': rec['filingDate'][i],
+                    'report': (rec.get('reportDate') or [''] * len(forms))[i],
+                    'accn': rec['accessionNumber'][i],
+                    'primary': (rec.get('primaryDocument') or [''] * len(forms))[i],
+                })
+            if rows6 and not hit6:
+                hit6 = (cik, name, rows6[0], rows6)
+
+        kind = '8-K'
+        if not hit and hit6:
+            hit, kind = hit6, '6-K'
+
         if not hit:
-            extra = (" (this filer reports on Form 6-K/20-F/40-F — foreign private "
-                     "issuer, use web search)") if saw_6k else ""
+            extra = (" (this filer reports on Form 6-K/20-F/40-F but has no 6-K in the "
+                     "last 200 days — use web search)") if saw_6k else ""
             return (f"No 8-K Item 2.02 earnings release found for {ticker.upper()}"
                     f"{extra}. Registrants tried: {'; '.join(tried)}")
 
         cik, name, _first, rows = hit
+        t_start = time.monotonic()
 
         def _reject_reason(text: str, fname: str) -> str:
             """'' if this looks like a results release, else why not. Catches
@@ -1263,14 +1307,51 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
             if re.search(r'\brecast', head) and not re.search(
                     r'(reports?|announces?|reported)\b.{0,80}\b(results|earnings)', head):
                 return 'recast'
-            if not re.search(r'results|earnings', head):
+            if kind == '8-K' and not re.search(r'results|earnings', head):
                 return 'no results text'
+            if kind == '6-K':
+                # 6-Ks are anything: AGM notices, voting rights, buybacks, debt
+                # offerings. Require a results headline shape.
+                top = text[:500].lower()
+                if re.search(r'notice of|annual general meeting|extraordinary general|'
+                             r'total voting rights|transaction in own shares|'
+                             r'notification of major|director/pdmr|holding\(s\) in|'
+                             r'form 8\.3|prospectus|results of (the )?(annual|general)', top):
+                    return 'not a results release'
+                body = text[:8000].lower()
+                fin = [t for t in ('net income', 'net profit', 'profit', 'ebitda',
+                                   'earnings per', 'eps', 'operating income',
+                                   'net sales', 'revenue', 'net earnings') if t in body]
+                period = re.search(
+                    r'(first|second|third|fourth|1st|2nd|3rd|4th)[- ]quarter|\bq[1-4]\b|'
+                    r'\b[1-4]q\s?\d{2,4}\b|\b[12]h\s?\d{2,4}\b|'
+                    r'half[- ]year|(three|six|nine|twelve)[- ]months?|full[- ]year|'
+                    r'(year|quarter|period)s? ended|fiscal (year|quarter)|annual results|'
+                    r'interim', text[:3000].lower())
+                if len(fin) < 2 or not period:
+                    return 'no results text'
             return ''
 
         found, skipped, seen = None, [], []
+        weak = None      # 6-K that reads like financials but lacks a results headline
         ordered = [r for r in rows if r['form'] == '8-K'] + \
                   [r for r in rows if r['form'] != '8-K']
-        for pick in ordered[:5]:
+        if kind == '6-K':
+            # Vale files ~10 separate 6-Ks the day it reports (buyback, board
+            # changes, financial statements, the performance release...). Try
+            # filings whose main document NAME hints at results first
+            # (valepr2q26_6k.htm, ...2q26..., ...results...), newest first, then
+            # the rest, so the scan budget is not spent on bond notices.
+            _hint = re.compile(r'result|earn|releas|press|[1-4]q\d{2}|[12]h\d{2}|'
+                               r'\bq[1-4]|fy\d{2}|quarter|financ|interim|perform|(^|[^a-z])pr\d?[qh]?\d',
+                               re.I)
+            ordered = [r for r in ordered if _hint.search(r['primary'] or '')] + \
+                      [r for r in ordered if not _hint.search(r['primary'] or '')]
+        max_filings = 5 if kind == '8-K' else 60
+        for pick in ordered[:max_filings]:
+            if kind == '6-K' and time.monotonic() - t_start > 100:
+                skipped.append("time budget reached")
+                break
             accn_nd = pick['accn'].replace('-', '')
             base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accn_nd}/"
 
@@ -1299,6 +1380,14 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
                     files.append((it.get('name', ''), sz))
             except Exception:
                 pass
+            if kind == '6-K':
+                # Annual reports / decks run 1-2 MB and take ages to convert.
+                big = {n for n, sz in files if sz > 1_200_000}
+                if big:
+                    skipped.append(f"{pick['filed']} {', '.join(sorted(big))} (too large)")
+                files = [(n, sz) for n, sz in files if n not in big]
+                if pick['primary'] in big:
+                    pick = dict(pick, primary='')
             scored = sorted((_sec_exhibit_score(n), n) for n, _ in files
                             if _sec_exhibit_score(n) is not None)
             order = [n for _, n in scored]
@@ -1313,11 +1402,13 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
                 order.append(pick['primary'])
 
             text, used = "", ""
-            for n in order[:7]:
+            for n in order[:(7 if kind == '8-K' else 3)]:
                 try:
                     t = _sec_doc_to_text(sec_get(base + n), n)
                 except Exception:
                     continue
+                if kind == '6-K':
+                    t = _strip_6k_cover(t)
                 if len(t) < 1500:
                     continue
                 why = _reject_reason(t, n)
@@ -1326,15 +1417,29 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
                     continue
                 text, used = t, n
                 break
-            if not text:
+            if not text and len(seen) < 6:
                 seen.append(f"{pick['filed']}: " + (", ".join(
                     f"{n}[{sz}]" for n, sz in files[:12]) or "index unavailable"))
+            if text and kind == '6-K':
+                # A strong 6-K has a results-style headline in its opening lines.
+                # Annual reports / sustainability reports also pass the financial
+                # test (BHP's Sept 16 6-K), so keep scanning for a stronger one.
+                top = text[:600].lower()
+                strong = (re.search(r'results|earnings|operating profit|net (income|profit)|'
+                                    r'financial report|interim|quarter', top)
+                          and not re.search(r'annual report|sustainability|climate|'
+                                            r'form 20-f|integrated report', top))
+                if not strong:
+                    if weak is None:
+                        weak = (pick, base, release, text, used)
+                    skipped.append(f"{pick['filed']} {used} (no results headline)")
+                    text = ""
             if text:
                 found = (pick, base, release, text, used)
                 break
 
         if not found:
-            return (f"8-K Item 2.02 filings exist for {ticker.upper()} "
+            return (f"{kind} filings exist for {ticker.upper()} "
                     f"({', '.join(r['filed'] for r in rows[:5])}) but none has a readable "
                     f"results exhibit. Skipped: {'; '.join(skipped) or 'none'}. "
                     f"Files seen: {' | '.join(seen) or 'n/a'}")
@@ -1344,7 +1449,8 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
             text = text[:max_chars] + "\n\n[Truncated]"
         recent = ", ".join(r['filed'] for r in rows[:4])
         skip_line = f"SKIPPED_NEWER: {'; '.join(skipped)}\n" if skipped else ""
-        return (f"=== SEC 8-K Item 2.02 earnings release — {name} ({ticker.upper()}) ===\n"
+        _label = "8-K Item 2.02" if kind == '8-K' else "6-K"
+        return (f"=== SEC {_label} earnings release — {name} ({ticker.upper()}) ===\n"
                 f"FORM: {pick['form']}\n"
                 f"FILING_DATE: {pick['filed']}\n"
                 f"REPORT_DATE: {pick['report'] or 'n/a'}\n"
@@ -1352,7 +1458,7 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
                 f"ITEMS: {pick['items']}\n"
                 f"URL: {base}{used}\n"
                 f"ACCESSION: {pick['accn']}\n"
-                f"RECENT_2.02_FILINGS: {recent}\n"
+                f"RECENT_{'2.02' if kind == '8-K' else '6-K'}_FILINGS: {recent}\n"
                 f"{skip_line}\n"
                 f"{text}")
 

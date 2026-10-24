@@ -447,13 +447,13 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
             summary_text = ""   # too old to be useful — omit rather than mislead
 
         if summary_text:
-            is_release = (source == "sec_8k")
+            is_release = source in ("sec_8k", "sec_6k")
             if source == "quartr":
                 source_note = "Quartr"
             elif is_release:
                 # Oct 24 2026: SEC 8-K Item 2.02 / Exhibit 99.1 is the company's
                 # own results press release: exact date, but NO Q&A or call.
-                source_note = ("SEC 8-K press release — company-written results, "
+                source_note = (f"SEC {'6-K' if source == 'sec_6k' else '8-K'} press release — company-written results, "
                                "no analyst Q&A or live call")
             else:
                 source_note = "web transcript"
