@@ -23,6 +23,8 @@ Tools (16 total):
   get_noaa_drought         — NOAA drought monitor
   get_cot_report           — CFTC Commitment of Traders
   get_baltic_dry           — Baltic Dry Index via SearXNG
+  get_gold_drivers         — Real yield, breakeven, dollar, gold trend, COT percentile, GLD/IAU flows
+  get_etf_flows            — ETF creations/redemptions proxy (IBIT, FBTC, BITQ, GLD, IAU)
   build_mercury_backdrop   — Structured YAML for cross-agent injection
 
 Data sources:
@@ -1150,6 +1152,210 @@ async def get_metals_prices() -> str:
 
 # ── Agriculture ───────────────────────────────────────────────────────────────
 
+ETF_SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "etf_share_snapshots.json")
+
+
+def _etf_share_flow_sync(tickers: list[str], days: int = 28) -> list[str]:
+    """Estimate ETF creations/redemptions from the change in implied shares outstanding.
+
+    Oct 26 2026: Mercury could say "IBIT volume 22.9M shares" but not whether money
+    was flowing in or out. Yahoo has no usable share-count HISTORY for ETFs
+    (get_shares_full returned 0 rows for all five funds) and its sharesOutstanding
+    field is stale for GLD/IAU (260M vs ~385M implied). What it does return fresh is
+    totalAssets and navPrice, so implied shares = totalAssets / navPrice. Each call
+    records that snapshot in etf_share_snapshots.json; flow is the change in implied
+    shares since a snapshot at least 5 days old, x the current NAV. The first run only
+    records a baseline; estimates begin with the next weekly run.
+    """
+    import yfinance as yf
+    try:
+        with open(ETF_SNAPSHOT_PATH) as f:
+            store = json.load(f)
+    except Exception:
+        store = {}
+    today = datetime.now(timezone.utc).date()
+    out = []
+    for tk in tickers:
+        try:
+            info = yf.Ticker(tk).info
+            ta, nav = info.get("totalAssets"), info.get("navPrice") or info.get("regularMarketPrice")
+            if not ta or not nav or nav <= 0:
+                out.append(f"  {tk:<6} totalAssets/NAV unavailable from Yahoo — flow cannot be estimated")
+                continue
+            shares = float(ta) / float(nav)
+            hist = [h for h in store.get(tk, []) if h.get("date") != today.isoformat()]
+            cands = [h for h in hist if (today - datetime.fromisoformat(h["date"]).date()).days >= 5]
+            base = None
+            if cands:
+                tgt = today - timedelta(days=days)
+                base = min(cands, key=lambda h: abs((datetime.fromisoformat(h["date"]).date() - tgt).days))
+            hist.append({"date": today.isoformat(), "shares": shares, "total_assets": float(ta), "nav": float(nav)})
+            store[tk] = hist[-26:]
+            if base is None:
+                out.append(f"  {tk:<6} implied shares {shares/1e6:,.1f}M recorded as baseline — flow estimates "
+                           f"start once a snapshot at least 5 days old exists (next weekly run); flow unverified until then")
+                continue
+            span = (today - datetime.fromisoformat(base["date"]).date()).days
+            d_sh = shares - base["shares"]
+            pct = d_sh / base["shares"] * 100 if base["shares"] else 0.0
+            if abs(pct) < 0.005 and abs(ta - base["total_assets"]) < 1:
+                out.append(f"  {tk:<6} Yahoo's asset figure is unchanged since {base['date']} — cannot tell flat flows "
+                           f"from a stale feed; flow unverified")
+                continue
+            usd = d_sh * float(nav)
+            direction = "net CREATIONS (inflow)" if d_sh > 0 else ("net REDEMPTIONS (outflow)" if d_sh < 0 else "flat")
+            out.append(f"  {tk:<6} implied shares {base['shares']/1e6:,.1f}M [{base['date']}] → {shares/1e6:,.1f}M "
+                       f"[{today}]  {pct:+.2f}% over {span}d  ≈ {'+' if usd >= 0 else '-'}${abs(usd)/1e6:,.0f}M  {direction}")
+        except Exception as e:
+            out.append(f"  {tk:<6} flow estimate error — {type(e).__name__}: {str(e)[:80]}")
+    try:
+        with open(ETF_SNAPSHOT_PATH, "w") as f:
+            json.dump(store, f)
+    except Exception as e:
+        out.append(f"  (could not save snapshot history: {type(e).__name__} — flows will not accumulate)")
+    return out
+
+
+@mcp.tool()
+async def get_etf_flows(tickers: list[str] = None) -> str:
+    """
+    Estimated ETF creations/redemptions (flow proxy) over ~4 weeks, from the change
+    in shares outstanding x price. Default set: spot-Bitcoin and crypto-industry ETFs
+    (IBIT, FBTC, BITQ) plus gold ETFs (GLD, IAU). Approximate — follows fund filings.
+    """
+    tickers = [t.upper() for t in (tickers or ["IBIT", "FBTC", "BITQ", "GLD", "IAU"])]
+    lines = ["=== ETF FLOW PROXY (change in implied shares outstanding x NAV) ===\n"]
+    lines += await asyncio.to_thread(_etf_share_flow_sync, tickers)
+    lines.append("\nNote: approximate. Shares outstanding change only via creations/redemptions, so "
+                 "this separates real inflows from mere trading volume. Implied shares = Yahoo totalAssets / NAV, "
+                 "snapshotted each run (history builds week by week).")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_gold_drivers() -> str:
+    """
+    The macro drivers of gold in one place, so gold moves can be explained rather
+    than just reported: 10Y TIPS real yield, 10Y breakeven inflation, broad dollar,
+    gold's trend and drawdown, how tightly gold has tracked real yields lately,
+    speculator (COT) positioning against its 3-year range, and GLD/IAU flows.
+    Sources: FRED (DFII10, T10YIE, DTWEXBGS), Yahoo Finance (GC=F), CFTC, Yahoo share counts.
+    """
+    lines = ["=== GOLD DRIVERS ===\n"]
+    gold_closes = None
+
+    # ── Gold price, trend, drawdown ──────────────────────────────────────
+    try:
+        import yfinance as yf
+        h = await asyncio.to_thread(lambda: yf.Ticker("GC=F").history(period="14mo"))
+        gold_closes = h["Close"].dropna() if h is not None and not h.empty else None
+    except Exception as e:
+        lines.append(f"Gold price: error — {type(e).__name__}")
+    gold_4w = None
+    if gold_closes is not None and len(gold_closes) > 25:
+        last = float(gold_closes.iloc[-1])
+        gold_4w = (last / float(gold_closes.iloc[-21]) - 1) * 100
+        hi = float(gold_closes.tail(252).max())
+        dd = (last / hi - 1) * 100
+        lines.append("── Gold ──")
+        lines.append(f"  Price ${last:,.2f} [{gold_closes.index[-1].date()}]   4w {gold_4w:+.1f}%   "
+                     f"{dd:+.1f}% from 52w high (${hi:,.0f})")
+        if len(gold_closes) >= 200:
+            ma = float(gold_closes.tail(200).mean())
+            lines.append(f"  vs 200d average (${ma:,.0f}): {(last / ma - 1) * 100:+.1f}%")
+        lines.append("")
+    else:
+        lines.append("Gold price history unavailable — trend and drawdown cannot be computed.\n")
+
+    # ── Rates / dollar ───────────────────────────────────────────────────
+    ry_obs = []
+    lines.append("── Rates & dollar (gold's main macro drivers) ──")
+    for label, sid, n, unit in (("10Y TIPS real yield", "DFII10", 60, "pct"),
+                                ("10Y breakeven inflation", "T10YIE", 40, "pct"),
+                                ("Broad dollar index (Fed, not ICE DXY)", "DTWEXBGS", 40, "idx")):
+        try:
+            obs = [o for o in await _fred_series(sid, limit=n) if o["value"] is not None]
+            if len(obs) < 6:
+                lines.append(f"  {label}: unavailable (FRED {sid} returned too little data)")
+                continue
+            if sid == "DFII10":
+                ry_obs = obs
+            cur, prev = obs[-1], obs[-min(21, len(obs))]
+            try:
+                age = (datetime.now() - datetime.strptime(cur["date"][:10], "%Y-%m-%d")).days
+            except Exception:
+                age = 0
+            stale = f"  ⚠ STALE: {age}d old" if age > 7 else ""
+            if unit == "pct":
+                lines.append(f"  {label}: {cur['value']:.2f}% [{cur['date']}]   "
+                             f"change over ~4w {cur['value'] - prev['value']:+.2f} pts{stale}")
+            else:
+                lines.append(f"  {label}: {cur['value']:.2f} [{cur['date']}]   "
+                             f"change over ~4w {(cur['value'] / prev['value'] - 1) * 100:+.2f}%{stale}")
+        except Exception as e:
+            lines.append(f"  {label}: unavailable — {type(e).__name__}")
+    lines.append("  Rule of thumb: rising real yields / stronger dollar = headwind for gold; "
+                 "falling = tailwind.")
+
+    # ── How tightly gold is tracking real yields ─────────────────────────
+    try:
+        if gold_closes is not None and len(ry_obs) >= 30:
+            import pandas as pd
+            ry = pd.Series({pd.Timestamp(o["date"]): o["value"] for o in ry_obs})
+            g = gold_closes.copy()
+            g.index = [pd.Timestamp(i.date()) for i in g.index]
+            df = pd.concat([g.rename("g"), ry.rename("r")], axis=1).dropna().tail(60)
+            if len(df) >= 25:
+                corr = float(df["g"].pct_change().corr(df["r"].diff()))
+                tag = ("tracking real yields (inverse) — rates explain the move" if corr < -0.3 else
+                       "moving WITH real yields — something other than rates (haven demand, central banks, "
+                       "ETF flows) is driving gold" if corr > 0.2 else "no clear link to real yields lately")
+                lines.append(f"  Gold vs real-yield daily-change correlation (last {len(df)} sessions): "
+                             f"{corr:+.2f} — {tag}")
+    except Exception:
+        pass
+    lines.append("")
+
+    # ── COT positioning vs its own history ───────────────────────────────
+    lines.append("── Speculator positioning (CFTC COT, gold futures) ──")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(CFTC_BASE, params={
+                "$where": "market_and_exchange_names='GOLD - COMMODITY EXCHANGE INC.'",
+                "$order": "report_date_as_yyyy_mm_dd DESC", "$limit": "156",
+                "$select": "report_date_as_yyyy_mm_dd,noncomm_positions_long_all,noncomm_positions_short_all"})
+            r.raise_for_status()
+            rows = r.json()
+        nets = [(x["report_date_as_yyyy_mm_dd"][:10],
+                 int(x.get("noncomm_positions_long_all") or 0) - int(x.get("noncomm_positions_short_all") or 0))
+                for x in rows]
+        if len(nets) >= 20:
+            cur_d, cur_n = nets[0]
+            vals = sorted(n for _d, n in nets)
+            pctile = sum(1 for v in vals if v <= cur_n) / len(vals) * 100
+            chg = cur_n - nets[min(4, len(nets) - 1)][1]
+            crowd = ("CROWDED long — contrarian risk of liquidation" if pctile >= 90 else
+                     "light positioning — room to add" if pctile <= 20 else "mid-range")
+            lines.append(f"  Net speculative position {cur_n:+,} contracts [{cur_d}]  "
+                         f"(percentile rank {pctile:.0f}/100 over the last {len(nets)} weeks; 4-report change {chg:+,}) — {crowd}")
+        else:
+            lines.append("  COT history unavailable — percentile cannot be computed.")
+    except Exception as e:
+        lines.append(f"  COT history unavailable — {type(e).__name__}")
+    lines.append("")
+
+    # ── Fund flows ───────────────────────────────────────────────────────
+    lines.append("── Gold ETF flows (implied shares outstanding change) ──")
+    lines += await asyncio.to_thread(_etf_share_flow_sync, ["GLD", "IAU"])
+    lines.append("")
+    # Wording avoids the words pipeline_health.py treats as CRITICAL Mercury gaps
+    # ("gold", "BDI", "baltic"): this is a permanent, known limitation, not a feed failure.
+    lines.append("Not covered: central-bank bullion purchases (the WGC quarterly series is "
+                 "not available from any configured source) — treat official-sector demand as unverified.")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def get_agricultural_prices() -> str:
     """
@@ -1891,6 +2097,56 @@ async def get_cot_report() -> str:
     return "\n".join(lines)
 
 
+_MON = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def _parse_snippet_date(text: str, fallback: str = ""):
+    """Return a date found in a search snippet (or SearXNG's publishedDate), else None.
+
+    Handles 'Oct 24, 2026', 'October 24 2026', '24 Oct 2026', '2026-10-24', and
+    year-less 'Oct 24' (assumed the current year, or last year if that would be future).
+    """
+    import re as _re
+    today = datetime.now(timezone.utc).date()
+    text = _re.sub(r'<[^>]+>', '', text or '')
+    # "...fell for a second session on Monday" — resolve a bare weekday to its most
+    # recent occurrence (today counts), but only when no explicit date is present.
+    _wd = {n: i for i, n in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday",
+                                       "saturday", "sunday"])}
+    pats = [
+        (r'\b(\d{4})-(\d{2})-(\d{2})\b', lambda m: (int(m[1]), int(m[2]), int(m[3]))),
+        (r'\b([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b',
+         lambda m: (int(m[3]), _MON.get(m[1].lower()), int(m[2]))),
+        (r'\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3})[a-z]*\.?,?\s+(\d{4})\b',
+         lambda m: (int(m[3]), _MON.get(m[2].lower()), int(m[1]))),
+        (r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b(?!,?\s*\d{4})',
+         lambda m: (today.year, _MON.get(m[1].lower()), int(m[2]))),
+    ]
+    for src in (text, fallback):
+        if not src:
+            continue
+        for pat, conv in pats:
+            m = _re.search(pat, src, _re.IGNORECASE)
+            if not m:
+                continue
+            try:
+                y, mo, d = conv(m)
+                if not mo:
+                    continue
+                dt_ = datetime(y, mo, d).date()
+                if dt_ > today + timedelta(days=1):
+                    dt_ = datetime(y - 1, mo, d).date()      # year-less date that would be in the future
+                return dt_
+            except Exception:
+                continue
+    wm = _re.search(r'\bon\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', text, _re.IGNORECASE)
+    if wm:
+        back = (today.weekday() - _wd[wm.group(1).lower()]) % 7
+        return today - timedelta(days=back)
+    return None
+
+
 @mcp.tool()
 async def get_baltic_dry() -> str:
     """
@@ -1954,38 +2210,39 @@ async def get_baltic_dry() -> str:
             )
             bdi_value = None
             bdi_source_date = ""
-            _min_bdi_year = datetime.now(timezone.utc).year - 2
+            stale_candidate = None
             for item in shipping_results:
-                text = item.get("title","") + " " + item.get("content","")
+                text = _re.sub(r'<[^>]+>', '', item.get("title","") + " " + item.get("content",""))
                 for pat in (bdi_pattern, points_pattern):
                     m = pat.search(text)
                     if m:
                         candidate = int(m.group(1).replace(",", ""))
                         if 400 <= candidate <= 8000:
-                            date_m = _re.search(
-                                r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)' +
-                                r'\w*\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}',
-                                text, _re.IGNORECASE
-                            )
-                            candidate_date = date_m.group(0) if date_m else ""
-                            # Reject a candidate tied to an old date — e.g. a
-                            # Wikipedia snippet describing the BDI's 1985
-                            # base value ("...set at 1,000 on January 4,
-                            # 1985") satisfies the numeric range check just
-                            # as well as a genuine current reading, and was
-                            # confirmed in practice (Sept 2026) to win the
-                            # match ahead of a result with the real current
-                            # value. Undated candidates are still accepted —
-                            # only a clearly old explicit date disqualifies.
-                            year_m = _re.search(r'\b(19|20)\d{2}\b', candidate_date)
-                            if year_m and int(year_m.group(0)) < _min_bdi_year:
-                                continue
+                            # Oct 26 2026: Jansky asked for the snippet date to be
+                            # verified. Parse it (snippet text, else SearXNG's own
+                            # publishedDate), reject anything older than 14 days —
+                            # including dated-this-year-but-months-old results and the
+                            # 1985 Wikipedia base value — and report the age.
+                            cand_dt = _parse_snippet_date(text, str(item.get("publishedDate") or ""))
+                            if cand_dt is not None:
+                                _age = (datetime.now(timezone.utc).date() - cand_dt).days
+                                if _age > 14:
+                                    stale_candidate = (candidate, cand_dt, _age)
+                                    continue
+                                candidate_date = f"{cand_dt.isoformat()}, {_age}d old"
+                            else:
+                                candidate_date = ""
                             bdi_value = candidate
                             bdi_source_date = candidate_date
                             break
                 if bdi_value:
                     break
 
+            if not bdi_value and stale_candidate:
+                _c, _d, _a = stale_candidate
+                lines.append(f"Baltic Dry Index (BDI):  {_c:,}  ⚠ STALE: the only readings found are dated "
+                             f"{_d.isoformat()} ({_a} days old) — do NOT treat as current")
+                lines.append("")
             if bdi_value:
                 if bdi_source_date:
                     lines.append(f"Baltic Dry Index (BDI):  {bdi_value:,}  [{bdi_source_date}]")
@@ -2148,6 +2405,8 @@ async def build_mercury_backdrop() -> str:
 
     bdi_text = await get_baltic_dry()
     bdi_val, bdi_4w, _            = _extract_metric_and_change(bdi_text, "Baltic Dry Index (")
+    if any("Baltic Dry Index (BDI)" in _l and "STALE" in _l for _l in bdi_text.split("\n")):
+        bdi_val, bdi_4w = None, None      # stale reading must not enter the backdrop YAML as current
 
     # ── DXY trend ─────────────────────────────────────────────────────────
     dxy_vals = [o["value"] for o in dxy_obs if o["value"] is not None]

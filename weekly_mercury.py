@@ -355,7 +355,9 @@ Current prices, 7d/30d trend, key levels to watch, and what the trend
 signals about overall risk appetite.
 
 **Crypto ETFs (BITQ, FBTC, IBIT)**
-Performance vs spot crypto. Any flow signals?
+Performance vs spot crypto. Use the ETF FLOW PROXY feed (creations/redemptions)
+to say whether money is actually entering or leaving — volume alone is not flow.
+If a fund's flow line says unavailable, say the flow is unverified.
 
 **News & Catalysts**
 Top 2-3 crypto news themes this week and their market implication.
@@ -370,7 +372,9 @@ implication for energy sector equities.
 
 **Metals**
 Gold safe-haven signal, copper growth proxy reading. Gold/Silver ratio
-interpretation. Any metals with notable moves?
+interpretation. Any metals with notable moves? Use the GOLD DRIVERS feed to
+EXPLAIN gold's move (real yield, dollar, positioning, ETF flows) rather than
+only reporting the price, and say when gold is moving against real yields.
 
 **Agriculture**
 WASDE highlights, crop progress, drought conditions. Which crops have the
@@ -1015,6 +1019,10 @@ def main():
     print(f"\n  [Market Structure & Positioning]")
     collected["cot_report"]        = run_tool("get_cot_report")
     collected["baltic_dry"]        = run_tool("get_baltic_dry")
+    # Gold drivers + ETF flow proxy (Oct 26 2026: gold had price only; crypto ETF
+    # flows were an unfilled HIGH-impact gap)
+    collected["gold_drivers"]      = run_tool("get_gold_drivers")
+    collected["etf_flows"]         = run_tool("get_etf_flows")
 
     # Mercury backdrop YAML
     print(f"\n  [Mercury Backdrop]")

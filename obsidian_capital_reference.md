@@ -1,5 +1,5 @@
 # Obsidian Capital Research Pipeline — Reference Guide
-## As of June 22, 2026 — updated September 22, 2026
+## As of June 22, 2026 — updated October 26, 2026
 
 ---
 
@@ -37,6 +37,17 @@
   before assuming a code regression when a SearXNG-dependent tool
   (crypto news, Fed communications, earnings search) comes back
   suspiciously empty.
+- **Root cause observed Oct 26, 2026:** `docker logs searxng` showed
+  Startpage and DuckDuckGo returning CAPTCHAs, Yahoo dropping
+  connections, scraped Brave "too many requests", Reuters 401. Nine
+  minutes after a restart, four engines were already suspended and the
+  pool leaned on `bing` + `braveapi` + DuckDuckGo web. SearXNG keeps
+  suspensions in memory, so a restart clears them until our own volume
+  (Nova's ~30-ticker searches, news) triggers them again. Mitigation:
+  `searxng_preflight.py` (probe, restart if empty, logs the blocked
+  engines each run). Open: add more tolerant engines (e.g. Mojeek) after
+  reviewing the enabled list; `braveapi` is quota-limited, not
+  CAPTCHA-limited.
 - Docker restart policy set to `unless-stopped` — auto-starts on reboot:
   `docker update --restart unless-stopped searxng`
 - `SEARXNG_URL` env var: `mercurymcp` (app4.py) and the new
@@ -57,16 +68,40 @@
 ### Agent Profiles & Models
 
 ```
-Agent    Profile     Model                              Role
+Agent    Profile     Model (as of Oct 26, 2026)         Role
 ──────   ─────────   ────────────────────────────────   ────────────────────────────
-Jansky   default     deepseek/deepseek-v4-flash-0731     Head of AI Operations
-Jupiter  jupiter     deepseek/deepseek-v4-flash-0731     Equity Research Analyst
-Mercury  mercury     deepseek/deepseek-v4-flash-0731     CCC + ETF Analyst
-Nova     nova        deepseek/deepseek-v4-flash-0731     Legal & Earnings Intel
-Atlas    atlas       deepseek/deepseek-v4-flash-0731     Macroeconomic Advisor
+Jansky   default     z-ai/glm-5.3-flash                 Head of AI Operations
+Jupiter  jupiter     deepseek/deepseek-v4.1-flash       Equity Research Analyst
+Mercury  mercury     z-ai/glm-5.3-flash                 CCC + ETF Analyst
+Nova     nova        z-ai/glm-5.3-flash                 Legal & Earnings Intel
+Atlas    atlas       z-ai/glm-5.3-flash                 Macroeconomic Advisor
 ```
 
-**Model history:** Owl Alpha (used through mid-2026) disappeared from
+**Other Hermes profiles** (`hermes profile list`, Oct 26, 2026 — not part of
+the weekly research run order; all gateways running):
+```
+Profile      Model                          Alias
+──────────   ────────────────────────────   ───────────
+fa           deepseek/deepseek-v4.1-flash   fa
+neptune      deepseek/deepseek-v4.1-flash   neptune
+venus        deepseek/deepseek-v4.1-flash   venus
+orbit        google/gemma-4-26b-a4b-it      orbit
+form_agent   qwen/qwen-image-3-pro          form_agent
+```
+(`hermes profile list` truncates the DeepSeek name to `deepseek-v4.1-fla`;
+`-flash` is confirmed for Jupiter (Oct 24 commit comment) and assumed for the
+others — check each profile's `config.yaml` if it matters.)
+
+**Model update, Oct 2026:** the research agents moved off the single
+DeepSeek V4 Flash 0731 build. Jupiter is on DeepSeek V4.1 Flash; Jansky
+(`default`), Mercury, Nova and Atlas are on Z.ai GLM 5.3 Flash. The
+Reasoning-effort history below describes V4 Flash 0731 and the time up to
+Sept 2026 — see the Oct 24 note at the end of that section for what
+changed. Re-check the self-narration/rewrite behavior and JSON salvage
+rate on the new models before assuming the old findings still apply; the
+salvage layer stays in place regardless.
+
+**Model history (through Sept 2026):** Owl Alpha (used through mid-2026) disappeared from
 OpenRouter during a ~6-week gap in pipeline operation. DeepSeek V4 Flash
 climbed from ~10th most-used model on OpenRouter to #1 over the same
 period and was adopted pipeline-wide as the price/performance leader —
@@ -74,7 +109,7 @@ confirmed solid after 2 months of production use. When the pipeline
 resumed after the 6-week gap, Jupiter's profile had not been updated
 from V4 Flash 0423 to 0731 the way every other agent's had — an
 oversight, not a deliberate choice. Fixed Aug 2026; all five agents now
-run the same 0731 build.
+run the same 0731 build. (Superseded Oct 2026 — see the model update above.)
 
 **Reasoning effort — full history, since this went through several
 incorrect theories before landing (Sept 2026):**
@@ -148,6 +183,19 @@ a one-off test run against a free OpenRouter model
 yet diagnosed failure (a fixed 91-character response, identical before
 and after a retry, that never parsed) — deprioritized, not yet
 investigated further.
+
+**Oct 24, 2026 update (`ffa16e9`):** `--reasoning high` was removed from
+the Jupiter calls (`weekly_research.py`, `sector_ranking.py`) and both
+Mercury calls (`weekly_mercury.py`). The current Jupiter model
+(deepseek-v4.1-flash via OpenRouter) rejects the flag with
+`Error: invalid_params` and returns nothing. So the "Current state"
+paragraph above is historical: there is now no `--reasoning` flag on any
+Jupiter or Mercury subprocess call. Failed calls are now caught: a
+summary under 800 characters (or "Summary unavailable") prints a failure
+and the run stops after 3 in a row, instead of printing a green check for
+a 61-character reply and continuing through 128 tickers. Whether the
+`high`/`xhigh`-only finding applies to GLM 5.3 Flash (Mercury, Nova, Atlas,
+Jansky) has not been checked.
 
 **Other agent-level config keys like `max_tokens` and
 `agent.reasoning_effort` are NOT reliably read** when set via `hermes
@@ -299,6 +347,17 @@ sleep 15
 curl -s "http://localhost:8080/search?q=Apple+earnings+press+release&format=json" | \
 python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Results: {len(d.get(\"results\",[]))}')"
 
+# Probe SearXNG and restart it only if it returns nothing (Oct 26, 2026).
+# Also prints which upstream engines are blocked and which answered.
+python3 searxng_preflight.py            # probe, restart if empty, re-probe
+python3 searxng_preflight.py --check    # probe only, never restart
+
+# Read-only SEC / ETF diagnostics (talk only to sec.gov / Yahoo / issuer pages)
+python3 diag_xbrl.py NEE                                  # newest filings + EPS/NI/revenue tags
+python3 diag_xbrl.py NEE --scan +ElectricUtilityRevenue   # every 'Revenue' concept; +Name adds one
+python3 diag_6k.py TICKER SINCE_DATE [LIMIT | EXACT_DATE] # foreign filers' 6-K scan (Nova's source)
+python3 diag_etf_shares.py [TICKER ...]                   # which source gives ETF share counts
+
 # After editing watchlist.json (dropping/swapping a ticker) — expunge its
 # stale earnings/legal cache from nova_supplemental.json
 python3 prune_stale_tickers.py            # dry run first
@@ -329,6 +388,9 @@ python3 settle_portfolio.py
 ```bash
 # 0. Pre-flight health check (optional but recommended)
 python3 pipeline_health.py
+#    SearXNG preflight (Oct 2026): scraped engines get CAPTCHA'd/rate-limited and the
+#    pool can empty out until the container restarts. Not yet wired into a launcher.
+python3 searxng_preflight.py
 
 # 1. Macro research (Atlas + FRED + Fed Communications)
 python3 weekly_macro.py
@@ -855,6 +917,37 @@ Jupiter call.
 
 **`nova_earnings_call.py`**
 - Researches earnings calls for stale/pending tickers (85-day window, `--stale-only`)
+- **SEC-first earnings source (Oct 24, 2026):** `research_earnings()` now
+  asks novamcp's `get_sec_earnings_release` for the company's own
+  earnings release *before* any web search. US filers: the newest 8-K
+  with Item 2.02 and its EX-99.1 exhibit (`340f291`). Foreign private
+  issuers (VALE, RIO, NVO, AEM, ...): the 6-K scan (`5a8ed17`).
+  - Freshness thresholds: `SEC_FRESH_DAYS=135` (8-K) and
+    `SEC_FRESH_DAYS_6K=200` (6-K). Inside the threshold the SEC release
+    is used and web search is skipped; outside it, the SEC release is
+    kept as one candidate alongside web results (an old SEC candidate
+    survives a web failure).
+  - The filing's own date is authoritative for `call_date` (shown to the
+    model as "VERIFIED from SEC filing metadata").
+  - `source` is now `sec_8k` / `sec_6k` / `web_search`. A release has no
+    Q&A and no management tone, and `weekly_research.py`'s
+    `_build_nova_preamble` says so: it labels such records as company
+    press releases and tells Jupiter not to cite analyst pushback.
+  - Recast/supplement filings (restated comparatives, historical
+    reclassifications) are rejected with specific reasons logged;
+    exhibit discovery goes through each filing's `index.json` by size.
+  - 6-K details: cover-page boilerplate is stripped (`_strip_6k_cover`);
+    filings are scanned in name-hint order, capped at 60 filings / 100 s;
+    documents over 1.2 MB are skipped; a "strong" results headline is
+    required. The earlier weak fallback (it returned BHP's cover page)
+    was removed, so **BHP stays on web search**.
+  - `call_tool` forces `r.encoding = "utf-8"` (requests guessed Latin-1
+    for the SSE stream and produced mojibake).
+  - Staleness (`earnings_is_current`) is keyed on `call_date`, not
+    `research_date`, so a record saved on Oct 24 does not block a refresh
+    when the company reports again after 85 days. Gap: a company that
+    reports again *within* 85 days of its last call is skipped until the
+    window passes (lowering `STALE_DAYS` to ~75 would close it; not done).
 - **Search backend (Aug 2026):** now routes through SearXNG (was silently
   calling DuckDuckGo directly — see `novamcp` env var fix above). A paid
   Brave Search API key (`braveapi` engine) was added mid-August for
@@ -1159,9 +1252,109 @@ Jupiter call.
 - Prints fragment sizes and missing fragment warnings
 - Usage: `bash rebuild_dashboard.sh`
 
+**Diagnostics and preflight scripts (Oct 2026)** — all read-only except the preflight's restart:
+- **`diag_xbrl.py TICKER [...] [+Concept ...] [--scan]`** — newest 10-Q/10-K
+  filings SEC lists, then the newest facts for each EPS / net-income /
+  revenue concept the extractor uses. `--scan` lists every us-gaap concept
+  with "Revenue" in its name (newest period first) — how NEE's real total
+  tag was found. `+Name` adds a concept. Talks only to sec.gov.
+- **`diag_6k.py TICKER SINCE_DATE [LIMIT | EXACT_DATE]`** — shows what the
+  6-K earnings scan sees for a foreign filer (used for VALE/RIO/NVO/AEM/BHP).
+- **`diag_etf_shares.py [TICKER ...]`** — probes Yahoo's share-count history
+  and `.info` fields plus the SPDR/iShares pages. Result 10/26: Yahoo
+  `get_shares_full` returns nothing; `totalAssets` and `navPrice` are
+  fresh; issuer pages are not parseable (the SPDR "csv" is a PDF).
+- **`searxng_preflight.py [--check]`** — probes SearXNG with two queries,
+  restarts the `searxng` container (up to twice) if both come back empty,
+  prints blocked/answering engines. Exit 0 = healthy. Chain with `&&`
+  before a run. Not yet in any launcher.
+
 ---
 
 ### MCP Server Details
+
+**October 2026 changes, by server** (details of the Sept 22 work follow below):
+
+**`mcp/app.py` (webmcp) — Oct 24 and Oct 26, 2026:**
+- **EPS tag discovery + lag attribution (`176253c`)** — EPD's per-unit EPS
+  sits under a tag the fixed list lacked (the table was frozen at 2011);
+  besides the fixed list, any us-gaap per-share/per-unit concept the
+  filer uses is considered, and wins only with strictly newer quarterly
+  data. A stale table now says *why*: "SEC's XBRL API hasn't published
+  this filer's newest 10-Q" (NEE, C, XEL: 10-Qs on file at SEC but absent
+  from `companyfacts`) vs "tag not covered".
+- **XOM legacy-CIK fallback (`c8a0543`)** — a ticker can list several
+  registrants (XOM → a holding-company CIK with no 10-Ks); the first one
+  with US-GAAP facts / an annual report is used.
+- **Revenue tag choice is per period (Oct 26, `1b6f096`)** — priority
+  `Revenues` → `RegulatedAndUnregulatedOperatingRevenue` →
+  `RevenueFromContractWithCustomerExcludingAssessedTax` → `SalesRevenueNet`
+  → `…IncludingAssessedTax` → `ElectricUtilityRevenue`; for each period
+  the first tag that has it wins. Reason: the ASC 606 tag excludes
+  derivative/hedge results (VST: $14.76B vs total $17.22B for 2024), and
+  neither "max" nor "newest tag" is right — VST's total is *below* the
+  contract tag in Q2 2026 ($4.02B vs $4.40B). NEE files its consolidated
+  total under `RegulatedAndUnregulatedOperatingRevenue` ($27.41B FY25)
+  while `…IncludingAssessedTax` holds a rounded contract-only slice.
+  (The helper is still named `_merge_max` — legacy name.)
+- **Q4 derivation works for any fiscal year (Oct 26)** — for each 10-K
+  period end E, the three quarters ending 45-300 days earlier are Q1-Q3
+  and Q4 = FY − Q1-Q3. Previously calendar-only, so ADSK (Jan), WMT, MU,
+  FDX never got a Q4 row. Verified live: ADSK, MSFT (June), AAPL (Sept).
+- **Scope-change warnings under the SEC table (Oct 26)** — revenue ratio
+  between consecutive quarters below 0.6 or above 1.7 → "SCOPE CHANGE?
+  quarters are NOT like-for-like" (HON spin-off: $9.72B → $4.99B);
+  net income above 45% of revenue and over twice the median margin →
+  one-time-gain warning; a derived Q4 that is >1.45× the Q1-Q3 average
+  or negative against positive quarters is marked "⚠ unreliable".
+- **Yahoo `get_earnings` notes** — "Actual" EPS is normally adjusted
+  (non-GAAP) and will differ from the SEC GAAP figure; revenue growth
+  ≤ −40% or ≥ +60% gets a spin-off/acquisition caution.
+- **`get_institutional` (REYN)** — insider + institutional above 100%
+  prints an overlap warning (they are not additive; controlled company);
+  free float comes from `floatShares / sharesOutstanding` (REYN 25.6%).
+
+**`mcp/app2.py` (macromcp) — Oct 20 (`c8a0543`):** headline CPI, Michigan
+1-year expectations, WTI and Brent levels now reach `macro_backdrop.yaml`
+(they were in the summary but never in the YAML Jupiter ingests). The
+backdrop is generated by code, so `atlas_yaml_validator.py` skips its
+truncation heuristic when the file says `Source: macromcp`.
+
+**`mcp/app3.py` (novamcp):** new `get_sec_earnings_release(ticker,
+max_chars=40000)` — see `nova_earnings_call.py` above. Oct 20: URL
+candidates need a real hostname (Google redirect fragments `/url?q=`
+were once "picked" as IBM's press release); a blocked domain stays
+blocked except for the company's own site.
+
+**`mcp/app4.py` (mercurymcp) — Oct 17 to Oct 26, 2026:**
+- Crude-inventory call: longer timeout, one retry, exception type in the
+  message (httpx timeouts stringify to ""), FRED `WCESTUS1` fallback
+  (`4c66ec3`); Brent-WTI spread check.
+- Oil summary shows spot (EIA/FRED) and front-month futures (Yahoo),
+  labeled; futures can sit far from spot in a tight market (`176253c`).
+- **New tool `get_gold_drivers` (Oct 26)** — 10Y TIPS real yield
+  (DFII10), 10Y breakeven (T10YIE), Fed broad dollar (DTWEXBGS), gold
+  price / 4-week move / drawdown from 52-week high / vs 200-day average,
+  60-session correlation of gold with real-yield changes (says so when
+  gold moves *with* real yields), CFTC speculative net position as a
+  percentile of the last 156 weeks, GLD/IAU flows. Explicitly lists
+  central-bank buying as not covered (no configured source), so the gap
+  scan reports it every week. Live-verified 10/26.
+- **New tool `get_etf_flows` (Oct 26)** — default IBIT, FBTC, BITQ, GLD,
+  IAU. Yahoo has no usable share-count history for ETFs
+  (`get_shares_full` returned 0 rows for all five) and its
+  `sharesOutstanding` is stale for GLD/IAU (260M vs ~385M implied), so
+  flow = change in *implied shares* (`totalAssets / navPrice`) × NAV,
+  measured against a snapshot at least 5 days old. Every call appends a
+  snapshot to `etf_share_snapshots.json` (one per day, last 26 kept).
+  The first run only records a baseline ("flow unverified"); unchanged
+  asset figures are reported as "cannot tell flat from stale".
+  Baselines recorded 10/26; first estimates expected on the next weekly
+  run. Wired into `weekly_mercury.py` (`gold_drivers`, `etf_flows`
+  feeds; prompt tells Mercury to explain gold with them and to call
+  flows unverified when a line says so).
+- **BDI date verification (Oct 26)** — see the BDI section below.
+- Tool count: 18 total (16 + `get_gold_drivers` + `get_etf_flows`).
 
 **`mcp/app.py` (webmcp) — `get_sec_earnings()` fixes (Sept 22, 2026):**
 - **Annual-revenue tag fallback bug fixed (BALL, DUK)** — `get_annual()`
@@ -1398,7 +1591,7 @@ Jupiter call.
   to 0.00 every single time, exactly the self-flagged bug from an Aug
   2026 Mercury report. Fixed to properly convert metric tons to pounds
   (1 mt = 2204.62 lb) before computing the ratio.
-- Tool count: 16 total
+- Tool count: 16 total (18 as of Oct 26, 2026 — see the October block above)
 
 ---
 
@@ -1460,6 +1653,8 @@ obsidian_config.json               Central pipeline configuration
 watchlist.json                     128 tickers across 16 sectors
 mercury_watchlist.json             CCC instruments + 17 ETFs
 neptune_holdings.json              Current portfolio positions (38 positions, incl. V/Visa)
+etf_share_snapshots.json           ETF implied-share snapshots for flow estimates (Oct 2026;
+                                   written by mercurymcp, gitignored via *.json)
 
 fragments/                         Dashboard HTML fragments (all agents write here)
   mercury_dashboard_fragment.html
@@ -1606,7 +1801,19 @@ Baltic Exchange data is commercially paywalled. Pipeline approach:
   (trend) still requires the FRED path to succeed, since SearXNG only
   gives a current snapshot.
 - If SearXNG is down/empty for any tool: `docker restart searxng`,
-  wait ~15s, retest.
+  wait ~15s, retest (or `python3 searxng_preflight.py`).
+- **Date verification (Oct 26, 2026, from Jansky's "verify the BDI
+  snippet date"):** the reading's date is parsed from the snippet
+  (`Oct 24, 2026`, `24 Oct 2026`, ISO, year-less `Oct 24`, or a bare
+  "on Monday" → most recent Monday) with SearXNG's `publishedDate` as
+  fallback, and HTML tags are stripped first. Output shows the age
+  (`2,628  [2026-10-26, 0d old]`). A reading older than 14 days is
+  rejected; if only old ones exist the line says `⚠ STALE ... do NOT treat
+  as current` and `build_mercury_backdrop` leaves `bdi_level` empty.
+  Undated snippets are still accepted with a "date not stated" caveat.
+  The old 2-year year check is replaced by this. (Live check on 10/26
+  found the real reading, 2,628, with only a weekday for a date — the
+  weekday parsing was added for that.)
 
 ---
 
@@ -1749,6 +1956,40 @@ re-verified — treat as historical unless refreshed.
 
 ### Known Issues / Watchlist
 
+**Open as of Oct 26, 2026:**
+- **SEC `companyfacts` lag (NEE, C, XEL, DUK, SRE, AEP)** — newest 10-Qs
+  exist in the filings index but not in SEC's XBRL API, so the table is
+  flagged STALE with the cause named. No tag change can recover them.
+  Idea not yet tried: the `companyconcept` endpoint.
+- **Nova refresh gap** — a company reporting again within 85 days of its
+  saved `call_date` is skipped until the window passes (`STALE_DAYS`).
+- **Nova reruns by name after they report:** MSFT, AMT, SCCO (10/27).
+- **Atlas / Mercury data gaps:** Eurozone M3, Japan M2, UK M4 are
+  ~3 years old (poison cross-country money comparisons); central-bank
+  gold buying has no source; crypto-ETF flows pending (above).
+- **Mercury data-gap self-report** — `pipeline_health.py` greps Mercury's
+  "Data gaps" text for "energy price", "gold", "BDI", "baltic" as CRITICAL.
+  The permanent central-bank-purchases note in `get_gold_drivers` is
+  worded without those words on purpose, so it is listed as a gap
+  without tripping that WARN every week. A genuine gold-price failure
+  still trips it.
+- **XOM Note 7 litigation extraction**, **LOW DOJ role** and **DE federal
+  inquiry** (Nova legal) still unresolved.
+- **Jansky small items:** GILD duplicate section 13, QSR section 13
+  cross-reference, SCCO N/A insider rows, C SEC-vs-Yahoo EPS ($6.99 vs
+  $10.26 — GAAP vs adjusted, now labeled), CMG docket pull before the
+  10/28 print, "$500K approval" prose leakage (superseded-approval fix
+  in `176253c` — not yet confirmed on a live run), a within-sector tier
+  requirement.
+- **SearXNG pool emptying** — mitigated by `searxng_preflight.py`; more
+  engines and quota review pending; the preflight is not yet in a launcher.
+- **Housekeeping:** `macro_backdrop_2026-*.yaml` in `~/stock_dashboard`
+  should be moved once into `reports/`; untracked
+  `macro_briefing_2026-09-26.md` was moved out of the repo folder 10/26.
+- **Not live-verified yet (deployed or tested with mocks only):**
+  BDI weekday/HTML date parsing, ETF flow estimates (baselines only),
+  `weekly_mercury.py` prompt wiring for `gold_drivers`/`etf_flows`.
+
 - **`nova_legal.py` raw-field encoding (Aug 2026, open)** — see
   `nova_legal.py` and `app3.py` notes above. Data-hygiene severity, not
   correctness-critical (doesn't reach Jupiter's context).
@@ -1827,17 +2068,73 @@ re-verified — treat as historical unless refreshed.
 - **DXY/rates cross-source date mismatch** — same report, DXY dated one
   week behind the rates data within the same report. Not yet
   investigated.
-- **Crypto ETF flow data (FBTC/IBIT net daily inflows/outflows)** —
-  deliberately deferred (Aug 2026). `get_etf_data()` now tracks FBTC/IBIT
-  price, AUM, and returns (see app4.py notes above), but not flow data —
-  yfinance doesn't expose it directly. Would need either a dedicated flow
-  data source (Farside Investors / SoSoValue, likely via scraping — no
-  clean API) or an AUM-based approximation requiring the pipeline to
-  persist its own day-over-day AUM history (not currently done).
+- **Crypto ETF flow data (FBTC/IBIT) — partly addressed Oct 26, 2026.**
+  `get_etf_flows` now estimates creations/redemptions from implied
+  shares (`totalAssets / navPrice`) snapshotted each run (see MCP Server
+  Details → app4.py). It is an approximation with a built-in lag: needs a
+  snapshot at least 5 days old, so the first real numbers arrive with the
+  next weekly run, and Yahoo's asset figure may update less often than
+  daily ("cannot tell flat from stale"). No dedicated flow source
+  (Farside / SoSoValue) is wired in. Jansky rated this gap HIGH for BITQ
+  (the portfolio's most at-risk CCC exposure).
 - **`mcp_servers`** commented out in `~/.hermes/config.yaml` on Jetson to
   prevent gateway startup warnings
 
 ---
+
+### Resolved Issues (October 2026)
+
+Commits: `4c66ec3` (Oct 17), `c8a0543` (Oct 20), `ffa16e9`, `176253c`,
+`340f291`, `5a8ed17` (Oct 24), `1b6f096` (Oct 26). Items marked (live)
+were confirmed against real output; the rest were tested with mocks.
+
+- ✅ **Nova earnings records came from search snippets** — now SEC 8-K
+  Item 2.02 / 6-K releases first (see `nova_earnings_call.py`). (live:
+  SO, BHP stays web, VALE/RIO/NVO/AEM resolve)
+- ✅ **6-K scan returned a cover page / missed VALE's release** — cover
+  strip, name-hint ordering, 60-filing cap, 1.2 MB skip, weak fallback
+  removed. (live)
+- ✅ **Mojibake in Nova SSE text** — `r.encoding = "utf-8"`. (live)
+- ✅ **Recast/supplement filings treated as the quarter's release** —
+  rejected with accurate reasons.
+- ✅ **EPD SEC table frozen at 2011** — EPS concept discovery (`176253c`).
+- ✅ **XOM resolved to a holding-company CIK** — multi-registrant
+  fallback (`c8a0543`, app.py and app3.py).
+- ✅ **Stale SEC table with no explanation** — lag attribution via the
+  filings index (NEE, C).
+- ✅ **Jupiter/Mercury calls failing with `--reasoning`** — removed
+  (the current Jupiter model, deepseek-v4.1-flash via OpenRouter,
+  rejects it with `invalid_params` and returns nothing). A 61-char
+  "summary" used to print a green check and the run carried on for 128
+  tickers; now anything under 800 chars is a failure and the run stops
+  after 3 in a row (`ffa16e9`). Atlas YAML is also written dated into
+  `reports/`.
+- ✅ **Mercury "Crude inventory error:" (empty message)** — httpx timeout
+  stringified to ""; longer timeout, retry, FRED fallback (`4c66ec3`).
+- ✅ **Spot vs futures oil read as a broken feed** — both shown, labeled.
+- ✅ **Atlas YAML missing CPI / Michigan expectations / oil** (`c8a0543`).
+- ✅ **Jansky stale-flag detector false positives** — "no longer" no
+  longer matches; "not current" is matched as a phrase (`176253c`).
+- ✅ **Superseded approvals leaking into Jupiter prose** — `superseded`
+  approvals are not injected (fix shipped; live confirmation pending).
+- ✅ **REYN ownership showed 106%** (insider 74.1% + institutional 32.1%)
+  — overlap warning and real free float 25.6%. (live)
+- ✅ **VST revenue understated** — ASC 606 tag excludes hedging results;
+  total `Revenues` now preferred per period; 2022/2021 annual revenue also
+  corrected ($13.73B / $12.08B, were $15.63B / $17.70B). (live)
+- ✅ **NEE revenue showed rounded contract-only figures** ($25.80B vs real
+  $27.41B for 2025) — a pre-existing bug, not caused by the VST change;
+  utility total tag ranked above the contract slice. (live: NEE, XEL, DUK)
+- ✅ **Missing Q4 rows for non-calendar fiscal years (ADSK, MSFT, ...)**
+  — fiscal-year-aware derivation. (live)
+- ✅ **HON spin-off read as real growth** — scope-change, one-time-gain and
+  unreliable-Q4 flags; Yahoo extreme-growth caution. (live)
+- ✅ **Mercury had gold's price but not its drivers** — `get_gold_drivers`
+  (live).
+- ✅ **BDI reading with no verifiable date** — date parsing and 14-day
+  age limit; stale reading kept out of the backdrop YAML.
+- ✅ **`diag_xbrl.py` could only show a fixed concept list** — `--scan`,
+  `+Concept`.
 
 ### Resolved Issues (September 2026)
 
