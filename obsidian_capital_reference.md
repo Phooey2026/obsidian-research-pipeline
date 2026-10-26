@@ -99,7 +99,9 @@ Reasoning-effort history below describes V4 Flash 0731 and the time up to
 Sept 2026 — see the Oct 24 note at the end of that section for what
 changed. Re-check the self-narration/rewrite behavior and JSON salvage
 rate on the new models before assuming the old findings still apply; the
-salvage layer stays in place regardless.
+salvage layer stays in place regardless. (Jay, Oct 26: GLM 5.3 Flash and
+DeepSeek V4.1 Flash have both been in use for at least the last two
+weekly runs; Mercury and Atlas ran fine on GLM with `--reasoning high`.)
 
 **Model history (through Sept 2026):** Owl Alpha (used through mid-2026) disappeared from
 OpenRouter during a ~6-week gap in pipeline operation. DeepSeek V4 Flash
@@ -193,9 +195,12 @@ paragraph above is historical: there is now no `--reasoning` flag on any
 Jupiter or Mercury subprocess call. Failed calls are now caught: a
 summary under 800 characters (or "Summary unavailable") prints a failure
 and the run stops after 3 in a row, instead of printing a green check for
-a 61-character reply and continuing through 128 tickers. Whether the
-`high`/`xhigh`-only finding applies to GLM 5.3 Flash (Mercury, Nova, Atlas,
-Jansky) has not been checked.
+a 61-character reply and continuing through 128 tickers. Thinking is
+now set to **high inside Hermes Agent itself** (per profile), so the
+per-call flag is not needed; this replaces the old note below that
+`agent.reasoning_effort` set via `hermes config set` is not reliably read
+(that finding was for the earlier Hermes/model combination). Mercury and
+Atlas ran cleanly on GLM 5.3 Flash with the flag before it was removed.
 
 **Other agent-level config keys like `max_tokens` and
 `agent.reasoning_effort` are NOT reliably read** when set via `hermes
@@ -389,8 +394,8 @@ python3 settle_portfolio.py
 # 0. Pre-flight health check (optional but recommended)
 python3 pipeline_health.py
 #    SearXNG preflight (Oct 2026): scraped engines get CAPTCHA'd/rate-limited and the
-#    pool can empty out until the container restarts. Not yet wired into a launcher.
-python3 searxng_preflight.py
+#    pool can empty out until the container restarts. Runs are manual, so run it first.
+python3 searxng_preflight.py     # runs are launched by hand, so this is just step 0 of the manual sequence
 
 # 1. Macro research (Atlas + FRED + Fed Communications)
 python3 weekly_macro.py
@@ -1266,8 +1271,8 @@ Jupiter call.
   fresh; issuer pages are not parseable (the SPDR "csv" is a PDF).
 - **`searxng_preflight.py [--check]`** — probes SearXNG with two queries,
   restarts the `searxng` container (up to twice) if both come back empty,
-  prints blocked/answering engines. Exit 0 = healthy. Chain with `&&`
-  before a run. Not yet in any launcher.
+  prints blocked/answering engines. Exit 0 = healthy. Run it by hand at
+  the start of the weekly sequence (or chain with `&&`).
 
 ---
 
@@ -1963,7 +1968,8 @@ re-verified — treat as historical unless refreshed.
   Idea not yet tried: the `companyconcept` endpoint.
 - **Nova refresh gap** — a company reporting again within 85 days of its
   saved `call_date` is skipped until the window passes (`STALE_DAYS`).
-- **Nova reruns by name after they report:** MSFT, AMT, SCCO (10/27).
+- **Nova reruns by name after they report:** MSFT, AMT, SCCO (10/27);
+  Jay plans a Nova earnings run next week.
 - **Atlas / Mercury data gaps:** Eurozone M3, Japan M2, UK M4 are
   ~3 years old (poison cross-country money comparisons); central-bank
   gold buying has no source; crypto-ETF flows pending (above).
@@ -1982,7 +1988,8 @@ re-verified — treat as historical unless refreshed.
   in `176253c` — not yet confirmed on a live run), a within-sector tier
   requirement.
 - **SearXNG pool emptying** — mitigated by `searxng_preflight.py`; more
-  engines and quota review pending; the preflight is not yet in a launcher.
+  engines and quota review pending; the weekly runs are manual, so the
+  preflight is a step to run by hand at the start.
 - **Housekeeping:** `macro_backdrop_2026-*.yaml` in `~/stock_dashboard`
   should be moved once into `reports/`; untracked
   `macro_briefing_2026-09-26.md` was moved out of the repo folder 10/26.
