@@ -2,7 +2,9 @@
 """
 diag_xbrl.py — why does get_sec_earnings show stale quarters for a ticker?
 
-Usage:  python3 diag_xbrl.py NEE [EPD ...]
+Usage:  python3 diag_xbrl.py NEE [EPD ...] [+ConceptName ...] [--scan]
+        +Name  also show that us-gaap concept;  --scan lists every us-gaap concept
+        whose name contains "Revenue" with its newest period and value
 
 For each ticker it prints:
   1. the newest 10-Q / 10-K filings SEC lists for the company (period + filed date)
@@ -39,7 +41,7 @@ def days(a, b):
         return None
 
 
-def main(tickers):
+def main(tickers, extra=(), scan=False):
     tk = get("https://www.sec.gov/files/company_tickers.json")
     for t in tickers:
         t = t.upper()
@@ -64,7 +66,19 @@ def main(tickers):
                 print(f"  lookup problem: {type(e).__name__}: {e}")
                 continue
             print("\n  concepts (newest facts first; Q = 75-110 day duration, A = 350-380):")
-            for c in CONCEPTS:
+            if scan:
+                print("\n  every us-gaap concept with 'Revenue' in its name (newest period first):")
+                rows_ = []
+                for c, v in gaap.items():
+                    if "Revenue" not in c:
+                        continue
+                    its = [x for u in v.get("units", {}).values() for x in u]
+                    if its:
+                        n = max(its, key=lambda x: (x.get("end", ""), x.get("filed", "")))
+                        rows_.append((n.get("end", ""), c, len(its), n.get("val"), days(n.get("start", ""), n.get("end", ""))))
+                for r in sorted(rows_, reverse=True)[:25]:
+                    print(f"   {r[0]}  {r[1]}  ({r[2]} facts)  newest val={r[3]}  [{r[4]}d]")
+            for c in list(CONCEPTS) + list(extra):
                 units = gaap.get(c, {}).get("units", {})
                 items = [x for u in units.values() for x in u]
                 if not items:
@@ -82,4 +96,6 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
-    main(sys.argv[1:])
+    _a = sys.argv[1:]
+    main([a for a in _a if not a.startswith(("+", "--"))],
+         [a[1:] for a in _a if a.startswith("+")], "--scan" in _a)

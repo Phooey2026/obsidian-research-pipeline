@@ -735,7 +735,22 @@ def get_institutional(ticker: str, top_n: int = 15) -> str:
         else:
             lines.append(f"  Institutional:  {inst_pct*100:.1f}%" if inst_pct else "  Institutional:  N/A")
         lines.append(f"  Insider:        {insider_pct*100:.1f}%" if insider_pct else "  Insider:        N/A")
-        if inst_ok:
+        # Oct 26 2026 (REYN): insider 74.1% + institutional 32.1% = 106%. Yahoo's
+        # institutional % counts shares from holders who are themselves insiders/
+        # parents (REYN's controlling shareholder files a 13F), so the two overlap
+        # and must not be added. Use floatShares/sharesOutstanding for the real float.
+        _fl, _so = info.get('floatShares'), info.get('sharesOutstanding')
+        free_float = (_fl / _so) if (_fl and _so and _so > 0 and _fl <= _so * 1.001) else None
+        if inst_ok and insider_pct and inst_pct + insider_pct > 1.0:
+            lines.append(
+                f"  ⚠ Insider ({insider_pct*100:.1f}%) + institutional ({inst_pct*100:.1f}%) = "
+                f"{(inst_pct+insider_pct)*100:.0f}% — the two overlap (controlling holder also "
+                f"files as an institution) and are NOT additive. This is a controlled company; "
+                f"treat the insider stake as the real concentration figure.")
+        if free_float is not None:
+            lines.append(f"  Free float:     {free_float*100:.1f}% of shares outstanding "
+                         f"(floatShares/sharesOutstanding)")
+        elif inst_ok and not (insider_pct and inst_pct + insider_pct > 1.0):
             lines.append(f"  Float:          {max(0.0, (1 - inst_pct - (insider_pct or 0))*100):.1f}% public")
 
         # Top institutional holders
@@ -913,6 +928,8 @@ def get_earnings(ticker: str) -> str:
                 lines.append("\nQuarterly EPS (last 8 quarters):")
                 lines.append(f"  {'Quarter':<12} {'Actual':>8} {'Estimate':>10} {'Surprise':>10} {'Beat?':>6}")
                 lines.append("  " + "-" * 50)
+                lines.append("  (Yahoo 'Actual' is normally the company's ADJUSTED/non-GAAP EPS — it will "
+                             "differ from the GAAP diluted EPS in the SEC EDGAR table; neither is wrong.)")
                 def _clean(v):
                     return None if (v is None or (isinstance(v, float) and v != v)) else v
                 for idx, row in hist.iterrows():
@@ -987,6 +1004,11 @@ def get_earnings(ticker: str) -> str:
 
         lines.append(f"  Revenue Growth:   {_pct_str(info.get('revenueGrowth'), 2.0, 'latest quarter vs same quarter last year')}")
         lines.append(f"  Earnings Growth:  {_pct_str(info.get('earningsGrowth'), 2.0, 'latest quarter vs same quarter last year')}")
+        _rg = info.get('revenueGrowth')
+        if isinstance(_rg, (int, float)) and _rg == _rg and (_rg <= -0.4 or _rg >= 0.6):
+            lines.append("  ⚠ Revenue growth this large usually means a spin-off, divestiture or acquisition "
+                         "changed the company's scope, not organic change — confirm against the company's "
+                         "continuing-operations figures before using it.")
         lines.append(f"  Profit Margin:    {_pct_str(info.get('profitMargins'), None, 'net income / revenue, TTM')}")
         lines.append(f"  P/E (TTM):        {info.get('trailingPE', 'N/A')}")
         lines.append(f"  P/E (Forward):    {info.get('forwardPE', 'N/A')}")
@@ -1165,6 +1187,30 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
                     best = a
             return best
 
+        # Oct 26 2026: a filer can report TOTAL revenue under 'Revenues' and a
+        # narrower slice under the ASC 606 tag (VST: contract revenue excludes
+        # derivative/hedge results). The slice can be larger OR smaller than the
+        # total (VST Q1'26 total 5.64B > 5.00B, Q2'26 total 4.02B < 4.40B), so a
+        # max-merge is wrong. Choose per PERIOD: 'Revenues' (undimensioned total)
+        # wins when it exists for that period, else fall through the other tags.
+        # NEE (Oct 26): files its consolidated total under
+        # RegulatedAndUnregulatedOperatingRevenue ($27.41B FY25) while the
+        # IncludingAssessedTax tag holds a rounded contract-only slice ($6.1B
+        # for a quarter whose total is $6.70B), so the utility total ranks high.
+        REV_TAGS = ['Revenues',
+                    'RegulatedAndUnregulatedOperatingRevenue',
+                    'RevenueFromContractWithCustomerExcludingAssessedTax',
+                    'SalesRevenueNet',
+                    'RevenueFromContractWithCustomerIncludingAssessedTax',
+                    'ElectricUtilityRevenue']
+
+        def _merge_max(series_list):   # name kept; series_list is in priority order
+            best = {}
+            for ser in series_list:
+                for x in ser:
+                    best.setdefault(x['end'], x)
+            return sorted(best.values(), key=lambda x: x['end'], reverse=True)
+
         quarters = min(quarters, 12)
         lines = [f"=== {company_name} ({ticker_upper}) — SEC EDGAR ===\n"]
 
@@ -1195,12 +1241,7 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
 
         # Step 6: Quarterly Revenue — newest-data tag wins. Utility tags added:
         # utilities (XEL etc.) often report under RegulatedAndUnregulatedOperatingRevenue.
-        rev_q = best_quarterly(
-            ['RevenueFromContractWithCustomerExcludingAssessedTax',
-             'Revenues', 'SalesRevenueNet',
-             'RevenueFromContractWithCustomerIncludingAssessedTax',
-             'RegulatedAndUnregulatedOperatingRevenue', 'ElectricUtilityRevenue'],
-            'USD')
+        rev_q = _merge_max([get_quarterly(c, 'USD') for c in REV_TAGS])
 
         # Bank/thrift revenue override (Sept 2026 fix — confirmed on HBAN,
         # MTB, CFG). ASC 606 "contract with customer" revenue explicitly
@@ -1258,12 +1299,7 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
         # are actually present. EPS derivation is an approximation (share
         # count can shift quarter to quarter), so derived rows are marked
         # "(derived)" rather than presented as directly reported.
-        rev_annual_for_q4 = get_annual(
-            ['RevenueFromContractWithCustomerExcludingAssessedTax',
-             'Revenues', 'SalesRevenueNet',
-             'RevenueFromContractWithCustomerIncludingAssessedTax',
-             'RegulatedAndUnregulatedOperatingRevenue', 'ElectricUtilityRevenue'],
-            'USD')
+        rev_annual_for_q4 = _merge_max([get_annual(c, 'USD') for c in REV_TAGS])
         bank_rev_annual = _bank_revenue(quarterly=False)
         if bank_rev_annual:
             bank_ends_a = {r['end'] for r in bank_rev_annual}
@@ -1279,33 +1315,49 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             return a or best_annual(_eps_fixed + _eps_discovered, 'USD/shares')
         eps_annual_for_q4 = _eps_annual_series()
 
-        def _q4_derive(quarterly_items, annual_items, year):
-            q123 = [it['val'] for it in quarterly_items
-                    if it['end'][:4] == year and it['end'][5:7] in ('03', '06', '09')]
-            if len(q123) != 3:
-                return None
-            annual_val = next((a['val'] for a in annual_items if a['end'][:4] == year), None)
-            if annual_val is None:
-                return None
-            return annual_val - sum(q123)
+        # Oct 26 2026: derive Q4 for ANY fiscal-year end, not just Dec 31. The old
+        # code only matched Mar/Jun/Sep quarters of a calendar year, so ADSK (Jan),
+        # WMT (Jan), MU (Aug), FDX (May)... never got a Q4 row. For each 10-K period
+        # end E, the three quarter ends 45-300 days before E are that year's Q1-Q3.
+        def _fy_q4(quarterly_items, annual_items):
+            out = {}
+            for a_ in annual_items:
+                try:
+                    e_dt = datetime.strptime(a_['end'], '%Y-%m-%d')
+                except Exception:
+                    continue
+                qs = {}
+                for it in quarterly_items:
+                    try:
+                        gap = (e_dt - datetime.strptime(it['end'], '%Y-%m-%d')).days
+                    except Exception:
+                        continue
+                    if 45 <= gap <= 300:
+                        qs[it['end']] = it['val']
+                if len(qs) == 3:
+                    out[a_['end']] = (a_['val'] - sum(qs.values()), list(qs.values()), a_['val'])
+            return out
 
-        years_seen = sorted({q['end'][:4] for q in eps_q} | {r['end'][:4] for r in rev_q})
+        d_rev_all = _fy_q4(rev_q, rev_annual_for_q4)
+        d_ni_all  = _fy_q4(ni_q, ni_annual_for_q4)
+        d_eps_all = _fy_q4(eps_q, eps_annual_for_q4)
         derived_q4 = []
-        for year in years_seen:
-            q4_end = f"{year}-12-31"
+        q4_suspect = set()
+        for q4_end in sorted(set(d_rev_all) | set(d_ni_all) | set(d_eps_all)):
             if q4_end in rev_by_date or any(q['end'] == q4_end for q in eps_q):
                 continue  # already have a real, filed Q4 entry — don't overwrite it
-
-            d_rev = _q4_derive(rev_q, rev_annual_for_q4, year)
-            d_ni  = _q4_derive(ni_q, ni_annual_for_q4, year)
-            d_eps = _q4_derive(eps_q, eps_annual_for_q4, year)
-
-            if d_rev is not None:
-                rev_by_date[q4_end] = d_rev
-            if d_ni is not None:
-                ni_by_date[q4_end] = d_ni
-            if d_eps is not None:
-                derived_q4.append({'end': q4_end, 'val': d_eps, 'derived': True})
+            if q4_end in d_rev_all:
+                rev_by_date[q4_end] = d_rev_all[q4_end][0]
+                _v, _q3, _fy = d_rev_all[q4_end]
+                if _q3 and _v > 1.45 * (sum(_q3) / 3):
+                    q4_suspect.add(q4_end)       # Q4 >> avg of Q1-Q3: scope change
+            if q4_end in d_ni_all:
+                ni_by_date[q4_end] = d_ni_all[q4_end][0]
+            if q4_end in d_eps_all:
+                _v, _q3, _fy = d_eps_all[q4_end]
+                derived_q4.append({'end': q4_end, 'val': _v, 'derived': True})
+                if _v < 0 < _fy and all(x > 0 for x in _q3):
+                    q4_suspect.add(q4_end)       # annual positive, Q1-Q3 positive, Q4 negative
 
         eps_q = sorted(eps_q + derived_q4, key=lambda x: x['end'], reverse=True)
 
@@ -1317,6 +1369,7 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
         lines.append("  " + "-" * 50)
 
         displayed = 0
+        _rows = []          # (end, rev, ni) for the scope-change checks below
         for q in eps_q[:quarters]:
             end = q['end']
             eps_val = q['val']
@@ -1329,10 +1382,43 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
                 if ni_val and not math.isnan(float(ni_val)) else "N/A"
             eps_str = f"${eps_val:.2f}" if eps_val is not None else "N/A"
             tag = "  (derived Q4 = FY - Q1-Q3)" if q.get('derived') else ""
+            if q.get('derived') and end in q4_suspect:
+                tag += "  ⚠ unreliable — mixed scope/restated quarters"
+            _rows.append((end, rev_val, ni_val, bool(q.get('derived'))))
 
             lines.append(
                 f"  {end:<13} {rev_str:>10} {ni_str:>11} {eps_str:>12}{tag}")
             displayed += 1
+
+        # Oct 26 2026 (HON): after a spin-off the series mixes perimeters — Q2 revenue
+        # $9.72B (with Aerospace) next to Q3 $4.99B (without) — and Yahoo-style
+        # growth rates computed across it are meaningless. Say so right under the table.
+        try:
+            _rv = [(e, r) for e, r, _n, _d in _rows if r and r > 0]
+            for (e1, r1), (e2, r2) in zip(_rv, _rv[1:]):          # newest first
+                _ratio = r1 / r2
+                if _ratio < 0.6 or _ratio > 1.7:
+                    lines.append(
+                        f"  ⚠ SCOPE CHANGE? revenue moved from ${r2/1e9:.2f}B ({e2}) to "
+                        f"${r1/1e9:.2f}B ({e1}), {(_ratio-1)*100:+.0f}% in one quarter — typical of a "
+                        f"spin-off, divestiture, big acquisition or discontinued-operations "
+                        f"restatement. Quarters in this table are NOT like-for-like: do not compute "
+                        f"growth or margins across it; use the company's own continuing-operations "
+                        f"figures (Nova) instead.")
+                    break
+            _mg = sorted(n / r for e, r, n, d in _rows if r and n and r > 0 and not d)
+            if len(_mg) >= 4:
+                _med = _mg[len(_mg) // 2]
+                for e, r, n, d in _rows:
+                    if r and n and r > 0 and not d and n / r > 0.45 and n / r > 2 * max(_med, 0.02):
+                        lines.append(
+                            f"  ⚠ {e}: net income is {n/r*100:.0f}% of revenue vs a typical "
+                            f"{_med*100:.0f}% — almost certainly a one-time gain (e.g. sale or spin-off "
+                            f"recorded in discontinued operations). Do not treat that quarter's EPS "
+                            f"as earnings power.")
+                        break
+        except Exception:
+            pass
 
         if displayed == 0:
             lines.append("  No quarterly EPS data found in SEC filings.")
@@ -1371,13 +1457,7 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
 
         # Step 9: Annual revenue trend — merged across all known revenue
         # tags (see get_annual() fix note above), not a sequential fallback
-        rev_annual = get_annual(
-            ['RevenueFromContractWithCustomerExcludingAssessedTax',
-             'Revenues',
-             'SalesRevenueNet',
-             'RevenueFromContractWithCustomerIncludingAssessedTax',
-             'RegulatedAndUnregulatedOperatingRevenue', 'ElectricUtilityRevenue'],
-            'USD')
+        rev_annual = _merge_max([get_annual(c, 'USD') for c in REV_TAGS])
         # Bank/thrift override — see the _bank_revenue() note above.
         if bank_rev_annual:
             bank_ends_disp = {r['end'] for r in bank_rev_annual}

@@ -361,6 +361,7 @@ python3 repair_sector_ranking.py --delta-only  # re-run delta + fragment only
 
 # 8. Jansky 21-pass weekly review of all agent outputs
 #    Pass 21 reviews trade pitches, approves/rejects, writes jansky_trade_feedback.json
+python3 settle_portfolio.py --skip-settlement
 python3 jansky_review.py
 python3 settle_portfolio.py --dry-run    # preview first — recommended. 
 python3 settle_portfolio.py              # then for real
