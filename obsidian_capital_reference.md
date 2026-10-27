@@ -1,5 +1,5 @@
 # Obsidian Capital Research Pipeline — Reference Guide
-## As of June 22, 2026 — updated October 26, 2026
+## As of June 22, 2026 — updated October 27, 2026
 
 ---
 
@@ -87,6 +87,7 @@ neptune      deepseek/deepseek-v4.1-flash   neptune
 venus        deepseek/deepseek-v4.1-flash   venus
 orbit        google/gemma-4-26b-a4b-it      orbit
 form_agent   qwen/qwen-image-3-pro          form_agent
+tts_agent    google/gemini-3.1-flash-tts-preview   (none — created with --no-alias; TTS model/key only, see Text-to-Speech Service)
 ```
 (`hermes profile list` truncates the DeepSeek name to `deepseek-v4.1-fla`;
 `-flash` is confirmed for Jupiter (Oct 24 commit comment) and assumed for the
@@ -258,6 +259,8 @@ Scripts read this file at startup; hardcoded values are deprecated.
 Scripts reading obsidian_config.json: `sector_ranking.py`, `weekly_mercury.py`,
 `jansky_review.py`, `pipeline_health.py`, `repair_summaries.py`
 
+`tts_server.py` also reads an optional `"tts"` block (voices, chunking, retention — see Text-to-Speech Service) and writes back only the voice you pick in the dashboard.
+
 **Note:** `nova_earnings_call.py`'s 85-day staleness window is hardcoded
 in-script (`STALE_DAYS`), not read from `obsidian_config.json` — separate
 from `earnings_stale_days` (180) above, which is `pipeline_health.py`'s
@@ -356,6 +359,14 @@ python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Results: {len(d.get
 # Also prints which upstream engines are blocked and which answered.
 python3 searxng_preflight.py            # probe, restart if empty, re-probe
 python3 searxng_preflight.py --check    # probe only, never restart
+
+# Text-to-speech (Oct 27, 2026) — on demand only, never part of the weekly run
+python3 tts_probe.py                         # one short real call (~1 cent): checks model, key, voice, real cost
+python3 tts_probe.py --list-voices           # voices OpenRouter reports for the model
+python3 tts_server.py --show atlas           # print exactly what would be spoken + estimate (no API call)
+python3 tts_server.py --show jansky
+systemctl --user restart tts-server.service  # after editing tts_server.py
+journalctl --user -u tts-server -n 50
 
 # Read-only SEC / ETF diagnostics (talk only to sec.gov / Yahoo / issuer pages)
 python3 diag_xbrl.py NEE                                  # newest filings + EPS/NI/revenue tags
@@ -1680,6 +1691,7 @@ reports/jansky_fragment_*.html     Dated Jansky tab archives
 reports/sectors_delta_fragment_*.html   Dated Sectors+Delta tab archives
 reports/macro_summary_*.md         Dated macro briefing archives
 reports/trade_decisions_*.json     Archived trade decisions (previous weeks)
+reports/audio/                     On-demand TTS audio (atlas_/jansky_YYYYMMDD_<hash>.mp3 + .json) — not part of the weekly run
 ```
 
 ---
@@ -1891,6 +1903,139 @@ precedence regardless.
 
 ---
 
+### Text-to-Speech Service (added Oct 27, 2026)
+
+On-demand spoken audio for two written summaries: **Atlas's Weekly Economic
+Briefing** (OUTLOOK tab) and **Jansky's executive briefing** (JANSKY tab).
+**Not part of the weekly run** — nothing is generated or spent unless the
+Generate/Play button is pressed on the dashboard. Each player bar sits
+directly above the written text and has a progress bar, a native audio
+control, and a ⚙ voice picker.
+
+**Pieces** (all in `stock_dashboard/`):
+```
+tts_server.py          the service — port 8646, tts-server.service (systemd user unit)
+tts_player.js          static front end, served by the port 8090 file server
+tts_probe.py           one-shot check of model / key / voice / real cost
+tts-server.service     copy to ~/.config/systemd/user/
+```
+- `tts_server.py` is a standalone service, **not an MCP server and not a
+  Hermes agent run**. It listens on `0.0.0.0:8646` so the iPad and Mac Mini
+  can use the dashboard over the LAN; there is no login. Its endpoints accept
+  only the report names `atlas` / `jansky` — never free text — so it can't be
+  used to read arbitrary text aloud.
+- `tts_player.js` is loaded by a single `<script src="tts_player.js">` tag
+  added just before `</body>` in `generate_dashboard()` (`weekly_research.py`
+  — the only existing script changed; `jansky_review.py` is untouched). It
+  waits (MutationObserver) for the fragment-built panels, then inserts a bar
+  above `#outlook-prose-body` and `#jansky-exec-body`. Editing the JS needs
+  only a page reload — no dashboard rebuild and no Jansky re-run.
+
+**Model and API key — the Hermes way.** Hermes profile `tts_agent`, created
+with `hermes profile create tts_agent --no-alias --no-skills`, then:
+```bash
+hermes -p tts_agent config set model.default google/gemini-3.1-flash-tts-preview
+hermes -p tts_agent config set model.provider openrouter
+```
+The service reads `model.default` from
+`~/.hermes/profiles/tts_agent/config.yaml` and `OPENROUTER_API_KEY` from the
+profile's `.env`, then `~/.hermes/.env`, then the environment — the same
+precedence as `load_atlas_config()` in `weekly_macro.py`. The profile is never
+run as a chat agent. The profile is re-read on every request, so changing the
+model needs **no service restart**.
+
+**Optional `tts` block in `obsidian_config.json`** (all keys have defaults):
+```json
+"tts": {
+  "profile": "tts_agent",
+  "port": 8646,
+  "voices": {"atlas": "Zephyr", "jansky": "Orus"},
+  "instructions": "",
+  "chunk_chars": 3000,
+  "gap_ms": 350,
+  "keep_days": 90,
+  "pronunciations": {}
+}
+```
+`instructions` is an optional delivery/style prompt for Gemini TTS (empty by
+default). `pronunciations` adds `"written": "spoken"` replacements. The voice
+picked in the ⚙ menu is written back to `tts.voices` — the only thing the
+service ever writes into `obsidian_config.json`. A new `port` needs a restart.
+
+**What gets read.**
+- Atlas ← `macro_summary.md` (the whole briefing; the scorecard cards are not read).
+- Jansky ← `executive_summary` in `jansky_latest.json`, cut down to the
+  **EXECUTIVE BRIEFING** section (from the heading containing "EXECUTIVE
+  BRIEFING" to the next CROSS-PIPELINE / PIPELINE RECOMMENDATIONS / OVERALL
+  POSTURE heading). The full synthesis also holds ACTION/REASON lines and
+  ticker lists that don't read well aloud. If Jansky's synthesis prompt
+  headings are ever changed, update `extract_briefing()` in `tts_server.py`.
+- The server reads these files itself; the browser never sends text.
+- `python3 tts_server.py --show atlas|jansky` prints exactly what would be
+  spoken, plus chunk sizes and an estimate, with no API call.
+
+**Text preparation** (before anything is sent): markdown, dividers and symbols
+stripped; ALL-CAPS headings become sentence case; `[brackets]` removed (Gemini
+treats `[tags]` as delivery cues); `%` → "percent"; `+87bps` → "plus 87 basis
+points" (the plus is kept only before basis points — `+4.02%` is spoken as
+"4.02 percent"); `25bp hike` → "25 basis point hike"; ranges like `4-8` and
+`3.75%–4.00%` → "to"; ISO dates and "as of 10/22" are spoken as dates; `5Y` →
+"5-year"; YoY / MoM / QoQ / WoW expanded. Gemini handles financial lingo and
+tickers well, so the default pronunciation map is deliberately small.
+
+**Generation.** Text is split at paragraph boundaries into chunks of at most
+`chunk_chars` (3000) characters; each chunk is one `POST
+/api/v1/audio/speech` (`response_format: pcm` — Gemini TTS returns PCM only,
+`audio/pcm;rate=24000;channels=1`). Finished chunks are saved under
+`reports/audio/.work/`, joined with `gap_ms` of silence, and encoded to MP3
+with ffmpeg. The progress bar counts finished chunks. A failing chunk is
+retried 3 times; a fatal error (bad key, no credits, bad voice) stops the job.
+**Pressing Retry resumes from the finished chunks, so completed parts are
+never paid for twice.** If the page is closed mid-run the job keeps going.
+
+**Cache and storage.** Audio goes in `reports/audio/` as
+`{atlas|jansky}_YYYYMMDD_<hash>.mp3` with a `.json` sidecar (voice, model,
+duration, generation ids, actual cost). The hash covers model + voice +
+instructions + text, so each week's new text — or a different voice or model —
+produces a new file, while unchanged text replays instantly and free. Files
+older than `keep_days` are pruned when the service starts. `reports/` is
+gitignored. ⚙ → **Regenerate audio** forces a fresh run (cost confirm applies).
+
+**Cost** (measured Oct 27, 2026, Gemini 3.1 Flash TTS Preview on OpenRouter,
+listed at $1 / $20 per million input / output tokens): about 15 characters of
+text per second of audio, about 25 audio tokens per second — a 315-character
+probe made 21 s of audio for $0.0106 and took 10 s to generate. Expect Atlas
+≈ 8 min of audio (≈ 7,100 chars, 3 chunks, a few minutes to generate, ≈ $0.24)
+and Jansky ≈ 2.6 min (≈ 2,300 chars, ≈ $0.08). The first click shows an
+estimate and asks for confirmation; the real cost is read back from
+OpenRouter's generation endpoint a few seconds after completion and shown in
+the bar (and stored in the sidecar). Model pricing units aren't stated
+clearly on OpenRouter's model page, so treat the estimate as approximate.
+
+**Voices.** Defaults: Zephyr (Atlas), Orus (Jansky). ⚙ → **Fetch voices** reads
+`supported_voices` from OpenRouter's models API (30 voices for this model on
+Oct 27, 2026; cached for an hour, refreshed by the button). If OpenRouter ever
+returns no list for a Gemini model, the picker falls back to a built-in list of
+the 30 Gemini voice names.
+
+**API** (CORS open, LAN only): `GET /api/tts/health`,
+`GET /api/tts/status?report=`, `POST /api/tts/generate`,
+`GET /api/tts/voices?report=&refresh=1`, `POST /api/tts/voice`,
+`GET /audio/<name>.mp3` (supports HTTP Range — required for iPad/Safari).
+
+**Troubleshooting.**
+- Bar says **Offline** → `systemctl --user status tts-server`,
+  `journalctl --user -u tts-server -n 50`, `ss -tln | grep 8646`; from another
+  device try `http://<jetson-ip>:8646/api/tts/health`.
+- **Not configured** → check the `tts_agent` model and key
+  (`python3 tts_probe.py` prints both in its first lines).
+- **"macro_summary.md / jansky_latest.json not found"** → the weekly step that
+  writes it hasn't run yet.
+- No bar at all → the dashboard was built without the script tag (e.g. an old
+  `weekly_research.py` was restored): `grep -c tts_player dashboard.html`, then
+  `bash rebuild_dashboard.sh`; hard-refresh the iPad.
+- After editing `tts_server.py` → `systemctl --user restart tts-server.service`.
+
 ### Systemd Services (Jetson)
 
 ```
@@ -1899,6 +2044,7 @@ macromcp.service        port 8643  mcp/app2.py
 novamcp.service         port 8644  mcp/app3.py
 mercurymcp.service      port 8645  mcp/app4.py
 stock-dashboard.service port 8090  python3 -m http.server 8090
+tts-server.service      port 8646  tts_server.py  (not an MCP server — see Text-to-Speech Service)
 ```
 
 Service files location: `~/.config/systemd/user/`

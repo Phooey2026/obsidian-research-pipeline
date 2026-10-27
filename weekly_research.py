@@ -1913,6 +1913,7 @@ if (CHARTS.length > 0) {{
   document.getElementById(`panel-${{CHARTS[0].ticker}}`).classList.add('active');
 }}
 </script>
+<script src="tts_player.js"></script>
 </body>
 </html>"""
 

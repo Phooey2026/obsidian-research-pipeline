@@ -1,0 +1,14 @@
+[Unit]
+Description=Obsidian Capital TTS service (port 8646)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/jay/stock_dashboard
+ExecStart=/usr/bin/python3 /home/jay/stock_dashboard/tts_server.py
+Environment=HOME=/home/jay
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
