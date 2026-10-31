@@ -1199,14 +1199,22 @@ def _etf_share_flow_sync(tickers: list[str], days: int = 28) -> list[str]:
             span = (today - datetime.fromisoformat(base["date"]).date()).days
             d_sh = shares - base["shares"]
             pct = d_sh / base["shares"] * 100 if base["shares"] else 0.0
-            if abs(pct) < 0.005 and abs(ta - base["total_assets"]) < 1:
-                out.append(f"  {tk:<6} Yahoo's asset figure is unchanged since {base['date']} — cannot tell flat flows "
-                           f"from a stale feed; flow unverified")
+            ta_chg = (float(ta) / base["total_assets"] - 1) * 100 if base.get("total_assets") else 0.0
+            nav_chg = (float(nav) / base["nav"] - 1) * 100 if base.get("nav") else 0.0
+            # Oct 31 2026: Yahoo's totalAssets can lag while navPrice is current. Then
+            # implied shares = assets / NAV moves INVERSELY to price with no flow at all
+            # (all five funds showed +2.6% to +6.3% "creations" in lock-step with price).
+            # If the asset figure has not actually changed, the share change is an artifact.
+            if abs(ta_chg) < 0.05:
+                out.append(f"  {tk:<6} Yahoo's asset figure is unchanged since {base['date']} "
+                           f"(NAV {nav_chg:+.2f}% over the same span) — any share change would be a "
+                           f"price artifact, not flow; flow unverified")
                 continue
             usd = d_sh * float(nav)
             direction = "net CREATIONS (inflow)" if d_sh > 0 else ("net REDEMPTIONS (outflow)" if d_sh < 0 else "flat")
             out.append(f"  {tk:<6} implied shares {base['shares']/1e6:,.1f}M [{base['date']}] → {shares/1e6:,.1f}M "
-                       f"[{today}]  {pct:+.2f}% over {span}d  ≈ {'+' if usd >= 0 else '-'}${abs(usd)/1e6:,.0f}M  {direction}")
+                       f"[{today}]  {pct:+.2f}% over {span}d  ≈ {'+' if usd >= 0 else '-'}${abs(usd)/1e6:,.0f}M  {direction}"
+                       f"  (assets {ta_chg:+.2f}%, NAV {nav_chg:+.2f}%)")
         except Exception as e:
             out.append(f"  {tk:<6} flow estimate error — {type(e).__name__}: {str(e)[:80]}")
     try:

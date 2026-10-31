@@ -415,6 +415,12 @@ python3 weekly_macro.py
 #    Also pitches ETF trades → trade_decisions.json["mercury"]
 python3 weekly_mercury.py
 
+# 2b. Earnings refresh (Nova) — runs BEFORE Jupiter (moved Oct 31, 2026)
+#    Jupiter ingests Nova's earnings records, so a week with many reporters
+#    (Oct 28-30) needs them refreshed first. Safe to run early: it works from the
+#    watchlist and SEC filings, not from anything Jupiter emits.
+python3 nova_earnings_call.py
+
 # 3. Stock research — 128 tickers (Jupiter + all MCP tools)
 #    Automatically runs sector_ranking.py as Pass 2
 #      sector_ranking.py: rankings + Jupiter trade pitches → trade_decisions.json["jupiter"]
@@ -429,8 +435,8 @@ python3 repair_summaries.py --refetch CVS TGT AMZN
 # 5. Legal research for flagged companies (Nova)
 python3 nova_legal.py 
 
-# 6. Earnings call research refresh (Nova)
-python3 nova_earnings_call.py --stale-only
+# 6. (Earnings refresh moved ahead of Jupiter — see 2b. Use --stale-only here
+#    only for an extra pass.)
 
 # 7. Sector ranking repair (if sector_ranking.py failed mid-run)
 python3 repair_sector_ranking.py             # auto-detect failed sectors
@@ -461,8 +467,9 @@ below). Skipping this doesn't break anything immediately, but the
 removed ticker's stale data will keep tripping Jansky's staleness
 pre-checks indefinitely.
 
-**Note on step order:** legal (5) and earnings (6) run AFTER Jupiter
-(step 3) intentionally — `nova_legal.py`'s flagging depends on
+**Note on step order (updated Oct 31, 2026):** earnings moved BEFORE Jupiter
+(step 2b) — `nova_earnings_call.py` does not depend on Jupiter's output. Legal
+(5) still runs AFTER Jupiter (step 3) intentionally — `nova_legal.py`'s flagging depends on
 `NOVA_FLAG_DATA` that Jupiter emits when synthesizing each ticker's
 summary. Running Nova before Jupiter in the same cycle would mean no
 fresh flags exist yet for that week, forcing Nova to act on last week's
@@ -954,8 +961,11 @@ Jupiter call.
     exhibit discovery goes through each filing's `index.json` by size.
   - 6-K details: cover-page boilerplate is stripped (`_strip_6k_cover`);
     filings are scanned in name-hint order, capped at 60 filings / 100 s;
-    documents over 1.2 MB are skipped; a "strong" results headline is
-    required. The earlier weak fallback (it returned BHP's cover page)
+    non-HTML files over 1.2 MB and HTML over 9 MB are skipped, but a
+    large HTML document is read (Oct 31: AEM's Q3 report is 3.35 MB, RIO's
+    H1 report `rio-20260630_d2.htm` 3.07 MB with no results hint in its
+    name; only XBRL `R*.htm` pages and indexes are excluded); a "strong"
+    results headline is required. The earlier weak fallback (it returned BHP's cover page)
     was removed, so **BHP stays on web search**.
   - `call_tool` forces `r.encoding = "utf-8"` (requests guessed Latin-1
     for the SSE stream and produced mojibake).
@@ -1365,6 +1375,12 @@ blocked except for the company's own site.
   snapshot to `etf_share_snapshots.json` (one per day, last 26 kept).
   The first run only records a baseline ("flow unverified"); unchanged
   asset figures are reported as "cannot tell flat from stale".
+  **Oct 31 finding:** Yahoo's `totalAssets` lags NAV by days. With stale
+  assets and a falling NAV, implied shares rise inversely to price, so
+  all five funds showed false "creations" of +2.6% to +6.3%. The tool now
+  prints the assets and NAV change beside each estimate and reports "flow
+  unverified" when assets moved under 0.05%. Real flow data needs issuer
+  share counts (SPDR for GLD, iShares for IAU/IBIT) — not yet wired in.
   Baselines recorded 10/26; first estimates expected on the next weekly
   run. Wired into `weekly_mercury.py` (`gold_drivers`, `etf_flows`
   feeds; prompt tells Mercury to explain gold with them and to call
@@ -2112,8 +2128,6 @@ re-verified — treat as historical unless refreshed.
   exist in the filings index but not in SEC's XBRL API, so the table is
   flagged STALE with the cause named. No tag change can recover them.
   Idea not yet tried: the `companyconcept` endpoint.
-- **Nova refresh gap** — a company reporting again within 85 days of its
-  saved `call_date` is skipped until the window passes (`STALE_DAYS`).
 - **Nova reruns by name after they report:** MSFT, AMT, SCCO (10/27);
   Jay plans a Nova earnings run next week.
 - **Atlas / Mercury data gaps:** Eurozone M3, Japan M2, UK M4 are
@@ -2247,6 +2261,12 @@ were confirmed against real output; the rest were tested with mocks.
 - ✅ **6-K scan returned a cover page / missed VALE's release** — cover
   strip, name-hint ordering, 60-filing cap, 1.2 MB skip, weak fallback
   removed. (live)
+- ✅ **6-K path skipped large results documents** — AEM (3.35 MB) and RIO
+  (3.07 MB) fell to unreliable web search; NVO's H1 report likewise.
+  Large HTML is now read. (live: AEM, RIO, NVO all resolve via SEC,
+  Oct 31)
+- ✅ **ETF flow proxy produced false inflows** — see the Oct 31 finding
+  under `get_etf_flows`; stale-assets guard added. (live)
 - ✅ **Mojibake in Nova SSE text** — `r.encoding = "utf-8"`. (live)
 - ✅ **Recast/supplement filings treated as the quarter's release** —
   rejected with accurate reasons.
@@ -2286,6 +2306,20 @@ were confirmed against real output; the rest were tested with mocks.
   (live).
 - ✅ **BDI reading with no verifiable date** — date parsing and 14-day
   age limit; stale reading kept out of the backdrop YAML.
+- ✅ **Nova skipped tickers that had just reported (Oct 31)** — the 85-day
+  window and the 30-day no-data cooldown were checked BEFORE the SEC lookup,
+  so a company that reported this week stayed skipped if its saved record
+  was <85 days old or in cooldown (37 tickers were in cooldown on Oct 31).
+  `main()` now probes SEC (`probe_sec_release`, header-only) for every
+  skipped ticker and promotes any whose newest release is more than 3 days
+  newer than the saved `call_date`. Skipped-cooldown tickers are listed by
+  name. This also closes the "reports again within 85 days" gap, so
+  `STALE_DAYS` can stay at 85. (mock-tested; first live run pending)
+- ✅ **Nova re-synthesized identical releases (Oct 31)** — AMD, PFE, SO,
+  CI, AAPL, ... (88-93 days old, company not yet reported) were rewritten
+  each run. `research_earnings` now returns `unchanged` when the SEC release
+  date equals the saved `call_date` and the saved source is `sec_*`; the
+  summary line shows `= Unchanged`. `--force` / named tickers still rewrite.
 - ✅ **`diag_xbrl.py` could only show a fixed concept list** — `--scan`,
   `+Concept`.
 

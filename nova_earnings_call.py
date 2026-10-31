@@ -214,6 +214,44 @@ def earnings_is_current(nova_data: dict, ticker: str) -> bool:
     return days_since(cd) <= STALE_DAYS
 
 
+def probe_sec_release(ticker: str):
+    """Cheap check of the newest SEC earnings release: (release_date, form) or None.
+
+    Oct 31 2026: the skip logic (85-day window + 30-day no-data cooldown) ran BEFORE the
+    SEC lookup, so a company that reported this week was still skipped if its saved
+    record was <85 days old or sat in a no-data cooldown (37 tickers on Oct 31). The SEC
+    source is exact and cheap, so skipped tickers are probed first. Only the header is
+    needed, hence the tiny max_chars.
+    """
+    try:
+        raw = call_tool("get_sec_earnings_release", {"ticker": ticker, "max_chars": 1500},
+                        retries=1)
+    except Exception:
+        return None
+    if not raw or not raw.startswith("=== SEC "):
+        return None
+    dm = re.search(r'^RELEASE_DATE:\s*(\d{4}-\d{2}-\d{2})', raw, re.M)
+    fm = re.search(r'^FORM:\s*(\S+)', raw, re.M)
+    return (dm.group(1), fm.group(1) if fm else "8-K") if dm else None
+
+
+def has_newer_sec_release(nova_data: dict, ticker: str):
+    """Return (release_date, form, saved_call_date) if SEC has a release newer than the saved record."""
+    probe = probe_sec_release(ticker)
+    if not probe:
+        return None
+    rel, form = probe
+    saved = nova_data.get(ticker.upper(), {}).get("earnings", {}).get("call_date", "")
+    if not saved:
+        return (rel, form, saved)
+    try:
+        gap = (datetime.date.fromisoformat(rel) - datetime.date.fromisoformat(saved)).days
+    except Exception:
+        return (rel, form, saved)
+    # 3-day margin: a call date and its 8-K filing date can differ by a day or two
+    return (rel, form, saved) if gap > 3 else None
+
+
 # ─── Watchlist loader ──────────────────────────────────────────────────────────
 def load_watchlist() -> list[str]:
     """Load all tickers from watchlist.json. Falls back to scanning data dir."""
@@ -420,7 +458,7 @@ def research_earnings(ticker: str, company_name: str,
                       force: bool = False) -> str:
     """
     Fetch and synthesize earnings call for one ticker.
-    Returns status string: 'ok', 'skipped', 'no_data', 'error'
+    Returns status string: ok, unchanged, no_data, error
     """
     transcript_text  = ""
     call_date        = ""
@@ -460,11 +498,20 @@ def research_earnings(ticker: str, company_name: str,
         sec_meta["age"] = _age
         print(f"✓ ({sec_meta['form']} released {sec_meta['date']}, {_age}d ago)")
     else:
-        _why = (_sec_raw or "empty response").strip().splitlines()[0][:110]
+        _why = (_sec_raw or "empty response").strip().splitlines()[0][:360]
         print(f"– ({_why})")
     _fresh = SEC_FRESH_DAYS_6K if (sec_meta and sec_meta["form"].startswith("6-K")) \
              else SEC_FRESH_DAYS
     sec_direct = bool(sec_meta and sec_meta["age"] <= _fresh)
+    # Oct 31 2026: 8 stale-by-age tickers (AMD, PFE, SO, ...) were re-synthesized to the
+    # identical release because the company simply had not reported yet. Same release
+    # date + SEC source as the saved record = nothing new; keep it (no Nova call).
+    if sec_meta and not force:
+        _prev = load_nova_json().get(ticker.upper(), {}).get("earnings", {})
+        if _prev.get("call_date") == sec_meta["date"] and str(_prev.get("source", "")).startswith("sec_"):
+            print(f"    → unchanged: same SEC release ({sec_meta['date']}) as the saved record — "
+                  f"company has not reported since; keeping it")
+            return "unchanged"
     if sec_direct:
         print(f"    → using SEC filing; skipping web search")
     elif sec_meta:
@@ -969,7 +1016,29 @@ def main():
             else:
                 to_research.append(ticker)
 
+    # ── Probe SEC for skipped tickers: a newer release overrides the skip ──
+    if not forced and (skipped_current or skipped_cooldown):
+        print(f"  Checking SEC for new releases among {len(skipped_current) + len(skipped_cooldown)} "
+              f"skipped tickers...")
+        promoted = []
+        for bucket in (skipped_current, skipped_cooldown):
+            for t in list(bucket):
+                try:
+                    hit = has_newer_sec_release(nova_data, t)
+                except Exception:
+                    hit = None
+                if hit:
+                    bucket.remove(t)
+                    to_research.append(t)
+                    promoted.append(t)
+                    print(f"    ↑ {t}: SEC {hit[1]} released {hit[0]} (saved call_date: {hit[2] or 'none'})")
+        if not promoted:
+            print(f"    none — every skipped ticker's saved release is the newest on file")
+        print()
+
     skipped = skipped_current + skipped_cooldown
+    if skipped_cooldown:
+        print(f"  In no-data cooldown (no newer SEC release): {', '.join(skipped_cooldown)}")
     print(f"  To research:  {len(to_research)}")
     print(f"  Skipping:     {len(skipped)} total"
           f" ({len(skipped_current)} current within {STALE_DAYS} days,"
@@ -993,6 +1062,7 @@ def main():
 
     # ── Research loop ──────────────────────────────────────────────────────
     results_ok       = []
+    results_unchanged = []
     results_no_data  = []
     results_error    = []
 
@@ -1009,6 +1079,8 @@ def main():
 
         if status == "ok":
             results_ok.append(ticker)
+        elif status == "unchanged":
+            results_unchanged.append(ticker)
         elif status == "no_data":
             results_no_data.append(ticker)
             # Record that a search was actually conducted today, even
@@ -1047,6 +1119,7 @@ def main():
     print(f"\n{'═'*52}")
     print(f"  Nova Earnings Call Research Complete")
     print(f"  ✓ Updated:   {len(results_ok)}")
+    print(f"  = Unchanged: {len(results_unchanged)}  (same SEC release as saved — company has not reported)")
     print(f"  ⚠ No data:  {len(results_no_data)}  "
           f"({', '.join(results_no_data) if results_no_data else 'none'})")
     print(f"  ✗ Errors:   {len(results_error)}  "

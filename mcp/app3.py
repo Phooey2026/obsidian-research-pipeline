@@ -1382,7 +1382,24 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
                 pass
             if kind == '6-K':
                 # Annual reports / decks run 1-2 MB and take ages to convert.
-                big = {n for n, sz in files if sz > 1_200_000}
+                # Oct 31 2026: AEM's Q3 report (ex99-1.htm, 3.35 MB) and RIO's H1 interim
+                # report (inline-XBRL main document) were skipped as "too large", sending both
+                # to unreliable web search. A big HTML file is allowed (up to 9 MB) when its
+                # name looks like a results document or it is a 99.x exhibit / the main
+                # document; everything else over 1.2 MB (decks, images, zips) stays skipped.
+                def _too_big(n, sz):
+                    if sz <= 1_200_000:
+                        return False
+                    low = n.lower()
+                    if not low.endswith(('.htm', '.html')):
+                        return True
+                    if sz > 9_000_000:
+                        return True
+                    # RIO's H1 report is "rio-20260630_d2.htm" (3.07 MB, labelled Exhibit 99.1
+                    # only inside the text), so the name gives no hint. Any other big HTML
+                    # document is allowed; XBRL viewer pages (R1.htm) and indexes are not.
+                    return bool(re.match(r'r\d+\.htm', low) or 'index' in low)
+                big = {n for n, sz in files if _too_big(n, sz)}
                 if big:
                     skipped.append(f"{pick['filed']} {', '.join(sorted(big))} (too large)")
                 files = [(n, sz) for n, sz in files if n not in big]
