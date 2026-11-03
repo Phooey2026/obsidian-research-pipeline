@@ -757,6 +757,13 @@ TRADE PITCH RULES:
   The portfolio cannot fund every buy pitch without selling something
   first, and there have not been enough reduce candidates proposed to
   do that.
+- CONSISTENCY: every rationale must agree with the findings in your own
+  weekly summary above. If the summary says an asset is DECOUPLED from a
+  driver (for example gold falling while real yields fall), the pitch may
+  not then cite that same driver as the cause without saying so. When you
+  cite a macro driver, say whether you mean its LEVEL or its CHANGE and
+  which direction it is moving. If a flow or demand input is marked
+  unverified, do not use it as support for the trade.
 - If no compelling trade exists, respond with empty trades array
 
 REQUIRED OUTPUT FORMAT — valid JSON only:

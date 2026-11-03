@@ -1156,17 +1156,81 @@ ETF_SNAPSHOT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "etf_share_snapshots.json")
 
 
-def _etf_share_flow_sync(tickers: list[str], days: int = 28) -> list[str]:
-    """Estimate ETF creations/redemptions from the change in implied shares outstanding.
+_SHARES_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+              "Accept": "text/html,*/*"}
+_ISHARES_URLS = {
+    "IAU":  "https://www.ishares.com/us/products/239561/ishares-gold-trust-fund",
+    "IBIT": "https://www.ishares.com/us/products/333011/ishares-bitcoin-trust-etf",
+}
+ETF_FLOW_MIN_AGE_DAYS = 3      # Nov 3 2026: was 5; issuer counts are exact, so a shorter span is safe
+ETF_FLAT_PCT = 0.02            # below this the share change is rounding (stockanalysis shows 4-5 digits)
 
-    Oct 26 2026: Mercury could say "IBIT volume 22.9M shares" but not whether money
-    was flowing in or out. Yahoo has no usable share-count HISTORY for ETFs
-    (get_shares_full returned 0 rows for all five funds) and its sharesOutstanding
-    field is stale for GLD/IAU (260M vs ~385M implied). What it does return fresh is
-    totalAssets and navPrice, so implied shares = totalAssets / navPrice. Each call
-    records that snapshot in etf_share_snapshots.json; flow is the change in implied
-    shares since a snapshot at least 5 days old, x the current NAV. The first run only
-    records a baseline; estimates begin with the next weekly run.
+
+def _http_text(url: str, limit: int = 3_000_000) -> str:
+    import urllib.request
+    with urllib.request.urlopen(urllib.request.Request(url, headers=_SHARES_UA), timeout=25) as r:
+        return r.read(limit).decode("utf-8", "replace")
+
+
+def _parse_ishares_shares(raw: str):
+    """(shares, as-of 'Nov 02, 2026' or '') from an iShares product page, else None."""
+    import html as _html
+    t = _html.unescape(raw)
+    m = re.search(r'"label"\s*:\s*"Shares Outstanding"\s*,\s*"formattedValue"\s*:\s*"([\d,]+)"'
+                  r'(?:.{0,900}?"formattedAsOfDate"\s*:\s*"([A-Za-z]{3} \d{1,2}, \d{4})")?', t, re.S)
+    if m:
+        return int(m.group(1).replace(",", "")), (m.group(2) or "")
+    m = re.search(r"Shares Outstanding\s*(?:<[^>]*>\s*)*([\d,]{6,})", t)
+    return (int(m.group(1).replace(",", "")), "") if m else None
+
+
+def _parse_stockanalysis_shares(raw: str):
+    """Shares from a stockanalysis.com ETF page ('Shares Out 352.40M'), else None."""
+    t = re.sub(r"<[^>]+>", " ", raw)
+    m = re.search(r"Shares Out\s+([\d,\.]+)\s*([KMB])\b", t)
+    if not m:
+        return None
+    return int(float(m.group(1).replace(",", "")) * {"K": 1e3, "M": 1e6, "B": 1e9}[m.group(2)])
+
+
+def _issuer_shares(tk: str):
+    """(shares, source, as_of) from the fund issuer / an aggregator, or None.
+
+    Oct 31 2026: Yahoo's totalAssets lags NAV by days, so assets/NAV 'implied shares'
+    moved inversely to price and produced false creations of +2.6% to +6.3% on all five
+    funds (issuer counts were 7-27% LOWER than the implied figures). Real share counts:
+      IAU, IBIT   iShares product page (exact, with an as-of date)
+      GLD, FBTC, BITQ (and fallback)   stockanalysis.com 'Shares Out' (4-5 digits)
+    """
+    errors = []
+    if tk in _ISHARES_URLS:
+        try:
+            r = _parse_ishares_shares(_http_text(_ISHARES_URLS[tk]))
+            if r and 1e5 < r[0] < 5e10:
+                return r[0], "iShares", r[1]
+            errors.append("iShares: no share count found")
+        except Exception as e:
+            errors.append(f"iShares: {type(e).__name__}")
+    try:
+        n = _parse_stockanalysis_shares(_http_text(f"https://stockanalysis.com/etf/{tk.lower()}/"))
+        if n and 1e5 < n < 5e10:
+            return n, "stockanalysis", ""
+        errors.append("stockanalysis: no share count found")
+    except Exception as e:
+        errors.append(f"stockanalysis: {type(e).__name__}")
+    return None
+
+
+def _etf_share_flow_sync(tickers: list[str], days: int = 28) -> list[str]:
+    """Estimate ETF creations/redemptions from the change in shares outstanding.
+
+    Shares outstanding change only through creations and redemptions, so
+    d(shares) x NAV is the net flow. Share counts come from the issuer (see
+    _issuer_shares); each call snapshots them in etf_share_snapshots.json and the
+    flow is measured against the closest snapshot at least ETF_FLOW_MIN_AGE_DAYS old
+    FROM THE SAME SOURCE (iShares and stockanalysis differ by ~0.1% from timing).
+    Old snapshots without a source tag came from Yahoo's implied-shares method and
+    are ignored. The first run per fund only records a baseline.
     """
     import yfinance as yf
     try:
@@ -1178,43 +1242,57 @@ def _etf_share_flow_sync(tickers: list[str], days: int = 28) -> list[str]:
     out = []
     for tk in tickers:
         try:
-            info = yf.Ticker(tk).info
-            ta, nav = info.get("totalAssets"), info.get("navPrice") or info.get("regularMarketPrice")
-            if not ta or not nav or nav <= 0:
-                out.append(f"  {tk:<6} totalAssets/NAV unavailable from Yahoo — flow cannot be estimated")
+            got = _issuer_shares(tk)
+            if not got:
+                out.append(f"  {tk:<6} issuer share count unavailable (iShares / stockanalysis both failed) "
+                           f"— flow unverified")
                 continue
-            shares = float(ta) / float(nav)
+            shares, source, asof = got
+            try:
+                info = yf.Ticker(tk).info
+                nav = info.get("navPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+            except Exception:
+                nav = None
+            if not nav or float(nav) <= 0:
+                out.append(f"  {tk:<6} price unavailable from Yahoo — cannot value the flow; flow unverified")
+                continue
+            nav = float(nav)
+            note = ""
+            if asof:
+                try:
+                    age = (today - datetime.strptime(asof, "%b %d, %Y").date()).days
+                    if age > 7:
+                        note = f"  ⚠ issuer figure is {age} days old"
+                except Exception:
+                    pass
             hist = [h for h in store.get(tk, []) if h.get("date") != today.isoformat()]
-            cands = [h for h in hist if (today - datetime.fromisoformat(h["date"]).date()).days >= 5]
+            cands = [h for h in hist if h.get("source") == source
+                     and (today - datetime.fromisoformat(h["date"]).date()).days >= ETF_FLOW_MIN_AGE_DAYS]
             base = None
             if cands:
                 tgt = today - timedelta(days=days)
                 base = min(cands, key=lambda h: abs((datetime.fromisoformat(h["date"]).date() - tgt).days))
-            hist.append({"date": today.isoformat(), "shares": shares, "total_assets": float(ta), "nav": float(nav)})
+            hist.append({"date": today.isoformat(), "shares": float(shares), "nav": nav,
+                         "source": source, "asof": asof})
             store[tk] = hist[-26:]
+            label = f"{source}{' as of ' + asof if asof else ''}"
             if base is None:
-                out.append(f"  {tk:<6} implied shares {shares/1e6:,.1f}M recorded as baseline — flow estimates "
-                           f"start once a snapshot at least 5 days old exists (next weekly run); flow unverified until then")
+                out.append(f"  {tk:<6} shares {shares/1e6:,.2f}M ({label}) recorded as baseline — flow estimates "
+                           f"start once a snapshot from {source} at least {ETF_FLOW_MIN_AGE_DAYS} days old exists; "
+                           f"flow unverified until then{note}")
                 continue
             span = (today - datetime.fromisoformat(base["date"]).date()).days
             d_sh = shares - base["shares"]
             pct = d_sh / base["shares"] * 100 if base["shares"] else 0.0
-            ta_chg = (float(ta) / base["total_assets"] - 1) * 100 if base.get("total_assets") else 0.0
-            nav_chg = (float(nav) / base["nav"] - 1) * 100 if base.get("nav") else 0.0
-            # Oct 31 2026: Yahoo's totalAssets can lag while navPrice is current. Then
-            # implied shares = assets / NAV moves INVERSELY to price with no flow at all
-            # (all five funds showed +2.6% to +6.3% "creations" in lock-step with price).
-            # If the asset figure has not actually changed, the share change is an artifact.
-            if abs(ta_chg) < 0.05:
-                out.append(f"  {tk:<6} Yahoo's asset figure is unchanged since {base['date']} "
-                           f"(NAV {nav_chg:+.2f}% over the same span) — any share change would be a "
-                           f"price artifact, not flow; flow unverified")
+            if abs(pct) < ETF_FLAT_PCT:
+                out.append(f"  {tk:<6} shares {shares/1e6:,.2f}M ({label}) — unchanged over {span}d "
+                           f"({pct:+.3f}%): no meaningful creations or redemptions{note}")
                 continue
-            usd = d_sh * float(nav)
-            direction = "net CREATIONS (inflow)" if d_sh > 0 else ("net REDEMPTIONS (outflow)" if d_sh < 0 else "flat")
-            out.append(f"  {tk:<6} implied shares {base['shares']/1e6:,.1f}M [{base['date']}] → {shares/1e6:,.1f}M "
-                       f"[{today}]  {pct:+.2f}% over {span}d  ≈ {'+' if usd >= 0 else '-'}${abs(usd)/1e6:,.0f}M  {direction}"
-                       f"  (assets {ta_chg:+.2f}%, NAV {nav_chg:+.2f}%)")
+            usd = d_sh * nav
+            direction = "net CREATIONS (inflow)" if d_sh > 0 else "net REDEMPTIONS (outflow)"
+            out.append(f"  {tk:<6} shares {base['shares']/1e6:,.2f}M [{base['date']}] → {shares/1e6:,.2f}M "
+                       f"[{today}, {label}]  {pct:+.2f}% over {span}d  ≈ "
+                       f"{'+' if usd >= 0 else '-'}${abs(usd)/1e6:,.0f}M  {direction}{note}")
         except Exception as e:
             out.append(f"  {tk:<6} flow estimate error — {type(e).__name__}: {str(e)[:80]}")
     try:
@@ -1233,11 +1311,12 @@ async def get_etf_flows(tickers: list[str] = None) -> str:
     (IBIT, FBTC, BITQ) plus gold ETFs (GLD, IAU). Approximate — follows fund filings.
     """
     tickers = [t.upper() for t in (tickers or ["IBIT", "FBTC", "BITQ", "GLD", "IAU"])]
-    lines = ["=== ETF FLOW PROXY (change in implied shares outstanding x NAV) ===\n"]
+    lines = ["=== ETF FLOWS (change in issuer-reported shares outstanding x price) ===\n"]
     lines += await asyncio.to_thread(_etf_share_flow_sync, tickers)
     lines.append("\nNote: approximate. Shares outstanding change only via creations/redemptions, so "
-                 "this separates real inflows from mere trading volume. Implied shares = Yahoo totalAssets / NAV, "
-                 "snapshotted each run (history builds week by week).")
+                 "this separates real inflows from mere trading volume. Share counts come from the issuer "
+                 "(iShares for IAU/IBIT, stockanalysis.com for GLD/FBTC/BITQ), snapshotted each run "
+                 "(history builds week by week).")
     return "\n".join(lines)
 
 

@@ -45,9 +45,14 @@
   suspensions in memory, so a restart clears them until our own volume
   (Nova's ~30-ticker searches, news) triggers them again. Mitigation:
   `searxng_preflight.py` (probe, restart if empty, logs the blocked
-  engines each run). Open: add more tolerant engines (e.g. Mojeek) after
-  reviewing the enabled list; `braveapi` is quota-limited, not
-  CAPTCHA-limited.
+  engines each run). **Nov 3:** `searxng_engine_cleanup.py` disabled the four
+  always-dead scraped engines (brave, duckduckgo, startpage, yahoo) and
+  enabled Mojeek in `settings.yml` (edit a copy: `docker cp` out, run the
+  script, `docker cp` back, `docker restart searxng`; the original is kept as
+  `searxng_settings.orig.yml`). Bing, braveapi and "duckduckgo web" still
+  answer; Mojeek did not answer the first probes. Open: whether the restart
+  workaround is still needed (test `searxng_preflight.py --check` cold);
+  `braveapi` is quota-limited, not CAPTCHA-limited.
 - Docker restart policy set to `unless-stopped` — auto-starts on reboot:
   `docker update --restart unless-stopped searxng`
 - `SEARXNG_URL` env var: `mercurymcp` (app4.py) and the new
@@ -1379,10 +1384,18 @@ blocked except for the company's own site.
   assets and a falling NAV, implied shares rise inversely to price, so
   all five funds showed false "creations" of +2.6% to +6.3%. The tool now
   prints the assets and NAV change beside each estimate and reports "flow
-  unverified" when assets moved under 0.05%. Real flow data needs issuer
-  share counts (SPDR for GLD, iShares for IAU/IBIT) — not yet wired in.
-  Baselines recorded 10/26; first estimates expected on the next weekly
-  run. Wired into `weekly_mercury.py` (`gold_drivers`, `etf_flows`
+  unverified" when assets moved under 0.05%.
+  **Nov 3 replacement:** the Yahoo-implied method is gone. Share counts now
+  come from the issuer: IAU and IBIT from the iShares product page (exact,
+  with an as-of date), GLD/FBTC/BITQ from stockanalysis.com "Shares Out"
+  (the issuer counts were 7-27% below the Yahoo-implied figures). Each run
+  snapshots the count with its source; flow = change in shares × price vs
+  the closest snapshot at least 3 days old **from the same source** (iShares
+  and stockanalysis differ ~0.1% from timing; old untagged Yahoo snapshots
+  are ignored). A source failure reports "flow unverified" instead of
+  guessing. `diag_issuer_shares.py` probes the candidate sources.
+  Issuer-sourced baselines recorded 11/03; first estimates expected on the
+  Nov 7 run. Wired into `weekly_mercury.py` (`gold_drivers`, `etf_flows`
   feeds; prompt tells Mercury to explain gold with them and to call
   flows unverified when a line says so).
 - **BDI date verification (Oct 26)** — see the BDI section below.
@@ -2322,6 +2335,41 @@ were confirmed against real output; the rest were tested with mocks.
   summary line shows `= Unchanged`. `--force` / named tickers still rewrite.
 - ✅ **`diag_xbrl.py` could only show a fixed concept list** — `--scan`,
   `+Concept`.
+
+### Resolved Issues (November 3, 2026 — Jansky's 10/31 review)
+
+- ✅ **Short-interest garbage slipped through** (USB/CFG/ALL/DLR/BA showed
+  -99% to -100% month-over-month; ALL was consumed unflagged) — the level
+  passed the float check, so the *prior-month* field was the bad one.
+  `get_short_interest` now quarantines the whole record on a MoM change of
+  -90% or worse / +900% or more, or an implausible prior-month figure. (live)
+- ✅ **"Nova has records but Jupiter says none" on WYNN/PENN/LMT/HON/MTB/CSCO**
+  — not structural: `nova_legal.py` must run after Jupiter (it needs the
+  flags), so first-time legal records land after the summaries. It now ends
+  by printing `python3 repair_summaries.py <tickers>` to regenerate those
+  summaries with the new data.
+- ✅ **Nova earnings summary dropped at 91+ days after Nova last touched it**
+  — `weekly_research.py` gated the earnings block on `research_date` (90d)
+  while the code below it already aged the record by call date (warn 120d,
+  drop 365d). A release still being the latest quarter vanished between day
+  91 and 120, worse since the "unchanged" skip stopped re-touching records.
+  The gate now uses call date only. (mock-tested)
+- ✅ **UNH/HUM/TJX/CZR/AMT earnings records were stale (web-search, April-July)**
+  — re-run with named tickers; UNH (10/13), CZR/AMT (10/27) and TJX (8/19)
+  now come from SEC 8-Ks. VALE correctly stayed "unchanged". (live)
+- ✅ **Mercury ETF pitch contradicted its own summary** (IAU "macro driver has
+  flipped" vs the summary's decoupling finding) — the pitch prompt now has a
+  CONSISTENCY rule: agree with the summary, label a driver as level vs change,
+  never cite an unverified flow input. (prompt-only; check next Mercury run)
+- ✅ **ETF flow proxy replaced by issuer share counts** — see
+  `get_etf_flows` above. (live baselines 11/03)
+
+Not code bugs / still open from that review: the TRIM/REDUCE verdict-taxonomy
+question (a "WATCH-TRIM" qualifier is the cheap option), SEC `companyfacts`
+lag (try the `companyconcept` endpoint), DUK Item 3 extraction, FSLR legal
+truncation, AEP's +35.1% institutional change, DPZ's 52-week-low reference,
+Atlas not linking its oil shock to its PPI warning, a 4-week DXY history,
+and the weekly cap treating reductions like buys.
 
 ### Resolved Issues (September 2026)
 

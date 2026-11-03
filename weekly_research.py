@@ -424,7 +424,12 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
 
     # ── Earnings section ───────────────────────────────────────────────────
     earnings = rec.get("earnings", {})
-    if earnings and _nova_is_current(rec, "earnings"):
+    # Nov 3 2026: this was gated on research_date within 90 days, but the block
+    # below already ages the record by its CALL date (warn at 120d, drop at 365d).
+    # The two clocks disagreed: a release that is still the newest quarter was
+    # silently dropped between day 91 and day 120 after Nova last touched it (and
+    # the "unchanged" skip means Nova no longer re-touches an unchanged record).
+    if earnings:
         call_date    = earnings.get("call_date", "N/A")
         fiscal_q     = earnings.get("fiscal_quarter", "Most Recent Quarter")
         source       = earnings.get("source", "")

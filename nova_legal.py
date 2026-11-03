@@ -604,6 +604,15 @@ def main():
     print(f"  Researched: {success}  |  Errors: {errors}  |  Skipped: {len(skipped)}")
     print(f"  Nova data: {NOVA_JSON}")
     print(f"{'═'*52}\n")
+    # Nov 3 2026: nova_legal runs AFTER Jupiter (it needs Jupiter's NOVA_FLAG_DATA),
+    # so a ticker researched here for the first time was summarized without its
+    # legal record, and Jansky saw the table and the summary disagree (WYNN, PENN,
+    # LMT, HON, MTB, CSCO on 10/31). Tell the operator how to close the loop.
+    done = [t for t, *_ in to_research]
+    if success and done:
+        print("  Jupiter wrote these summaries before the legal records existed.")
+        print("  To refresh them with the new Nova data (summary-only, ~1 min each):")
+        print(f"    python3 repair_summaries.py {' '.join(done)}\n")
 
 
 if __name__ == "__main__":

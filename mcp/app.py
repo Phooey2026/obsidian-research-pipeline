@@ -1776,6 +1776,20 @@ def get_short_interest(ticker: str) -> str:
         mom_change = ""
         if not bad_reason and shares_short and prior_month and prior_month > 0:
             chg = ((shares_short - prior_month) / prior_month) * 100
+            # Nov 3 2026: Jansky's 10/31 review found USB/CFG/ALL/DLR/BA reporting
+            # month-over-month collapses of -99% or worse (ALL's slipped through
+            # unflagged). The level passed the float check, so the PRIOR-month
+            # field was the garbage one. A real short book does not shrink 90%+
+            # (or grow 10x) in a month, so quarantine the whole record.
+            prior_ratio = (prior_month / float_shares) if float_shares else None
+            if chg <= -90 or chg >= 900:
+                bad_reason = (f"month-over-month change of {chg:+,.0f}% "
+                              f"({prior_month:,.0f} -> {shares_short:,.0f} shares) is not "
+                              f"physically plausible for a short position")
+            elif prior_ratio is not None and (prior_ratio < 1e-5 or prior_ratio > 1.0):
+                bad_reason = (f"prior-month short figure ({prior_month:,.0f}) is "
+                              f"{prior_ratio*100:.5f}% of the float")
+        if not bad_reason and shares_short and prior_month and prior_month > 0:
             arrow = "↑" if chg > 0 else "↓"
             mom_change = f"{arrow} {abs(chg):.1f}% vs prior month"
 
