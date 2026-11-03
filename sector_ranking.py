@@ -447,24 +447,37 @@ def select_weekly_pitches(trades: list, verdicts: dict, rank_scores: dict,
                           holdings: dict, config: dict) -> tuple[list, list]:
     """
     Cap the week's Jupiter pitches. Returns (kept, dropped[with reason]).
-      1. drop buys on AVOID names
-      2. keep the top `max_weekly_pitches` by score
-      3. cash check: kept buys must fit within (cash - floor) + kept sells;
+      1. verdict consistency: drop buys on AVOID names and reductions on
+         ACCUMULATE names (an ACCUMULATE is not a sell, an AVOID is not a buy)
+      2. buys on WATCH names need a high conviction score
+      3. keep the top `max_weekly_pitches` BUYS and, separately, the top
+         `max_weekly_reductions` REDUCTIONS (default: same number) by score
+      4. cash check: kept buys must fit within (cash - floor) + kept sells;
          drop the lowest-scored buys until they do
+
+    Nov 3 2026: buys and reductions used to share one pool, so on Oct 31 five
+    score-8 reductions (WMT, AAPL, XOM, ABBV, PLD) were dropped as "below weekly
+    cap" while four buys were kept. De-risking now has its own cap, and the sells
+    that survive also fund more of the buys in step 4.
     """
     limits = config.get("trade_limits", {})
     max_n = int(limits.get("max_weekly_pitches", 7))
+    max_r = int(limits.get("max_weekly_reductions", max_n))
     dropped: list = []
 
     watch_min = float(limits.get("watch_buy_min_score", 9))
-    pool = []
+    buy_pool, red_pool = [], []
     for t in trades:
         tk = str(t.get("ticker", "")).upper()
         is_buy = t.get("action") in ("NEW_POSITION", "ADD_TO_POSITION")
-        if is_buy and verdicts.get(tk) == "AVOID":
+        v = verdicts.get(tk)
+        if is_buy and v == "AVOID":
             dropped.append({**t, "dropped_reason": "buy on an AVOID-verdict name"})
             continue
-        if is_buy and verdicts.get(tk) == "WATCH":
+        if not is_buy and v == "ACCUMULATE":
+            dropped.append({**t, "dropped_reason": "reduction on an ACCUMULATE-verdict name"})
+            continue
+        if is_buy and v == "WATCH":
             try:
                 sc = float(t.get("conviction_score"))
             except (TypeError, ValueError):
@@ -473,12 +486,15 @@ def select_weekly_pitches(trades: list, verdicts: dict, rank_scores: dict,
                 dropped.append({**t, "dropped_reason":
                                 f"buy on a WATCH name needs score >= {watch_min:g}"})
                 continue
-        pool.append(t)
+        (buy_pool if is_buy else red_pool).append(t)
 
-    pool.sort(key=lambda t: _pitch_score(t, verdicts, rank_scores), reverse=True)
-    kept, over = pool[:max_n], pool[max_n:]
-    for t in over:
-        dropped.append({**t, "dropped_reason": f"below weekly cap of {max_n}"})
+    kept = []
+    for pool, cap, label in ((buy_pool, max_n, "buy"), (red_pool, max_r, "reduction")):
+        pool.sort(key=lambda t: _pitch_score(t, verdicts, rank_scores), reverse=True)
+        kept += pool[:cap]
+        for t in pool[cap:]:
+            dropped.append({**t, "dropped_reason": f"below weekly {label} cap of {cap}"})
+    kept.sort(key=lambda t: _pitch_score(t, verdicts, rank_scores), reverse=True)
 
     summary = (holdings or {}).get("summary", {})
     total = summary.get("total_portfolio_value", 0)
@@ -493,7 +509,7 @@ def select_weekly_pitches(trades: list, verdicts: dict, rank_scores: dict,
                 return 0.0
         while True:
             buys = [t for t in kept if t.get("action") in ("NEW_POSITION", "ADD_TO_POSITION")]
-            sells = [t for t in kept if t.get("action") == "REDUCE_POSITION"]
+            sells = [t for t in kept if t.get("action") not in ("NEW_POSITION", "ADD_TO_POSITION")]
             if sum(map(_d, buys)) <= room + sum(map(_d, sells)) or not buys:
                 break
             worst = min(buys, key=lambda t: _pitch_score(t, verdicts, rank_scores))
