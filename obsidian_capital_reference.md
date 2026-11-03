@@ -1,5 +1,5 @@
 # Obsidian Capital Research Pipeline — Reference Guide
-## As of June 22, 2026 — updated October 27, 2026
+## As of June 22, 2026 — updated November 3, 2026
 
 ---
 
@@ -263,6 +263,11 @@ Scripts read this file at startup; hardcoded values are deprecated.
 }
 ```
 
+`trade_limits` also accepts two optional keys read by `sector_ranking.py`
+(Nov 3, 2026): `max_weekly_pitches` (cap on Jupiter's equity **buys** per week;
+Jay's value is 5; code default 7) and `max_weekly_reductions` (separate cap on
+reductions/sells; defaults to `max_weekly_pitches` when absent).
+
 Scripts reading obsidian_config.json: `sector_ranking.py`, `weekly_mercury.py`,
 `jansky_review.py`, `pipeline_health.py`, `repair_summaries.py`
 
@@ -380,6 +385,10 @@ python3 diag_xbrl.py NEE                                  # newest filings + EPS
 python3 diag_xbrl.py NEE --scan +ElectricUtilityRevenue   # every 'Revenue' concept; +Name adds one
 python3 diag_6k.py TICKER SINCE_DATE [LIMIT | EXACT_DATE] # foreign filers' 6-K scan (Nova's source)
 python3 diag_etf_shares.py [TICKER ...]                   # which source gives ETF share counts
+python3 diag_lag.py TICKER [TICKER ...]                   # is SEC's API behind the filings? (submissions vs companyfacts vs frames vs R pages)
+python3 diag_rpage.py CIK ACCESSION                       # parse one filing's income-statement R page the way get_sec_earnings does
+python3 diag_find.py FILING_URL ["regex" [hits [chars]]]  # Item 3 text + where litigation/contingency headings sit in a 10-K
+python3 check_mcp_tool.py web get_legal_proceedings '{"ticker":"XOM","debug":true}'  # trace of every legal-extraction anchor tried
 
 # After editing watchlist.json (dropping/swapping a ticker) — expunge its
 # stale earnings/legal cache from nova_supplemental.json
@@ -508,6 +517,21 @@ Jupiter and Mercury pitch trade recommendations to Jansky each week.
 - Max single ETF position: 15% of portfolio
 - Max single equity position: 10% of portfolio
 - Cash floor: 10% minimum (Jansky warns and prioritizes if aggregate buys breach this)
+
+**Weekly pitch cap and verdict rules (`sector_ranking.py` → `select_weekly_pitches`, Nov 3, 2026):**
+- Buys (`NEW_POSITION`, `ADD_TO_POSITION`) and reductions (`REDUCE_POSITION`) are
+  capped **separately**: top `max_weekly_pitches` buys and top
+  `max_weekly_reductions` reductions by `_pitch_score`. Before, reductions
+  competed with buys for the same slots (Oct 31 replay: PLD's reduction took a
+  buy slot).
+- A buy on an **AVOID**-verdict name is dropped ("buy on an AVOID-verdict
+  name"); a reduction on an **ACCUMULATE**-verdict name is dropped. WATCH names
+  may still carry sell pitches (accepted for now — a "WATCH-TRIM" qualifier is
+  the deferred option); a WATCH buy needs a score of at least 9.
+- The cash-floor check counts every non-buy action as proceeds.
+- Jupiter's prompt (which still says "about N trade pitches") is unchanged by
+  design; the cap is applied after Jupiter answers. (Oct 31 replay in the
+  sandbox; first live run is the next Jupiter run.)
 
 **Jansky trade review (Pass 21):**
 - Two-call approach: narrative review call + dedicated JSON decisions call
@@ -1402,6 +1426,53 @@ blocked except for the company's own site.
   flows unverified when a line says so).
 - **BDI date verification (Oct 26)** — see the BDI section below.
 - Tool count: 18 total (16 + `get_gold_drivers` + `get_etf_flows`).
+
+**`mcp/app.py` (webmcp) — Nov 3, 2026 changes:**
+- **`get_sec_earnings` — SEC API lag fallback ("R pages").** SEC's
+  `companyfacts` / `companyconcept` / `frames` are the *same* dataset and can
+  trail a filing by weeks (NEE, SO, DUK, AEP, SRE, C, REYN all missing a
+  10-Q). When the newest quarter is more than 100 days old, the tool lists the
+  10-Qs the API hasn't published, opens each filing's `FilingSummary.xml`,
+  finds the income-statement R page, and prints "Quarters read from the
+  filings themselves" (3-month column only; revenue, net income attributable
+  to the parent, diluted EPS; up to 3 quarters). A STALE warning prints only
+  past 200 days. Parser notes: the first *numeric* cell is the value (NEE and C
+  put an empty cell after the label); EPS must carry a decimal point (AEP's
+  Q2 once returned a $713.00 "EPS"); a "Diluted earnings per share:" header
+  with a "Net income" row beneath it is read via section tracking. GAAP as
+  filed, so noisy where derivative gains/losses are large (NEE). (live: DUK,
+  REYN, NEE, C, SO, AEP, SRE. PNW and XEL needed no fallback.)
+  Diagnostics: `diag_lag.py TICKER...`, `diag_rpage.py CIK ACCESSION`.
+- **`get_technicals`** — adds `52W Low` (Yahoo `fiftyTwoWeekLow`, fallback the
+  minimum intraday low) with "price is X% vs the low" (DPZ: $282.00, +14.6%).
+- **`get_institutional`** — the accumulation signal now uses the **median**
+  position change and prints the mean beside it; warns when any holder moved
+  more than ±100% (new positions/restated filings) or the mean and median
+  differ by more than 10 points, and when 13F report dates span more than 100
+  days. (AEP: median +6.1% vs mean +35.1%, two outliers named.) (live)
+- **`get_legal_proceedings(ticker, debug=False)` — extraction order rebuilt.**
+  Layouts differ too much for one anchor, so strategies run in this order:
+  A (unique note phrases) → **C0** (an explicit "Item 3. Legal Proceedings"
+  heading followed by its own text; short sections of 400-1,500 chars count if
+  they don't just point at a note; the window ends at "Item 4") → **C1** (Item 3
+  is a stub of ≤600 chars naming "Note N": find that note's own heading, skipping index/TOC
+  rows and prose references, and extract to the next note) → A2 (note headings
+  such as "Note 14. Commitments and Contingencies") → B, B2, C, C2 (20-F), D.
+  Guards in `extract_from`: a window containing "Unresolved Staff Comments" or
+  "Item 1C" started too early and is rejected; outside Item 3 windows, "Item 4.
+  Mine Safety" within 1,500 chars means the start was the *end* of Item 3.
+  When no end marker falls inside the 25,000-char window the result ends at a
+  sentence and carries a "[Truncated — the extraction window ended before the
+  legal section did …]" marker (long sections: IP, JPM). Exhibit files named
+  like `duk-20251231x10kxexx21.htm` are now excluded (regex `ex+\d|exhibit|exh\d`,
+  also in `app3.py`); that file used to be *preferred* because its name
+  contains "10k". `_PREDECESSOR_CIKS` reads a predecessor's 10-K when a
+  holding-company successor has none (XOM → CIK 34088; add entries when an
+  8-K12B shows up). `debug=true` appends a trace of every anchor tried and
+  every Item 3 heading found. Diagnostic: `diag_find.py URL ["regex"]`.
+  (live: FSLR, CBRE, DUK, XOM, LMT, IP, JPM.) Lesson: every fix here was first
+  guessed from mocks and got a layout wrong — read a trace before changing
+  anchors.
 
 **`mcp/app.py` (webmcp) — `get_sec_earnings()` fixes (Sept 22, 2026):**
 - **Annual-revenue tag fallback bug fixed (BALL, DUK)** — `get_annual()`
@@ -2366,12 +2437,31 @@ were confirmed against real output; the rest were tested with mocks.
 - ✅ **ETF flow proxy replaced by issuer share counts** — see
   `get_etf_flows` above. (live baselines 11/03)
 
+- ✅ **SEC `companyfacts` lag (NEE/SO/DUK/AEP/SRE/PNW/C/REYN)** — `companyconcept`
+  is the same dataset, so the fix reads the filings' own income-statement R
+  pages. See `get_sec_earnings` above. (live)
+- ✅ **DUK Item 3 not extracted** — an exhibit (subsidiary list, 7,718 chars) was
+  preferred over the 10-K; exhibit regex fixed in `app.py` and `app3.py`. (live)
+- ✅ **FSLR legal text cut mid-matter / wrong section** — three successive wrong
+  anchors (risk-factor pointer, Item 3's closing pointer, an MD&A pointer);
+  fixed by taking the real Item 3 first. Truncation marker added. (live)
+- ✅ **CBRE and XOM legal not extracted** — short Item 3 ending at Item 4 (CBRE);
+  Item 3 stub pointing to Note 7, and the ticker resolving to a holding company
+  with no 10-K (XOM). (live)
+- ✅ **AEP's +35.1% institutional change** — two holders at +138%/+113% pulled the
+  mean; the signal uses the median and warns. (live)
+- ✅ **DPZ 52-week-low reference** — `52W Low` is now in the technicals feed; the
+  quoted low is Yahoo's $282.00. (live; Jupiter's wording not yet compared)
+- ✅ **Weekly cap treating reductions like buys** — separate caps and verdict
+  rules; see "Weekly pitch cap and verdict rules". (sandbox replay; not yet run
+  live)
+
 Not code bugs / still open from that review: the TRIM/REDUCE verdict-taxonomy
-question (a "WATCH-TRIM" qualifier is the cheap option), SEC `companyfacts`
-lag (try the `companyconcept` endpoint), DUK Item 3 extraction, FSLR legal
-truncation, AEP's +35.1% institutional change, DPZ's 52-week-low reference,
-Atlas not linking its oil shock to its PPI warning, a 4-week DXY history,
-and the weekly cap treating reductions like buys.
+question (a "WATCH-TRIM" qualifier is the cheap option; Jay is fine with sells
+inside WATCH for now), Atlas not linking its oil shock to its PPI warning, and a
+4-week DXY history. Jay is working offline on an accumulate-ranking methodology
+and does not want Jupiter's prompt changed yet (the "be stingy with accumulate"
+prompt is why the list is ~99% WATCH, which he likes as a baseline).
 
 ### Resolved Issues (September 2026)
 

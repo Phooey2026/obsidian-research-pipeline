@@ -577,12 +577,13 @@ def get_technicals(ticker: str) -> str:
         import yfinance as yf
 
         t = yf.Ticker(ticker.upper())
-        hist = t.history(period="1y")[["Close", "High"]]
+        hist = t.history(period="1y")[["Close", "High", "Low"]]
         if hist.empty or len(hist) < 20:
             return f"Insufficient price history for {ticker}."
 
         closes = hist["Close"].values
         highs  = hist["High"].values
+        lows   = hist["Low"].values
 
         # ── RSI(14) ──
         def compute_rsi(prices, period=14):
@@ -662,10 +663,24 @@ def get_technicals(ticker: str) -> str:
         else:
             high_52w = max(highs[-252:]) if len(highs) >= 252 else max(highs)
         drawdown = (current - high_52w) / high_52w * 100
+        # Nov 3 2026: Jansky flagged DPZ's 52-week-low reference as a possible
+        # stop-loss level that "may not exist as stated". The technicals output only
+        # carried the HIGH, so an analyst quoting a low had to take it from raw
+        # price tables (dividend-adjusted, so lower than the real traded low) or
+        # from get_stock_info. Report the low here from the same source and
+        # convention as the high: Yahoo's own field first, intraday lows as fallback.
+        try:
+            info_52w_low = t.info.get('fiftyTwoWeekLow')
+        except Exception:
+            info_52w_low = None
+        low_52w = info_52w_low if info_52w_low else (min(lows[-252:]) if len(lows) >= 252 else min(lows))
+        above_low = (current - low_52w) / low_52w * 100 if low_52w else None
 
         lines = [f"=== {ticker.upper()} Technical Indicators ===\n"]
         lines.append(f"Current Price:     ${current:.2f}")
         lines.append(f"52W High:          ${high_52w:.2f}")
+        lines.append(f"52W Low:           ${low_52w:.2f}"
+                     + (f"  (price is {above_low:+.1f}% vs the low)" if above_low is not None else ""))
         lines.append(f"Drawdown from High: {drawdown:.1f}%\n")
 
         lines.append("── Momentum ──")
@@ -804,11 +819,39 @@ def get_institutional(ticker: str, top_n: int = 15) -> str:
                            for _, row in inst.iterrows()
                            if (row.get('pctChange') or row.get('% Change')) is not None]
                 if changes:
-                    avg_change = sum(changes) / len(changes)
+                    # Nov 3 2026: AEP showed "+35.1% average institutional change" and
+                    # it was read as live accumulation. A mean over ~10 holders is moved
+                    # by a single new position or restated filing (a +300% line is
+                    # enough), so the signal now uses the MEDIAN and says when the mean
+                    # is being pulled by outliers; and flags when the 13F "date reported"
+                    # values span many months (changes then compare different periods).
+                    import statistics as _st
+                    mean_change = sum(changes) / len(changes)
+                    avg_change = _st.median(changes)
                     net_adding = sum(1 for c in changes if c > 0)
                     net_reducing = sum(1 for c in changes if c < 0)
+                    _outl = [c for c in changes if abs(c) > 1.0]
                     lines.append(f"\n── Accumulation Signal ──")
-                    lines.append(f"  Avg position change: {avg_change*100:+.1f}%")
+                    lines.append(f"  Median position change: {avg_change*100:+.1f}%   "
+                                 f"(mean {mean_change*100:+.1f}%)")
+                    if _outl or abs(mean_change - avg_change) > 0.10:
+                        lines.append(
+                            f"  ⚠ The mean is pulled by {len(_outl)} holder(s) with changes beyond ±100% "
+                            f"(new positions or restated filings: "
+                            f"{', '.join(f'{c*100:+.0f}%' for c in _outl[:3]) or 'wide spread'}). "
+                            f"The signal below uses the MEDIAN; do not cite the mean as accumulation.")
+                    try:
+                        _dr = [d for d in inst['Date Reported'].tolist() if d is not None]
+                        if _dr:
+                            _d0, _d1 = min(_dr), max(_dr)
+                            _span = (_d1 - _d0).days if hasattr(_d1 - _d0, 'days') else 0
+                            if _span > 100:
+                                lines.append(
+                                    f"  ⚠ 13F 'date reported' values span {_span} days "
+                                    f"({str(_d0)[:10]} to {str(_d1)[:10]}): position changes compare "
+                                    f"different filing periods; treat the signal as weak.")
+                    except Exception:
+                        pass
                     lines.append(f"  Adding: {net_adding} / Reducing: {net_reducing} institutions")
                     if avg_change > 0.02:
                         lines.append("  Signal: 🟢 Net accumulation — institutions increasing positions")
@@ -1022,6 +1065,131 @@ def get_earnings(ticker: str) -> str:
 
     except Exception as e:
         return f"Error fetching earnings for {ticker}: {str(e)}"
+
+
+# ── SEC filing R-page fallback (Nov 3 2026) ──────────────────────────────────
+# SEC's companyfacts / companyconcept / frames APIs are one dataset, and for some
+# filers it is missing whole 10-Qs (diag_lag.py, Nov 3: NEE has no Q2/Q3 2026, C no
+# Q1/Q2, DUK no Q2, while the filings index lists them). The numbers are still in
+# the filing's own XBRL "R" pages, so read the income statement from there.
+
+def _sec_raw(url: str, timeout: int = 30) -> bytes:
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': 'Jay jay@example.com'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _r_cells(row_html: str) -> list:
+    import html as _h
+    out = []
+    for c in re.findall(r'<t[dh]\b[^>]*>(.*?)</t[dh]>', row_html, re.S | re.I):
+        t = _h.unescape(re.sub(r'<[^>]+>', ' ', c)).replace('\xa0', ' ')
+        out.append(re.sub(r'\s+', ' ', t).strip())
+    return out
+
+
+def _r_num(s: str):
+    s = s.replace('$', '').replace(',', '').strip()
+    neg = s.startswith('(') and s.endswith(')')
+    s = s.strip('()').strip()
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+_R_REV = [r'^total (operating )?(net )?revenues?(,? net( of interest expense)?)?$',
+          r'^total revenues?\b', r'^(net )?revenues?(,? net( of interest expense)?)?$',
+          r'^operating revenues$', r'^total operating revenues?\b', r'^net sales$',
+          r'^total net sales\b', r'^sales$', r'^revenues?, net\b']
+_R_NI = [r'^net (income|earnings|profit)( \(loss\))? (attributable to|available to)\b(?!.*non[- ]?controlling)',
+         r'^net (income|earnings|profit)( \(loss\))?$',
+         r"^.{0,40}\bnet (income|earnings)( \(loss\))?$"]
+
+
+def _rpage_quarter(html_text: str):
+    """Current-quarter revenue / net income / diluted EPS from an EDGAR R-page
+    income statement, or None. Only 3-month columns are read."""
+    rows = re.findall(r'<tr\b.*?</tr>', html_text, re.S | re.I)
+    if len(rows) < 4:
+        return None
+    head = _r_cells(rows[0]) + _r_cells(rows[1])
+    top = ' '.join(head).lower()
+    if not re.search(r'3 months ended|13 weeks ended|three months ended', top):
+        return None
+    scale = 1e6 if 'in millions' in top else 1e3 if 'in thousands' in top else 1e9 if 'in billions' in top else 1.0
+    dm = re.search(r'([A-Z][a-z]{2})[a-z]*\.? (\d{1,2}), (\d{4})', ' '.join(_r_cells(rows[1])) or ' '.join(head))
+    if not dm:
+        return None
+    try:
+        end = datetime.strptime(f"{dm.group(1)} {dm.group(2)} {dm.group(3)}", "%b %d %Y").strftime('%Y-%m-%d')
+    except ValueError:
+        return None
+    items = []
+    section = ''
+    for r in rows[2:]:
+        c = _r_cells(r)
+        if len(c) < 2:
+            continue
+        label = re.sub(r'\s*\[\d+\]\s*$', '', c[0]).strip().lower().rstrip(':')
+        # Some filers (NEE, C) put an empty cell between label and values:
+        # take the first numeric cell, not blindly c[1].
+        _cell = next((x for x in c[1:] if _r_num(x) is not None), None)
+        v = _r_num(_cell) if _cell is not None else None
+        if label and v is None:
+            section = label          # header row such as "Diluted earnings per share:"
+        elif label:
+            items.append((label, v, section, '.' in _cell))
+
+    def pick(patterns):
+        for pat in patterns:
+            for label, v, _sec, _dec in items:
+                if re.search(pat, label):
+                    return v
+        return None
+
+    rev, ni = pick(_R_REV), pick(_R_NI)
+    _bad = r'in shares|weighted|shares outstanding|number of|average shares'
+    # EPS is always printed with cents; a whole-number cell is a share count or $ amount.
+    eps = next((v for label, v, _s, dec in items
+                if ('diluted' in label or 'assuming dilution' in label)
+                and dec and not re.search(_bad, label) and abs(v) < 100), None)
+    if eps is None:   # "Diluted earnings per share:" header, then "Net income" beneath it
+        eps = next((v for label, v, sec, dec in items
+                    if re.search(r'diluted|assuming dilution', sec)
+                    and not re.search(_bad, sec) and dec
+                    and re.search(r'^net (income|earnings)|per share', label)
+                    and not re.search(_bad, label) and abs(v) < 100), None)
+    if ni is None and eps is None:
+        return None
+    return {'end': end,
+            'rev': rev * scale if rev is not None else None,
+            'ni': ni * scale if ni is not None else None,
+            'eps': eps}
+
+
+def _filing_quarter(cik_num: str, accn: str):
+    """Fetch FilingSummary.xml, locate the income statement R page, parse it."""
+    import html as _h
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik_num}/{accn.replace('-', '')}/"
+    fs = _sec_raw(base + 'FilingSummary.xml').decode('utf-8', 'replace')
+    reports = []
+    for blk in re.findall(r'<Report\b.*?</Report>', fs, re.S):
+        fn = re.search(r'<HtmlFileName>(.*?)</HtmlFileName>', blk, re.S)
+        sn = re.search(r'<ShortName>(.*?)</ShortName>', blk, re.S)
+        if fn and sn:
+            reports.append((_h.unescape(sn.group(1)).strip(), fn.group(1).strip()))
+    for sn, fn in reports[:12]:
+        if (re.search(r'(?i)income|operations|earnings', sn)
+                and not re.search(r'(?i)comprehensive|parenthetical|equity|cash|balance|cover|tax|segment|detail|polic|note', sn)):
+            q = _rpage_quarter(_sec_raw(base + fn).decode('utf-8', 'replace'))
+            if q:
+                q['page'] = fn
+                return q
+    return None
+
 
 @mcp.tool()
 def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
@@ -1428,32 +1596,65 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
                 _qage = (datetime.now() - datetime.strptime(_newest_q, '%Y-%m-%d')).days
             except Exception:
                 _qage = 0
-            if _qage > 200:
+            if _qage > 100:
                 # Oct 24 2026: tell "SEC's XBRL API hasn't published this filer's
                 # newest 10-Q(s)" apart from "tag not covered". NEE and C both have
                 # 10-Qs filed in 2026 that are simply absent from companyfacts, so no
                 # tag change can recover them; the filings index shows what exists.
+                # Nov 3 2026: check from 100 days (REYN's Q2 was missing at 124 days),
+                # and read the missing quarters from the filings' own R pages.
                 _lag_txt = ""
+                _missing = []
                 try:
                     _subs = sec_get(f'https://data.sec.gov/submissions/CIK{cik}.json')
                     _rec = _subs.get('filings', {}).get('recent', {})
+                    _filed_ends = [q['end'] for q in eps_q if not q.get('derived')]
                     for _i, _f in enumerate(_rec.get('form', [])):
-                        if _f == '10-Q':
-                            _lp, _lf = _rec['reportDate'][_i], _rec['filingDate'][_i]
-                            _filed_ends = [q['end'] for q in eps_q if not q.get('derived')]
-                            if _filed_ends and _lp > max(_filed_ends):
-                                _lag_txt = (f"SEC's XBRL API has not published this filer's latest 10-Q "
-                                            f"(period {_lp}, filed {_lf}); the table above lags the "
-                                            f"company's real latest quarter. Use Nova/Yahoo earnings "
-                                            f"for the most recent quarter")
-                            break
+                        if _f == '10-Q' and _filed_ends and _rec['reportDate'][_i] > max(_filed_ends):
+                            _accs = _rec.get('accessionNumber') or []
+                            _missing.append((_rec['reportDate'][_i], _rec['filingDate'][_i],
+                                             _accs[_i] if _i < len(_accs) else ''))
+                    if _missing:
+                        _lp, _lf, _ = _missing[0]
+                        _lag_txt = (f"SEC's XBRL API has not published this filer's latest 10-Q "
+                                    f"(period {_lp}, filed {_lf}); the table above lags the "
+                                    f"company's real latest quarter")
                 except Exception:
                     pass
-                lines.append(
-                    f"  ⚠ STALE: newest quarterly EPS on file is {_newest_q} ({_qage} days old) — "
-                    + (_lag_txt if _lag_txt else
-                       "this filer likely reports under XBRL tags not covered here")
-                    + "; do NOT treat this table as current.")
+                if _qage > 200:
+                    lines.append(
+                        f"  ⚠ STALE: newest quarterly EPS on file is {_newest_q} ({_qage} days old) — "
+                        + (_lag_txt if _lag_txt else
+                           "this filer likely reports under XBRL tags not covered here")
+                        + "; do NOT treat this table as current.")
+                elif _lag_txt:
+                    lines.append(f"  ⚠ {_lag_txt}.")
+                if _missing:
+                    _got = []
+                    for _lp, _lf, _ac in sorted(_missing, reverse=True)[:3]:
+                        try:
+                            _q = _filing_quarter(cik.lstrip('0'), _ac) if _ac else None
+                        except Exception:
+                            _q = None
+                        if _q:
+                            _got.append((_q, _lf))
+                    if _got:
+                        lines.append("")
+                        lines.append("  Quarters read from the filings themselves (SEC's API has not "
+                                     "published them; income-statement R page, 3 months ended):")
+                        lines.append(f"  {'Quarter End':<13} {'Revenue':>10} {'Net Income':>11} {'Diluted EPS':>12}")
+                        lines.append("  " + "-" * 50)
+                        for _q, _lf in _got:
+                            _rs = f"${_q['rev']/1e9:.2f}B" if _q['rev'] is not None else "N/A"
+                            _ns = f"${_q['ni']/1e9:.2f}B" if _q['ni'] is not None else "N/A"
+                            _es = f"${_q['eps']:.2f}" if _q['eps'] is not None else "N/A"
+                            lines.append(f"  {_q['end']:<13} {_rs:>10} {_ns:>11} {_es:>12}"
+                                         f"  (10-Q filed {_lf}, {_q['page']})")
+                        lines.append("  These figures are GAAP as reported in the filing; the table above "
+                                     "does not include them.")
+                    elif _qage > 200:
+                        lines.append("  (the missing filings' income statements could not be read either; "
+                                     "use Nova/Yahoo for the latest quarter)")
 
         # Step 9: Annual revenue trend — merged across all known revenue
         # tags (see get_annual() fix note above), not a sequential fallback
@@ -2358,8 +2559,14 @@ def get_analyst_ratings(ticker: str, recent_days: int = 60) -> str:
         return f"Error fetching analyst ratings for {ticker}: {str(e)}"
         
 
+# Successor issuers whose 10-K was filed under a predecessor CIK (holding-company reorganizations).
+_PREDECESSOR_CIKS = {
+    'XOM': ['0000034088'],      # ExxonMobil Holdings Corp <- Exxon Mobil Corp
+}
+
+
 @mcp.tool()
-def get_legal_proceedings(ticker: str) -> str:
+def get_legal_proceedings(ticker: str, debug: bool = False) -> str:
     """Fetch legal proceedings and litigation disclosures from SEC 10-K filing.
     Returns material lawsuits, regulatory actions, DOJ/FTC/EC cases, class
     actions, and other legal risks companies are required to disclose.
@@ -2367,6 +2574,7 @@ def get_legal_proceedings(ticker: str) -> str:
     Note: extraction may fail for combined filings, foreign filers (20-F),
     or companies with minimal legal disclosure. Review the SEC link directly.
     ticker: stock symbol e.g. GOOG, META, MSFT, AAPL, CRM, TSLA
+    debug: True appends a trace of every anchor tried (diagnostics only)
     """
     try:
         import urllib.request
@@ -2404,6 +2612,22 @@ def get_legal_proceedings(ticker: str) -> str:
         accns = filings.get('accessionNumber', [])
         dates = filings.get('filingDate', [])
 
+        # Nov 3 2026: XOM files so many documents that `recent` only reaches back a few
+        # months; its February 10-K had rolled into the older pages listed under
+        # filings.files ("No 10-K filing found for XOM"). Read those when needed.
+        if not any(f in ('10-K', '20-F') for f in forms):
+            for fe in (subs.get('filings', {}).get('files') or [])[:6]:
+                try:
+                    older = json.loads(sec_get(
+                        'https://data.sec.gov/submissions/' + fe['name']))
+                except Exception:
+                    continue
+                if any(f in ('10-K', '20-F') for f in older.get('form', [])):
+                    forms = list(older.get('form', []))
+                    accns = list(older.get('accessionNumber', []))
+                    dates = list(older.get('filingDate', []))
+                    break
+
         tenk_accn  = None
         tenk_date  = None
         form_type  = None
@@ -2414,8 +2638,35 @@ def get_legal_proceedings(ticker: str) -> str:
                 form_type = form
                 break
 
+        # Nov 3 2026: XOM now resolves to ExxonMobil Holdings Corp (CIK 2115436), a new
+        # holding company that has filed 10-Qs but no 10-K; the FY2025 10-K was filed
+        # by the predecessor, Exxon Mobil Corp (CIK 34088). For successor issuers read
+        # the predecessor's filings. Add entries here as holding-company
+        # reorganizations happen (an 8-K12B in the successor's filings is the tell).
         if not tenk_accn:
-            return f"No 10-K filing found for {ticker.upper()}"
+            for _pc in _PREDECESSOR_CIKS.get(ticker.upper(), []):
+                try:
+                    _psubs = json.loads(sec_get(
+                        f'https://data.sec.gov/submissions/CIK{_pc}.json'))
+                except Exception:
+                    continue
+                _pr = _psubs.get('filings', {}).get('recent', {})
+                _pf, _pa, _pd = (_pr.get('form', []), _pr.get('accessionNumber', []),
+                                 _pr.get('filingDate', []))
+                for i, form in enumerate(_pf):
+                    if form in ('10-K', '20-F'):
+                        tenk_accn, tenk_date, form_type = _pa[i], _pd[i], form
+                        cik = _pc
+                        company_name = (_psubs.get('name') or company_name) + " (predecessor filer)"
+                        break
+                if tenk_accn:
+                    break
+
+        if not tenk_accn:
+            return (f"No 10-K filing found for {ticker.upper()} "
+                    f"(CIK {cik}, {company_name}; {len(forms)} filings listed, "
+                    f"{len(subs.get('filings', {}).get('files') or [])} older pages, "
+                    f"forms seen: {sorted(set(forms))[:12]})")
 
         # Step 3: Get filing index — find main HTM document.
         # Exclude XBRL inline viewer files (R1.htm … R999.htm) which are
@@ -2442,7 +2693,11 @@ def get_legal_proceedings(ticker: str) -> str:
             if 'index' in name_lower:
                 continue
             # Skip exhibit files — xex21, ex3d1, exh1025, exhibit103, etc.
-            if re.search(r'x?ex\d|exhibit|exh\d', name_lower):
+            # Nov 3 2026: DUK names its exhibits like duk-20251231x10kxexx21.htm
+            # ("exx21": two x's). The old pattern missed it, and because the name
+            # contains "10k" it was then PREFERRED over the real 10-K, so legal-
+            # proceedings extraction read a 7.7K-character subsidiaries list.
+            if re.search(r'ex+\d|exhibit|exh\d', name_lower):
                 continue
             # Skip XBRL inline viewer files (R1.htm … R999.htm)
             if re.match(r'^r\d+\.html?$', name_lower):
@@ -2495,15 +2750,59 @@ def get_legal_proceedings(ticker: str) -> str:
             'Incentive Awards Stock-based',
         ]
 
-        def extract_from(start_pos, chunk_size=25000, min_len=100):
+        _ext = {"capped": False, "s": "", "trace": []}
+
+        def _tr(start_pos, outcome, n=0):
+            _ext["trace"].append(
+                f"  [{_ext['s']}] pos {start_pos} ({100 * start_pos // max(doc_len, 1)}%) "
+                f"len {n} -> {outcome} | {clean[start_pos:start_pos + 120]!r}")
+
+        def extract_from(start_pos, chunk_size=25000, min_len=100, item3=False, stop_re=None):
             chunk = clean[start_pos:start_pos + chunk_size]
             end_pos = len(chunk)
+            if stop_re:
+                # end at the next note heading (C1: the note an Item 3 stub points to)
+                _ms = re.search(stop_re, chunk[200:])
+                if _ms:
+                    end_pos = 200 + _ms.start()
+            if item3:
+                # A window that opens on the "Item 3" heading ends at "Item 4" however
+                # short the section is (CBRE's is ~1,000 characters; the generic
+                # end-marker search ignores the first 2,000 and ran on into Part II).
+                _m4 = re.search(r'(?i)\bitem\s+4\b', chunk[40:])
+                if _m4:
+                    end_pos = 40 + _m4.start()
             for marker in end_markers:
                 # Use 2000 char minimum to avoid false early triggers
                 p = chunk.find(marker, 2000)
                 if p != -1 and p < end_pos:
                     end_pos = p
+            # Nov 3 2026: when no end marker was found inside the window, the cut is
+            # the window's, not the section's. FSLR's extract stopped mid-action with
+            # no sign anything was missing (the [Truncated] note below could never
+            # fire, because chunk_size already limits the text to 25,000 characters).
+            _ext["capped"] = (end_pos == len(chunk)) and (start_pos + chunk_size < len(clean))
             result = chunk[:end_pos].strip()
+            # Nov 3 2026: FSLR's extraction began at a risk-factor cross-reference
+            # ("Note 14. Commitments and Contingencies - Legal Proceedings to our
+            # consolidated financial statements...") and spent its window on tax,
+            # privacy, cyber and properties text. Item 1B/1C headings can never
+            # sit inside a financial-statement note or Item 3, so a window that
+            # contains them started too early: reject it and let the caller try
+            # the next anchor.
+            if re.search(r'(?i)unresolved\s+staff\s+comments|\bitem\s+1c\b', result):
+                _tr(start_pos, 'rejected: contains Item 1B/1C', len(result))
+                return ''
+            # Second FSLR failure: the start was the pointer sentence that closes
+            # Item 3 ("...Legal Proceedings to our consolidated financial statements
+            # for information regarding legal proceedings. Item 4. Mine Safety
+            # Disclosures None. PART II Item 5..."). Item 4 within the first
+            # paragraph means the text opens at the END of the section; the
+            # 2,000-char end-marker holdoff then let it run on into Items 5-7.
+            if not item3 and re.search(r'(?i)item\s+4\.?\s*mine\s+safety', result[:1500]):
+                _tr(start_pos, 'rejected: Item 4 within 1500 chars', len(result))
+                return ''
+            _tr(start_pos, 'ok' if len(result) >= min_len else 'too short', len(result))
             return result if len(result) >= min_len else ''
 
         # Strategy A: Unique anchor phrases that only appear in the
@@ -2532,6 +2831,7 @@ def get_legal_proceedings(ticker: str) -> str:
         ]
 
         # Search from 50%, 35%, 60%, then 75% of document
+        _ext["s"] = "A"
         for search_from_pct in [0.50, 0.35, 0.60, 0.75]:
             threshold = int(doc_len * search_from_pct)
             for phrase in anchor_phrases:
@@ -2549,22 +2849,77 @@ def get_legal_proceedings(ticker: str) -> str:
         # Separator varies across companies: en-dash (–), em-dash (—),
         # period, comma, hyphen, or comma+quote. The character class covers
         # all observed variants.
+        # Strategy C0: an explicit "Item 3. Legal Proceedings" heading followed by its
+        # OWN text (>1,500 chars, not a pointer to a note). Nov 3 2026: FSLR's notes
+        # say "14. Commitments and Contingencies" (no "Note"), so the note-heading
+        # strategy below only ever found prose pointers elsewhere in the filing.
+        # Item 3 pointers (DUK, CBRE, JPM...) fail this test and fall through as before.
         if not legal_text:
+            _ext["s"] = "C0"
+            item3_re = re.compile(r'(?i)ITEM\s+3[\.\s]+LEGAL\s+PROCEEDINGS')
+            _stubs = []
+            for m in list(item3_re.finditer(clean, int(doc_len * 0.30)))[:8]:
+                after = clean[m.end():m.end() + 60]
+                if re.match(r'\W{0,3}(for|of|in|and|to|under|above|below|included|contained|set|see|refer)\b', after):
+                    continue        # prose reference, not the heading
+                cand = extract_from(m.start(), 25000, item3=True)
+                head = cand[:300].lower()
+                # Short sections (400-1,500 chars) count only if they carry their own
+                # text; one that mainly points at a note falls through to the note.
+                _ptr = re.search(r'(?i)\b(see|refer to|included in|set forth in|incorporated)\b.{0,100}\bnote\s+\d+', cand)
+                if (len(cand) > 400 and 'see note' not in head and 'refer to note' not in head
+                        and 'incorporated herein' not in head and 'incorporated by reference' not in head
+                        and (len(cand) > 1500 or not _ptr)):
+                    legal_text = cand
+                    break
+                if cand and len(cand) <= 600:
+                    _stubs.append(cand)
+
+        # Strategy C1: Item 3 is only a stub that points at a numbered note (XOM: "Refer
+        # to the relevant portions of Note 7 ... for additional information on legal
+        # proceedings"). Read the number, find that note's own heading later in the
+        # filing, and extract just that note (to the next note heading).
+        if not legal_text and _stubs:
+            _ext["s"] = "C1"
+            for stub in _stubs:
+                for num in list(dict.fromkeys(re.findall(r'(?i)\bNote\s+(\d{1,2})\b', stub)))[:3]:
+                    head_re = re.compile(r'\bNote\s+%s\s*[\.\:\-\u2013\u2014]\s+(?=[A-Z])' % num)
+                    stop = r'\bNote\s+%d\s*[\.\:\-\u2013\u2014]\s+[A-Z]' % (int(num) + 1)
+                    for m in list(head_re.finditer(clean, int(doc_len * 0.30)))[:10]:
+                        title = clean[m.end():m.end() + 80]
+                        if not re.search(r'(?i)litigation|legal|contingenc|commitment|proceeding', title):
+                            continue
+                        # table-of-contents / index entries list several notes in a row
+                        if len(re.findall(r'\bNote\s+\d+', clean[m.start():m.start() + 600])) >= 3:
+                            continue
+                        cand = extract_from(m.start(), 25000, stop_re=stop)
+                        if len(cand) > 500:
+                            legal_text = cand
+                            break
+                    if legal_text:
+                        break
+                if legal_text:
+                    break
+
+        if not legal_text:
+            _ext["s"] = "A2"
             note_cc_re = re.compile(
                 r'Note\s+\d+[\.\s:\u2013\u2014,\-\"\u201c\u201d]+'
                 r'Commitments\s+and\s+Contingencies',
                 re.IGNORECASE)
             for threshold_pct in [0.25, 0.10]:
                 threshold = int(doc_len * threshold_pct)
-                m = note_cc_re.search(clean, threshold)
-                if m:
+                for m in list(note_cc_re.finditer(clean, threshold))[:8]:
                     candidate = extract_from(m.start(), 25000)
                     if len(candidate) > 500:
                         legal_text = candidate
                         break
+                if legal_text:
+                    break
 
         # Strategy B: Find 'Legal Matters' in final 30% of document
         if not legal_text:
+            _ext["s"] = "B"
             threshold = int(doc_len * 0.70)
             positions = [
                 m.start() for m in
@@ -2581,6 +2936,7 @@ def get_legal_proceedings(ticker: str) -> str:
         # proceedings as a lettered subsection within a larger Commitments
         # note: "h) Legal proceedings". Find the subsection directly.
         if not legal_text:
+            _ext["s"] = "B2"
             subsec_re = re.compile(r'\b[a-z]\)\s*[Ll]egal\s+proceedings\b')
             threshold = int(doc_len * 0.30)
             for m in subsec_re.finditer(clean):
@@ -2592,6 +2948,7 @@ def get_legal_proceedings(ticker: str) -> str:
 
         # Strategy C: Find Item 3 Legal Proceedings — skip cross-references
         if not legal_text:
+            _ext["s"] = "C"
             threshold = int(doc_len * 0.30)
             positions = [
                 m.start() for m in
@@ -2613,6 +2970,7 @@ def get_legal_proceedings(ticker: str) -> str:
         # use Item 3. Legal disclosures appear under Item 8 as "Legal and
         # Arbitration Proceedings". Search from 10% onward.
         if not legal_text and form_type == '20-F':
+            _ext["s"] = "C2"
             for pattern in [
                 r'(?i)legal\s+and\s+arbitration\s+proceedings',
                 r'(?i)ITEM\s+8[\.\s]+.*?legal',
@@ -2639,6 +2997,7 @@ def get_legal_proceedings(ticker: str) -> str:
         # a lower min_len=100 threshold — returning the short boilerplate
         # rather than a NOT_EXTRACTED failure message.
         if not legal_text:
+            _ext["s"] = "D"
             for keyword in ['pending legal proceedings',
                             'material litigation',
                             'class action',
@@ -2652,6 +3011,13 @@ def get_legal_proceedings(ticker: str) -> str:
                         legal_text = candidate
                         break
 
+        if debug:
+            for _m in list(re.finditer(r'(?i)ITEM\s+3[\.\s]+LEGAL\s+PROCEEDINGS', clean))[:10]:
+                _ext["trace"].append(
+                    f"  [item3 heading] pos {_m.start()} ({100 * _m.start() // max(doc_len, 1)}%) "
+                    f"| {clean[_m.start():_m.start() + 160]!r}")
+        _trace = ("\n\nDEBUG TRACE (doc %d chars, source %s):\n%s" % (
+            doc_len, doc_filename, "\n".join(_ext["trace"]) or "  (no anchors tried)")) if debug else ""
         if not legal_text:
             return (
                 f"=== {company_name} ({ticker.upper()}) ===\n"
@@ -2659,7 +3025,7 @@ def get_legal_proceedings(ticker: str) -> str:
                 f"Legal proceedings section could not be extracted.\n"
                 f"This may indicate minimal disclosed legal exposure\n"
                 f"or an unusual filing format.\n\n"
-                f"Review directly:\n{doc_url}"
+                f"Review directly:\n{doc_url}" + _trace
             )
 
         # Step 5: Final cleanup and truncation
@@ -2667,6 +3033,13 @@ def get_legal_proceedings(ticker: str) -> str:
         if len(legal_text) > 25000:
             legal_text = (legal_text[:25000]
                           + "\n\n[Truncated — full text in SEC filing]")
+        elif _ext["capped"]:
+            _cut = legal_text.rfind('. ')
+            if _cut > len(legal_text) * 0.8:
+                legal_text = legal_text[:_cut + 1]
+            legal_text += ("\n\n[Truncated — the extraction window ended before the legal section did; "
+                           "the last matter above may be incomplete and further matters may follow. "
+                           "State this limit in the analysis; full text in SEC filing]")
 
         lines = [
             f"=== {company_name} ({ticker.upper()}) ===",
@@ -2678,7 +3051,7 @@ def get_legal_proceedings(ticker: str) -> str:
             f"?action=getcompany&CIK={cik}&type=10-K"
         ]
 
-        return "\n".join(lines)
+        return "\n".join(lines) + _trace
 
     except Exception as e:
         return f"Error fetching legal proceedings for {ticker}: {str(e)}"

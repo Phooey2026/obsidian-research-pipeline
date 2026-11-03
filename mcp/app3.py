@@ -829,7 +829,7 @@ def get_legal_proceedings_deep(ticker: str) -> str:
                     continue
                 if 'index' in name_lower:
                     continue
-                if _re.search(r'x?ex\d|exhibit|exh\d', name_lower):
+                if _re.search(r'ex+\d|exhibit|exh\d', name_lower):
                     continue
                 if _re.match(r'^r\d+\.html?$', name_lower):
                     continue
