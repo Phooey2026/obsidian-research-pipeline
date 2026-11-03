@@ -50,7 +50,9 @@
   enabled Mojeek in `settings.yml` (edit a copy: `docker cp` out, run the
   script, `docker cp` back, `docker restart searxng`; the original is kept as
   `searxng_settings.orig.yml`). Bing, braveapi and "duckduckgo web" still
-  answer; Mojeek did not answer the first probes. Open: whether the restart
+  answer. Mojeek is enabled but returns `access denied` from this IP (0
+  results), so it adds nothing; the pool stays bing + braveapi + duckduckgo
+  web, with no further tolerant engine found yet. Open: whether the restart
   workaround is still needed (test `searxng_preflight.py --check` cold);
   `braveapi` is quota-limited, not CAPTCHA-limited.
 - Docker restart policy set to `unless-stopped` — auto-starts on reboot:
