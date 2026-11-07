@@ -1441,15 +1441,22 @@ def get_sec_earnings_release(ticker: str, max_chars: int = 40000) -> str:
                 # A strong 6-K has a results-style headline in its opening lines.
                 # Annual reports / sustainability reports also pass the financial
                 # test (BHP's Sept 16 6-K), so keep scanning for a stronger one.
+                # Nov 7 2026: Novo's Q3 6-K was rejected ("no results headline") although
+                # the cover strip was correct: its header (investor-relations address,
+                # CVR number, link/bold markup) put "Financial report for the period..."
+                # at offset ~613, just past a 600-char window, so NVO stayed on its August
+                # record. Results words now count anywhere in the first 1,500 chars; the
+                # annual-report / sustainability blockers still look at the first 600 only.
                 top = text[:600].lower()
+                top_pos = text[:1500].lower()
                 strong = (re.search(r'results|earnings|operating profit|net (income|profit)|'
-                                    r'financial report|interim|quarter', top)
+                                    r'financial report|interim|quarter', top_pos)
                           and not re.search(r'annual report|sustainability|climate|'
                                             r'form 20-f|integrated report', top))
                 if not strong:
                     if weak is None:
                         weak = (pick, base, release, text, used)
-                    skipped.append(f"{pick['filed']} {used} (no results headline)")
+                    skipped.append(f"{pick['filed']} {used} (no results headline; text starts {text[:100]!r})")
                     text = ""
             if text:
                 found = (pick, base, release, text, used)

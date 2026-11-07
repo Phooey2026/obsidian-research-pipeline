@@ -1,5 +1,5 @@
 # Obsidian Capital Research Pipeline — Reference Guide
-## As of June 22, 2026 — updated November 3, 2026
+## As of June 22, 2026 — updated November 7, 2026
 
 ---
 
@@ -384,6 +384,8 @@ journalctl --user -u tts-server -n 50
 python3 diag_xbrl.py NEE                                  # newest filings + EPS/NI/revenue tags
 python3 diag_xbrl.py NEE --scan +ElectricUtilityRevenue   # every 'Revenue' concept; +Name adds one
 python3 diag_6k.py TICKER SINCE_DATE [LIMIT | EXACT_DATE] # foreign filers' 6-K scan (Nova's source)
+python3 diag_strip6k.py 6K_DOC_URL                        # why a 6-K was rejected as "no results headline": cover strip + headline-test matches
+python3 diag_6k_docs.py CIK YYYY-MM-DD                    # every 6-K a company filed that day: files, text length, financial terms, first 400 chars
 python3 diag_etf_shares.py [TICKER ...]                   # which source gives ETF share counts
 python3 diag_lag.py TICKER [TICKER ...]                   # is SEC's API behind the filings? (submissions vs companyfacts vs frames vs R pages)
 python3 diag_rpage.py CIK ACCESSION                       # parse one filing's income-statement R page the way get_sec_earnings does
@@ -998,6 +1000,13 @@ Jupiter call.
     name; only XBRL `R*.htm` pages and indexes are excluded); a "strong"
     results headline is required. The earlier weak fallback (it returned BHP's cover page)
     was removed, so **BHP stays on web search**.
+  - **Headline window (Nov 7, 2026):** the "strong headline" words are searched
+    in the first 1,500 characters of the stripped text; the annual-report /
+    sustainability / climate / 20-F blockers still look at the first 600. Novo's
+    Q3 6-K has a long investor-relations header, so "Financial report for the
+    period..." starts at offset 587 and ends at 603, three characters past the old
+    600-character window; NVO stayed on its August record for a week. The
+    `SKIPPED_NEWER` line now shows the first 100 characters of a rejected text.
   - `call_tool` forces `r.encoding = "utf-8"` (requests guessed Latin-1
     for the SSE stream and produced mojibake).
   - Staleness (`earnings_is_current`) is keyed on `call_date`, not
@@ -2408,6 +2417,23 @@ were confirmed against real output; the rest were tested with mocks.
   summary line shows `= Unchanged`. `--force` / named tickers still rewrite.
 - ✅ **`diag_xbrl.py` could only show a fixed concept list** — `--scan`,
   `+Concept`.
+
+### Resolved Issues (November 7, 2026)
+
+- ✅ **NVO's Q3 6-K rejected as "no results headline"** (Novo filed Nov 4;
+  Nova kept the Aug 4 record) — the results words sat just past the 600-char
+  headline window (see 6-K details above). Fixed in `mcp/app3.py`; NVO now returns
+  FILING_DATE 2026-11-04 and Nova synthesized it. The first explanation (the
+  cover strip cutting too deep) was wrong: the strip was correct. `diag_strip6k.py`
+  showed the real offset.
+- ✅ **Other foreign filers reviewed** — AEM (Nov 2) and VALE (Oct 30) current;
+  RIO (H1, Jul 29) and Barrick (Q2, Aug 11) correct for their cadence (Barrick's Q3
+  is due around Nov 10-12); BHP files no results 6-K (the Aug 19 6-K is the Annual
+  Report) so it stays on web search, whose record (FY26, call date 2026-08-18)
+  is current. "No data" for BHP between its Feb and Aug reports is expected.
+- ℹ️ `hermes update` to v0.23.0 and the `platform 'cli'` warning: harmless.
+  `diag_strip6k.py` hit a pre-3.12 f-string error on the Jetson; f-string
+  expressions must not contain backslashes or the enclosing quote character.
 
 ### Resolved Issues (November 3, 2026 — Jansky's 10/31 review)
 
