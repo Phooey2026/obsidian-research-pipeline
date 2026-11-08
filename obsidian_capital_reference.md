@@ -948,7 +948,13 @@ Jupiter call.
 - Reads latest research JSON, finds tickers with `needs_research: true`
   (from Jupiter's `NOVA_FLAG_DATA` in each ticker's summary)
 - Skips tickers with current Nova legal records (within 90 days)
-- Runs 5-tool legal pipeline per ticker: deep_sec, news, court, sec_enforce, doj
+- Runs a 6-tool legal pipeline per ticker: **web_item3** (webmcp's `get_legal_proceedings`,
+  Nov 7 2026 — Jupiter's extractor, which follows Item 3 to the note / MD&A section it points
+  at), deep_sec (novamcp's separate `get_legal_proceedings_deep`), news, court, sec_enforce,
+  doj. When web_item3 extracted text, Nova's synthesis reads it first (up to 7,000 chars),
+  then up to 3,000 chars of the deep text; if webmcp errors or says "could not be extracted"
+  the deep text is used alone. The synthesis window is 11,000 chars (was 8,000).
+  The deep extractor returned only the Item 3 stub for LSTR and ran into Items 4-5 for DLR.
 - Calls `nova -z prompt` for synthesis
 - Saves to `nova_supplemental.json` with risk_level and research_confidence
 - **Confirmed genuinely flag-driven, not blanket-researching everyone**
@@ -969,7 +975,12 @@ Jupiter call.
   `nova_legal_summary` field gets injected via `_build_nova_preamble()`),
   so this is data-hygiene severity, not correctness-critical — but worth
   the same `r.content.decode('utf-8', ...)` fix eventually.
-- Usage: `python3 nova_legal.py` or `python3 nova_legal.py HUBG CHRW`
+- Usage: `python3 nova_legal.py` or `python3 nova_legal.py HUBG CHRW`; named tickers whose
+  record is current are still skipped — add **`--force`** to redo them (e.g. after an extractor
+  fix): `python3 nova_legal.py --force PNW JBHT ...`. Nov 7 2026 redo of 14 tickers
+  (PNW JBHT LSTR GXO CB CI GE DE COP EOG TXRH WELL DLR CBRE) followed by
+  `python3 repair_summaries.py --refetch` for the same list; use `--refetch`, not the
+  summary-only command Nova prints, so the research data's own 10-K legal text is replaced too.
 
 **`nova_earnings_call.py`**
 - Researches earnings calls for stale/pending tickers (85-day window, `--stale-only`)
@@ -1504,7 +1515,7 @@ blocked except for the company's own site.
   capital must match a capital (DE: 'Antitrust Matters' matched a lowercase list at the
   end of a note and beat the real Item 3). Note: `nova_legal.py`'s `deep_sec` step uses
   a separate extractor, `get_legal_proceedings_deep` in `app3.py`, which does *not* have
-  these fixes.
+  these fixes; `nova_legal.py` therefore reads this extractor first (see below).
 
 **`mcp/app.py` (webmcp) — `get_sec_earnings()` fixes (Sept 22, 2026):**
 - **Annual-revenue tag fallback bug fixed (BALL, DUK)** — `get_annual()`

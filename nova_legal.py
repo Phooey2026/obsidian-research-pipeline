@@ -14,6 +14,8 @@ Usage:
     python3 nova_legal.py                  # auto-detects latest research JSON
     python3 nova_legal.py TICKER [TICKER]  # research specific tickers only
     python3 nova_legal.py --json path.json # use a specific research JSON file
+    python3 nova_legal.py --force TICKER [TICKER]  # redo even if the Nova record is current
+                                                  # (after an extractor fix, Nov 7 2026)
 
 Run manually after weekly_research.py completes.
 """
@@ -31,6 +33,7 @@ import requests
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 NOVAMCP_URL   = "http://localhost:8644/mcp"
+WEBMCP_URL    = "http://localhost:8642/mcp"   # webmcp: get_legal_proceedings (Jupiter's extractor)
 BASE_DIR      = "/home/jay/stock_dashboard"
 DATA_DIR      = f"{BASE_DIR}/data"
 NOVA_JSON     = f"{BASE_DIR}/nova_supplemental.json"
@@ -258,7 +261,7 @@ Here is the research data gathered:
 ═══════════════════════════════════════════
 SEC 10-K DEEP EXTRACTION
 ═══════════════════════════════════════════
-{deep_result[:8000]}
+{deep_result[:11000]}
 
 ═══════════════════════════════════════════
 WEB / NEWS SEARCH RESULTS
@@ -368,7 +371,13 @@ def research_legal(ticker: str, company_name: str,
 
     # ── Tool calls ─────────────────────────────────────────────────────────
     results = {}
+    # Nov 7 2026: webmcp's get_legal_proceedings follows Item 3 to the note or MD&A section
+    # it points at (it was fixed for ~11 tickers that day); novamcp's deep extractor returned
+    # only the Item 3 stub for LSTR and ran on into Items 4-5 for DLR. Read the webmcp text
+    # first and give Nova both.
     tools = [
+        ("web_item3",   "get_legal_proceedings",
+                        {"ticker": ticker}),
         ("deep_sec",    "get_legal_proceedings_deep",
                         {"ticker": ticker}),
         ("news",        "search_legal_news",
@@ -389,7 +398,8 @@ def research_legal(ticker: str, company_name: str,
         data = None
         for outer in range(MAX_OUTER + 1):
             try:
-                data = call_tool(tool, args)
+                data = call_tool(tool, args,
+                                 mcp_url=WEBMCP_URL if key == "web_item3" else NOVAMCP_URL)
                 break
             except _RetryableError as e:
                 if outer < MAX_OUTER:
@@ -404,6 +414,17 @@ def research_legal(ticker: str, company_name: str,
         status = "✓" if not data.startswith("ERROR") else "✗"
         print(f"{status} ({len(data):,} chars)")
         time.sleep(3.0)     # be polite to external APIs / DDG rate limits
+
+    # Primary 10-K text from webmcp when it extracted something; novamcp's deep text after it.
+    _web = results.get("web_item3", "")
+    _deep = results.get("deep_sec", "")
+    if (_web and not _web.startswith(("ERROR", "Error", "No 10-K", "Could not"))
+            and "could not be extracted" not in _web[:500]):
+        results["deep_sec"] = (
+            "PRIMARY 10-K EXTRACTION (webmcp get_legal_proceedings; starts at Item 3 or the "
+            "note / MD&A section it points to):\n" + _web[:7000] +
+            "\n\n---- SECONDARY EXTRACTION (novamcp deep; may include unrelated text) ----\n" +
+            _deep[:3000])
 
     # ── LLM synthesis ──────────────────────────────────────────────────────
     print(f"    [synthesis] asking Nova...", end=" ", flush=True)
@@ -469,6 +490,8 @@ def main():
             research_json_path = args[idx + 1]
             args = [a for i, a in enumerate(args)
                     if i != idx and i != idx + 1]
+
+    force = "--force" in args
 
     # Remaining args treated as explicit tickers
     explicit_tickers = [t.upper() for t in args if not t.startswith("--")]
@@ -569,7 +592,7 @@ def main():
     skipped:     list[str]   = []
 
     for ticker, name, flag_type, flag_detail in flagged:
-        if is_current(nova_data, ticker):
+        if is_current(nova_data, ticker) and not force:
             skipped.append(ticker)
         else:
             to_research.append((ticker, name, flag_type, flag_detail))
