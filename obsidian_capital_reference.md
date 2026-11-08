@@ -1482,6 +1482,29 @@ blocked except for the company's own site.
   (live: FSLR, CBRE, DUK, XOM, LMT, IP, JPM.) Lesson: every fix here was first
   guessed from mocks and got a layout wrong — read a trace before changing
   anchors.
+  **Nov 7, 2026 additions** (found from `debug=true` traces on 14 tickers Jupiter
+  flagged; all live): (1) **C0b** — a short Item 3 (100-600 chars) that is a
+  complete statement, not a pointer, is returned as is (DLR 282 chars, JBHT 388;
+  both used to be dropped by the 400-char floor and then rejected by the Item 4
+  guard). (2) **C0c** — an Item 3 with its own text that also points at a note
+  that can't be found is returned with a "note could not be located" marker
+  (before the last-resort strategy D, which had returned Item 2 text for EOG).
+  (3) C0 skips cross-reference *index rows* ("Item 3. Legal Proceedings 70-71 Item 4"
+  — GE) and prose references ("see Item 3 Legal Proceedings"); GE's text now comes
+  from the Note "LEGAL MATTERS" strategy. (4) **C1** now also follows bare
+  "N. Title" and "(N) Title" note headings (EOG "8.", TXRH "(13)"); the title must
+  *start* with Commitments/Contingen*/Litigation/Legal; titles ending "...to the
+  Consolidated Financial Statements" (prose references) and index rows with page
+  numbers (GXO "Note 18 - Commitments and Contingencies 73 33 Report of...") are skipped.
+  (5) The text is re-started at a named subsection: the stub says "Note 14 j)" (CB →
+  "j) Legal proceedings") or quotes a title ("Legal and Regulatory Matters", CI;
+  "Contingencies", EOG). (6) **C1b** — Item 3 points at a *named MD&A section*
+  ("See Item 7 ... Legal Proceedings", LSTR): the heading that opens a sentence is used
+  and the text ends at the next MD&A heading. (7) Strategy A anchors written with a
+  capital must match a capital (DE: 'Antitrust Matters' matched a lowercase list at the
+  end of a note and beat the real Item 3). Note: `nova_legal.py`'s `deep_sec` step uses
+  a separate extractor, `get_legal_proceedings_deep` in `app3.py`, which does *not* have
+  these fixes.
 
 **`mcp/app.py` (webmcp) — `get_sec_earnings()` fixes (Sept 22, 2026):**
 - **Annual-revenue tag fallback bug fixed (BALL, DUK)** — `get_annual()`
@@ -2431,6 +2454,11 @@ were confirmed against real output; the rest were tested with mocks.
   is due around Nov 10-12); BHP files no results 6-K (the Aug 19 6-K is the Annual
   Report) so it stays on web search, whose record (FY26, call date 2026-08-18)
   is current. "No data" for BHP between its Feb and Aug reports is expected.
+- ✅ **Legal-proceedings extraction wrong or empty for ~10% of the watchlist** (DLR,
+  JBHT, EOG, GE, DE, GXO, TXRH, CB, CI, PNW, LSTR flagged by Jupiter) — see the Nov 7
+  additions under `get_legal_proceedings` above. COP, WELL and CBRE were already right.
+  Next week's Jupiter run gets the better text; this week's summaries were written from
+  the old extractions.
 - ℹ️ `hermes update` to v0.23.0 and the `platform 'cli'` warning: harmless.
   `diag_strip6k.py` hit a pre-3.12 f-string error on the Jetson; f-string
   expressions must not contain backslashes or the enclosing quote character.

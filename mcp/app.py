@@ -2837,6 +2837,13 @@ def get_legal_proceedings(ticker: str, debug: bool = False) -> str:
             for phrase in anchor_phrases:
                 pos = clean.lower().find(phrase.lower(), threshold)
                 if pos != -1:
+                    # Nov 7 2026: DE's note ends with a running list "...antitrust matters
+                    # (including class action litigation) product liability...". The
+                    # capitalised anchor 'Antitrust Matters' matched that lowercase mid-list
+                    # text and won over DE's real Item 3 (FTC action). An anchor written with a
+                    # capital must match a capital.
+                    if phrase[0].isupper() and not clean[pos].isupper():
+                        continue
                     candidate = extract_from(pos, 25000)
                     if len(candidate) > 500:
                         legal_text = candidate
@@ -2862,6 +2869,18 @@ def get_legal_proceedings(ticker: str, debug: bool = False) -> str:
                 after = clean[m.end():m.end() + 60]
                 if re.match(r'\W{0,3}(for|of|in|and|to|under|above|below|included|contained|set|see|refer)\b', after):
                     continue        # prose reference, not the heading
+                # Nov 7 2026: GE's 10-K ends with a "Form 10-K cross-reference index"
+                # whose row reads "Item 3. Legal Proceedings 70-71 Item 4. Mine Safety..."
+                # (page numbers, no text). It was taken for the real section and ran
+                # through the signatures. Skip index rows.
+                if re.search(r'(?i)(?:\bsee|\bin|\bunder|\bto|\balso|\band|\bwith|\bof|\bat)\W{0,3}$',
+                             clean[max(0, m.start() - 14):m.start()]):
+                    _tr(m.start(), 'skipped: prose reference to Item 3', 0)
+                    continue
+                if re.match(r'(?i)item\s+3[\.\s]+legal\s+proceedings\s+(?:pages?\s+)?'
+                            r'[\d\s,\-\u2013\u2014]{1,25}item\s+4', clean[m.start():m.start() + 120]):
+                    _tr(m.start(), 'skipped: cross-reference index row', 0)
+                    continue
                 cand = extract_from(m.start(), 25000, item3=True)
                 head = cand[:300].lower()
                 # Short sections (400-1,500 chars) count only if they carry their own
@@ -2872,8 +2891,45 @@ def get_legal_proceedings(ticker: str, debug: bool = False) -> str:
                         and (len(cand) > 1500 or not _ptr)):
                     legal_text = cand
                     break
-                if cand and len(cand) <= 600:
+                # Nov 7 2026: keep every genuine Item 3 that was not accepted above. Short
+                # ones (<= 600) are pointers or one-paragraph statements; a pointer that also
+                # carries its own text (EOG: 1,143 chars) is kept up to 2,000.
+                if cand and (len(cand) <= 600 or (_ptr and len(cand) <= 2000)):
                     _stubs.append(cand)
+
+        def _xref_title(t):
+            # "Commitments and Contingencies to the Consolidated Financial Statements" is a
+            # cross-reference inside prose (GXO: inside the guaranteed-securities text),
+            # never the heading of the note itself.
+            return bool(re.search(r'(?i)\b(to|in|of|within)\s+the\s+(consolidated|notes?)\b', t[:110]))
+
+        def _index_row(t):
+            # Financial-statement index: "Note 18 - Commitments and Contingencies 73 33 Report
+            # of Independent Registered Public Accounting Firm" (GXO, Nov 7 2026): the title is
+            # followed by page numbers, not by the note's text. Only one "Note N" sits in
+            # the row, so the several-notes-in-a-row contents test did not catch it.
+            return bool(re.search(r'(?i)(?:commitments|contingenc|litigation|legal)[^.\d]{0,45}\s\d{1,3}\s+\d{1,3}\b', t[:110]))
+
+        def _focus(cand, stub):
+            # The stub may name a lettered subsection ("Note 14 j)": CB) or quote a
+            # subsection title ("Legal and Regulatory Matters" in Note 22: CI). Start the
+            # text there when it exists inside the note, so the window is not spent on
+            # derivatives or guarantees first.
+            best = None
+            ml = re.search(r'(?i)\bNote\s+\d{1,2}\s+\(?([a-z])\)', stub)
+            if ml:
+                mm = re.search(r'(?<![\w])%s\)\s+[A-Z]' % ml.group(1), cand[200:])
+                if mm:
+                    best = 200 + mm.start()
+            if best is None:
+                q = re.search(r'["\u201c]([^"\u201d]{8,60})["\u201d]', stub)
+                if q:
+                    i = cand.lower().find(q.group(1).lower(), 100)
+                    if i != -1:
+                        best = i
+            if best is not None and len(cand) - best >= 500:
+                return cand[best:]
+            return cand
 
         # Strategy C1: Item 3 is only a stub that points at a numbered note (XOM: "Refer
         # to the relevant portions of Note 7 ... for additional information on legal
@@ -2889,16 +2945,93 @@ def get_legal_proceedings(ticker: str, debug: bool = False) -> str:
                         title = clean[m.end():m.end() + 80]
                         if not re.search(r'(?i)litigation|legal|contingenc|commitment|proceeding', title):
                             continue
+                        if _xref_title(clean[m.end():m.end() + 120]) or _index_row(clean[m.end():m.end() + 120]):
+                            continue
                         # table-of-contents / index entries list several notes in a row
                         if len(re.findall(r'\bNote\s+\d+', clean[m.start():m.start() + 600])) >= 3:
                             continue
                         cand = extract_from(m.start(), 25000, stop_re=stop)
                         if len(cand) > 500:
-                            legal_text = cand
+                            legal_text = _focus(cand, stub)
                             break
                     if legal_text:
                         break
+                # Nov 7 2026: many filers number their notes without the word "Note"
+                # (EOG: "8. Commitments and Contingencies", FSLR "14. ..."), so the pass
+                # above never finds them. Same idea, bare "N. Title" headings; skip
+                # "Item N." and contents rows (the next heading follows within 250 chars).
+                if not legal_text:
+                    for num in list(dict.fromkeys(re.findall(r'(?i)\bNote\s+(\d{1,2})\b', stub)))[:3]:
+                        n_i = int(num)
+                        bare_re = re.compile(r'(?<![\w.$,])(?:%d\.|\(%d\))\s+(?=[A-Z])' % (n_i, n_i))
+                        stop = r'(?<![\w.$,])(?:%d\.|\(%d\))\s+[A-Z]' % (n_i + 1, n_i + 1)
+                        for m in list(bare_re.finditer(clean, int(doc_len * 0.30)))[:40]:
+                            if clean[max(0, m.start() - 6):m.start()].lower().endswith(
+                                    ('item ', 'note ', 'otes ', ' and ', ' see ')):
+                                continue        # "Item 8." / "See Note 14. Commitments..." prose
+                            # Nov 7 2026: the title must START with a heading word. PNW's
+                            # "14. Purchase obligations may include commitments..." passed the
+                            # looser keyword test and returned a commitments footnote.
+                            if not re.match(r'(?i)\W{0,3}(commitments?|contingenc|contingent|litigation|legal)',
+                                            clean[m.end():m.end() + 80]):
+                                continue
+                            if _xref_title(clean[m.end():m.end() + 120]) or _index_row(clean[m.end():m.end() + 120]):
+                                continue
+                            if re.search(stop, clean[m.end():m.end() + 250]):
+                                continue
+                            cand = extract_from(m.start(), 25000, stop_re=stop)
+                            if len(cand) > 500:
+                                # a stub that carries its own text (EOG's environmental-
+                                # proceedings statement) is kept in front of the note
+                                cand = _focus(cand, stub)
+                                legal_text = (stub + " " + cand) if len(stub) > 600 else cand
+                                break
+                        if legal_text:
+                            break
                 if legal_text:
+                    break
+
+        # Strategy C1b (Nov 7 2026): Item 3 points at a NAMED section of the MD&A instead of a
+        # note (LSTR: "See Item 7, Management's Discussion and Analysis ... Legal Proceedings").
+        # There is no note number to follow. The section is a heading that opens a sentence,
+        # unlike the cross-references that name it in running text ("...Operations Legal
+        # Proceedings." / "... Operations - Legal Proceedings ."), and unlike "Item 3. Legal
+        # Proceedings" itself. It ends at the next MD&A heading.
+        if not legal_text and _stubs:
+            _ext["s"] = "C1b"
+            _mda_stop = (r'(?i)\b(Item\s+7A|Quantitative and Qualitative Disclosures|Off[- ]Balance|'
+                         r'Critical Accounting|Recent Accounting|Contractual Obligations|'
+                         r'Seasonality|Item\s+8\b)')
+            for stub in _stubs:
+                if not re.search(r'(?i)\bitem\s+7\b', stub):
+                    continue
+                for m in list(re.finditer(r'(?:Legal Proceedings|Litigation|Legal Matters)\s+(?=[A-Z])',
+                                          clean[int(doc_len * 0.30):]))[:40]:
+                    pos = int(doc_len * 0.30) + m.start()
+                    before = clean[max(0, pos - 12):pos]
+                    if not re.search(r'[\.\)]\s$', before) or re.search(r'(?i)item\s+\d+[a-c]?\.\s$', before):
+                        continue
+                    cand = extract_from(pos, 25000, stop_re=_mda_stop)
+                    if len(cand) > 500:
+                        legal_text = cand
+                        break
+                if legal_text:
+                    break
+
+        # Strategy C0b (Nov 7 2026): a short Item 3 that is a complete statement and not a
+        # pointer. DLR's is 282 characters ("...we were not a party to any material legal
+        # proceedings...") and JBHT's 388; the 400-character floor above dropped both, the
+        # wider strategies then rejected their windows (Item 4 right after), and DLR fell
+        # through to a risk-factor paragraph (strategy D) while JBHT returned nothing. The
+        # section really is that short, so return it as is.
+        if not legal_text and _stubs:
+            _ext["s"] = "C0b"
+            for stub in _stubs:
+                if (len(stub) >= 100 and len(stub) <= 600 and
+                        not re.search(r'(?i)\bnotes?\s+\d|incorporated|\b(see|refer)\b', stub)):
+                    legal_text = stub
+                    _ext["capped"] = False
+                    _tr(0, 'accepted: short complete Item 3', len(stub))
                     break
 
         if not legal_text:
@@ -2991,6 +3124,21 @@ def get_legal_proceedings(ticker: str, debug: bool = False) -> str:
                         break
                 if legal_text:
                     break
+
+        # Strategy C0c (Nov 7 2026): an Item 3 that carries its own text but also points at a
+        # note which could not be located (EOG: 1,143 characters, "see ... Note 8", then its
+        # environmental-proceedings paragraph). Strategy D picked a "Properties" paragraph
+        # for EOG, so use the real Item 3 instead and say the note is missing. Tiny
+        # pointer-only stubs (<= 600) still go to D as before.
+        if not legal_text and _stubs:
+            _long = [x for x in _stubs if len(x) > 600]
+            if _long:
+                _ext["s"] = "C0c"
+                legal_text = (max(_long, key=len) +
+                              " [Item 3 refers to a financial-statement note whose text could "
+                              "not be located; the note's matters are not included here.]")
+                _ext["capped"] = False
+                _tr(0, 'accepted: Item 3 with own text, note not located', len(legal_text))
 
         # Strategy D: Last resort — broad litigation keywords.
         # Also catches genuinely minimal disclosures (e.g. AMD) by using
