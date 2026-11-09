@@ -261,10 +261,32 @@ def _check_stale_language(summary: str) -> list[str]:
         r"(?:nova|earnings|legal|data|news|call|transcript)\s+records?|records?\s+(?:is|are|was|were)\s+\w*\s*(?:old|stale|outdated))\b",
         re.IGNORECASE)
     EXCLUSION_CONTEXT = [
-        "not used", "discarded", "discard", "pre-dates", "predates",
+        "not used", "discarded", "discard", "pre-dates", "predates", "predating", "predated",
         "ignored", "superseded", "excluded", "per protocol",
         "historical only", "for context only",
+        # Nov 9 2026: PLD/DLR wrote "SEC XBRL API stale ... Q3 figures hand-read from the filing
+        # R-pages". That is Jupiter reporting a gap it already recovered from, not Nova data it
+        # had to discard, so it must not raise a flag.
+        "r-page", "hand-read", "read from the filing",
     ]
+    # Nov 9 2026 false positives (found with diag_stale.py on the Nov 7 summaries):
+    #   MTB, COP: "penalty history ... is historical, not current"   (a legal-history remark)
+    #   CHRW:     "street targets are stale vs. price"                (analyst targets, not Nova)
+    #   LNG:      "docket dominated by stale employment ... matters"  (old court cases)
+    # Judge the words right next to the hit, not just the 120-char window, because the window
+    # almost always contains a data-quality word (10-K, filing, records ...).
+    ANALYTIC_BEFORE = re.compile(
+        r"(?:targets?|consensus|estimates?|multiples?|valuation|street|forecasts?)\W+(?:\w+\W+){0,2}$"
+        r"|(?:technical|bullish|bearish|moving average)\W+(?:\w+\W+){0,5}$")
+    ANALYTIC_AFTER = re.compile(
+        r"^\W*(?:vs\.?|versus|relative to|compared (?:to|with))\b"
+        r"|^\W*as\s+(?:the\s+)?(?:price|stock|shares)\b"
+        r"|^\W*(?:\w+\W+){0,3}?(?:employment|personal-injury|claims?|cases?|matters?|dockets?|lawsuits?|complaints?)\b")
+    # NEE/SO/AEP wrote "SEC XBRL quarterly table is stale (newest API quarter 2026-03-31) ...
+    # recovered manually from filing R2 pages / read from the filings' R pages": the "R-page"
+    # wording varies and often sits more than 120 chars after "stale", so look at the whole bullet.
+    RECOVERED_RE = re.compile(
+        r"\br[\s-]?\d{0,2}[\s-]?pages?\b|hand-read|manually (?:read|recovered)|recovered manually")
     found = []
     lower = summary.lower()
     for phrase in STALE_LANGUAGE:
@@ -276,6 +298,18 @@ def _check_stale_language(summary: str) -> list[str]:
             if not _m:
                 break
             idx = _m.start()
+            _pre = lower[max(0, idx - 40):idx]
+            _post = lower[_m.end():_m.end() + 60]
+            if (ANALYTIC_BEFORE.search(_pre) or ANALYTIC_AFTER.search(_post)
+                    or (phrase_lower == "not current" and re.search(r"historical\W*$", _pre))):
+                idx += len(phrase_lower)
+                continue
+            _ls = lower.rfind("\n", 0, idx) + 1
+            _le = lower.find("\n", idx)
+            _line = lower[_ls:(_le if _le != -1 else len(lower))][:500]
+            if RECOVERED_RE.search(_line):
+                idx += len(phrase_lower)
+                continue
             # Check 120-char window around the phrase for context
             window_start = max(0, idx - 120)
             window_end   = min(len(lower), idx + len(phrase_lower) + 120)

@@ -1126,7 +1126,25 @@ def get_earnings(ticker: str) -> str:
                 except Exception:
                     if hist is not None and hist.empty:
                         hist = None
+            # Nov 9 2026: RIO's table came back with only 2003-2008 quarters and Jupiter had to
+            # call it "stale/dataset quirk". If the newest quarter Yahoo gives is more than ~400
+            # days old, it is not a usable beat/miss history: say so instead of printing it.
+            _stale_hist_note = None
             if hist is not None and not hist.empty:
+                try:
+                    _qd = []
+                    for _hi, _hr in hist.iterrows():
+                        _qv = _hr.get('quarter', _hi)
+                        if hasattr(_qv, 'year') and hasattr(_qv, 'replace'):
+                            _qd.append(_qv.replace(tzinfo=None))
+                    if _qd and (datetime.now() - max(_qd)).days > 400:
+                        _stale_hist_note = max(_qd).strftime('%Y-%m-%d')
+                except Exception:
+                    _stale_hist_note = None
+            if _stale_hist_note:
+                lines.append(f"\nQuarterly EPS: Yahoo returned only old quarters (newest {_stale_hist_note}) "
+                             f"— omitted as unreliable; use the SEC/6-K and Nova earnings data instead.")
+            elif hist is not None and not hist.empty:
                 hist = hist.tail(8)
                 lines.append("\nQuarterly EPS (last 8 quarters):")
                 lines.append(f"  {'Quarter':<12} {'Actual':>8} {'Estimate':>10} {'Surprise':>10} {'Beat?':>6}")
@@ -2851,6 +2869,26 @@ def get_legal_proceedings(ticker: str, debug: bool = False) -> str:
                     f"(CIK {cik}, {company_name}; {len(forms)} filings listed, "
                     f"{len(subs.get('filings', {}).get('files') or [])} older pages, "
                     f"forms seen: {sorted(set(forms))[:12]})")
+
+        # Nov 9 2026: AEM files 40-F annual reports, but its only 20-F is from FY2012, so this
+        # tool extracted a 13-year-old 20-F and Jupiter was handed it as "legal proceedings"
+        # (it called it stale, correctly). A 20-F that is not the filer's newest annual report,
+        # or is more than ~2 years old, describes a different company state: refuse it and say why.
+        if form_type == '20-F':
+            try:
+                _newest = next(((_f, _d) for _f, _d in zip(forms, dates)
+                                if _f in ('10-K', '20-F', '40-F')), None)
+                _age20 = (datetime.now() - datetime.strptime(tenk_date, '%Y-%m-%d')).days
+            except Exception:
+                _newest, _age20 = None, 0
+            if (_newest and _newest[0] == '40-F') or _age20 > 800:
+                _nw = (f"the newest annual report is a {_newest[0]} filed {_newest[1]}"
+                       if _newest and _newest[0] == '40-F' else "no newer annual report was found")
+                return (f"No 10-K/20-F legal-proceedings text for {ticker.upper()} (CIK {cik}, "
+                        f"{company_name}): {_nw}; the only 20-F on file was filed {tenk_date} "
+                        f"({_age20} days ago) and was NOT used because it describes a different period. "
+                        f"A 40-F carries legal proceedings in its Annual Information Form exhibit, "
+                        f"which this tool does not parse; rely on Nova's web research for current legal exposure.")
 
         # Step 3: Get filing index — find main HTM document.
         # Exclude XBRL inline viewer files (R1.htm … R999.htm) which are
