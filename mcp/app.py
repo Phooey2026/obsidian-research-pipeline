@@ -2130,6 +2130,98 @@ def get_stock_news(ticker: str, max_results: int = 5) -> str:
         return (f"=== {sym} News UNAVAILABLE ===\nError fetching news: {str(e)}. "
                 f"Treat news coverage as MISSING this week.")
 
+_FINRA_CACHE = {}   # settlement 'YYYYMMDD' -> (fetched_at, {symbol: row}) ; None rows = not published
+
+
+def _finra_candidate_dates(today=None):
+    """Semi-monthly FINRA short-interest settlement dates (the 15th and the last business day of
+    each month, moved back to a weekday), newest first, each with the two prior weekdays as
+    fallbacks for holiday shifts."""
+    import calendar
+    from datetime import date, timedelta
+    today = today or date.today()
+    out = []
+    y, m = today.year, today.month
+    for _ in range(3):
+        last = date(y, m, calendar.monthrange(y, m)[1])
+        for nominal in (last, date(y, m, 15)):
+            d = nominal
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+            for k in range(3):
+                dd = d - timedelta(days=k)
+                if dd.weekday() < 5 and dd <= today:
+                    out.append(dd)
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    return sorted(set(out), reverse=True)
+
+
+def _finra_parse(text):
+    """Parse a FINRA bi-monthly short-interest file (pipe-delimited, every field quoted) into
+    {symbol: {current, previous, adv, days, settlement}}."""
+    rows = {}
+    lines = text.splitlines()
+    if not lines:
+        return rows
+    hdr = [h.strip().strip('"') for h in lines[0].split('|')]
+    try:
+        ix = {n: hdr.index(n) for n in ('symbolCode', 'currentShortPositionQuantity',
+                                         'previousShortPositionQuantity', 'averageDailyVolumeQuantity',
+                                         'daysToCoverQuantity', 'settlementDate')}
+    except ValueError:
+        return rows
+    for ln in lines[1:]:
+        f = [x.strip().strip('"') for x in ln.split('|')]
+        if len(f) < len(hdr):
+            continue
+        try:
+            cur = float(f[ix['currentShortPositionQuantity']])
+            prev = float(f[ix['previousShortPositionQuantity']] or 0)
+            adv = float(f[ix['averageDailyVolumeQuantity']] or 0)
+            dtc = float(f[ix['daysToCoverQuantity']] or 0)
+        except ValueError:
+            continue
+        sym = f[ix['symbolCode']].upper()
+        old = rows.get(sym)
+        if old is None or cur > old['current']:
+            rows[sym] = {'current': cur, 'previous': prev, 'adv': adv, 'days': dtc,
+                         'settlement': f[ix['settlementDate']]}
+    return rows
+
+
+def _finra_short(ticker, _fetch=None, _today=None):
+    """FINRA's own published short interest for `ticker` from the newest available settlement
+    file (cdn.finra.org/equity/otcmarket/biweekly/shrtYYYYMMDD.csv, public). Nov 9 2026:
+    10 of 128 tickers (NEE BAC C WFC USB CFG ALL BA SPG DLR) had Yahoo short-interest fields
+    that failed plausibility every week; Yahoo's numbers are FINRA-derived, so use the source.
+    Returns the row dict or None."""
+    import time
+    import urllib.request
+
+    def _get(url):
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (obsidian-capital)'})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.read().decode('utf-8', 'replace')
+    fetch = _fetch or _get
+    sym = ticker.upper().replace('-', '.')
+    for d in _finra_candidate_dates(_today):
+        key = d.strftime('%Y%m%d')
+        hit = _FINRA_CACHE.get(key)
+        if hit and time.time() - hit[0] < 12 * 3600:
+            rows = hit[1]
+        else:
+            try:
+                rows = _finra_parse(fetch(f'https://cdn.finra.org/equity/otcmarket/biweekly/shrt{key}.csv'))
+            except Exception:
+                rows = None          # not published (404) or unreachable: try the next older date
+            _FINRA_CACHE[key] = (time.time(), rows)
+        if rows:
+            return rows.get(sym) or rows.get(sym.replace('.', '-'))
+    return None
+
+
 @mcp.tool()
 def get_short_interest(ticker: str) -> str:
     """Fetch current short interest data for a stock.
@@ -2176,6 +2268,7 @@ def get_short_interest(ticker: str) -> str:
             pass
 
         # Calculate month-over-month change
+        chg = None
         mom_change = ""
         if not bad_reason and shares_short and prior_month and prior_month > 0:
             chg = ((shares_short - prior_month) / prior_month) * 100
@@ -2192,11 +2285,39 @@ def get_short_interest(ticker: str) -> str:
             elif prior_ratio is not None and (prior_ratio < 1e-5 or prior_ratio > 1.0):
                 bad_reason = (f"prior-month short figure ({prior_month:,.0f}) is "
                               f"{prior_ratio*100:.5f}% of the float")
-        if not bad_reason and shares_short and prior_month and prior_month > 0:
+        # Nov 9 2026: when Yahoo's numbers are implausible (or absent), use FINRA's published file.
+        prior_label = "Prior Month Short:"
+        mom_label = "prior month"
+        finra_note = None
+        if bad_reason or shares_short is None:
+            try:
+                _f = _finra_short(ticker)
+            except Exception:
+                _f = None
+            _den = float_shares or outstanding
+            if _f and _den and 1e-5 < _f['current'] / _den <= 1.0:
+                finra_note = (f"Yahoo's short-interest fields were unusable"
+                              f"{' (' + bad_reason + ')' if bad_reason else ''}; the figures below are "
+                              f"FINRA's own published short interest, settlement {_f['settlement']}.")
+                shares_short = _f['current']
+                short_ratio = _f['days'] or None
+                short_pct = _f['current'] / _den
+                prior_month = _f['previous'] or None
+                bad_reason = None
+                prior_label = "Prior Settlement:"
+                mom_label = "prior settlement (~2 weeks earlier)"
+                chg = None
+                if prior_month:
+                    chg = (shares_short - prior_month) / prior_month * 100
+                    if chg <= -90 or chg >= 900:
+                        prior_month, chg = None, None
+        if not bad_reason and shares_short and prior_month and prior_month > 0 and chg is not None:
             arrow = "↑" if chg > 0 else "↓"
-            mom_change = f"{arrow} {abs(chg):.1f}% vs prior month"
+            mom_change = f"{arrow} {abs(chg):.1f}% vs {mom_label}"
 
         lines = [f"=== {ticker.upper()} Short Interest ===\n"]
+        if finra_note:
+            lines.append(f"ℹ {finra_note}\n")
         if bad_reason:
             lines.append(
                 f"⚠ DATA QUALITY: Yahoo's short-interest figures failed a "
@@ -2211,7 +2332,7 @@ def get_short_interest(ticker: str) -> str:
                 f"Shares Short:          "
                 f"{fmt(shares_short, ' shares')} {mom_change}")
             lines.append(
-                f"Prior Month Short:     {fmt(prior_month, ' shares')}")
+                f"{prior_label:<23}{fmt(prior_month, ' shares')}")
             lines.append(
                 f"Short % of Float:      "
                 f"{f'{short_pct*100:.2f}%' if short_pct else 'N/A'}")
@@ -2258,7 +2379,8 @@ def get_short_interest(ticker: str) -> str:
                     f"  Days-to-cover of {short_ratio:.1f} is low — "
                     f"shorts can exit quickly.")
 
-        lines.append("\nSource: Yahoo Finance (FINRA-reported, updated twice monthly)")
+        lines.append("\nSource: " + ("FINRA bi-monthly short interest file (Yahoo fields failed checks)"
+                                    if finra_note else "Yahoo Finance (FINRA-reported, updated twice monthly)"))
         return "\n".join(lines)
 
     except Exception as e:

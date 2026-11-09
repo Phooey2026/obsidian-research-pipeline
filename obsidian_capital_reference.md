@@ -2498,6 +2498,27 @@ were confirmed against real output; the rest were tested with mocks.
 - ℹ️ Core CPI (2.57%) still below core PCE (3.12%): likely the known shutdown distortion in
   the Oct/Nov 2025 CPI (October rents carried forward, depressing shelter) rather than a bug;
   it should fade as those months leave the 12-month window. Atlas should treat it as a caveat.
+- ✅ **Yahoo short interest failed plausibility for 10 of 128 tickers every week** (NEE BAC C WFC
+  USB CFG ALL BA SPG DLR: garbage like "697 shares short" or a -100% month-over-month).
+  `get_short_interest` now falls back to FINRA's own published file
+  (`cdn.finra.org/equity/otcmarket/biweekly/shrtYYYYMMDD.csv`, pipe-delimited, quoted fields;
+  semi-monthly settlement dates, newest available tried first, cached 12h) and labels the output
+  "FINRA … settlement <date>". Prior comparison is the previous settlement (~2 weeks), not a
+  month. If FINRA also fails the old "UNAVAILABLE" message remains. Live check Nov 9: BAC 1.29%
+  of float (settlement 2026-10-15), DLR 2.17%, NEE 2.98%. Fixed in `mcp/app.py` (`_finra_short`).
+- ✅ **AEM legal text came from a FY2012 20-F** — AEM files 40-Fs; its only 20-F is from 2013.
+  `get_legal_proceedings` now refuses a 20-F that is not the filer's newest annual report (or is
+  >800 days old) with a "No 10-K/20-F legal-proceedings text …" message, so `nova_legal.py`
+  falls back to its other sources. 40-F AIF exhibits are not parsed (Nova web research covers
+  them). Nova's `get_legal_proceedings_deep` returns "could not be extracted" for AEM (honest).
+- ✅ **Yahoo EPS history for RIO had only 2003-2008 quarters** — `get_earnings` now omits the
+  table with a one-line explanation when the newest quarter is >400 days old.
+- ✅ **jansky_review.py stale-language matcher tuned from real contexts** (`diag_stale.py`
+  shows the text around each hit, every occurrence): suppressed "historical, not current"
+  (MTB, COP), analyst-target talk "street targets are stale vs. price" (CHRW), "stale
+  employment … matters" (LNG), XBRL-stale-but-recovered-from-R-pages notes (NEE, SO, AEP, PLD,
+  DLR), EPD's "partly stale" technical note, and "predating/predated". Remaining legitimate
+  hits after Saturday's pack: RIO (fixed at source above) and AEM (fixed above).
 - ✅ **Nova legal records** re-run with `--force` for RTX, TSLA, FCX, ABBV, IP, JPM, XOM and
   Jupiter summaries refreshed with `repair_summaries.py --refetch`.
 - ℹ️ Barrick Q3 6-K not yet filed as of Nov 9 (latest is Aug 17). Recheck.
