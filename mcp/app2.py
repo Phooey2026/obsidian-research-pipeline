@@ -161,12 +161,83 @@ def _latest(obs_list: list[dict]) -> tuple[Optional[float], str]:
     return None, "N/A"
 
 
+def _obs_points(obs_list: list[dict]):
+    """(datetime, value) pairs for the usable observations, oldest first."""
+    pts = []
+    for o in obs_list:
+        if o.get("value") is None:
+            continue
+        try:
+            pts.append((datetime.strptime(str(o["date"])[:10], "%Y-%m-%d"), o["value"]))
+        except Exception:
+            pass
+    return pts
+
+
 def _pct_change(obs_list: list[dict], periods: int = 1) -> Optional[float]:
-    """Compute pct change between the last and `periods`-ago observation."""
-    vals = [o["value"] for o in obs_list if o["value"] is not None]
-    if len(vals) < periods + 1:
+    """Percent change between the latest observation and the one `periods` periods earlier.
+
+    Nov 9 2026: this used to count OBSERVATIONS (vals[-(periods+1)]), which is wrong whenever
+    the series has a gap. FRED's CPIAUCSL/CPILFESL have no October 2025 value (shutdown), so
+    "12 observations back" from Sep 2026 landed on Aug 2025 (a 13-month change) and CPI YoY ran
+    high. Now the base is found BY DATE from the series' own spacing: monthly -> same month
+    `periods` months earlier; quarterly -> `3*periods` months; weekly -> `7*periods` days
+    (+/-3). If that base date is absent the answer is None (callers print nothing) instead of
+    a wrong number. Daily/irregular series keep the old index behaviour."""
+    pts = _obs_points(obs_list)
+    if len(pts) < periods + 1:
         return None
-    return ((vals[-1] - vals[-(periods + 1)]) / vals[-(periods + 1)]) * 100
+    t0, v0 = pts[-1]
+    gaps = sorted((pts[i][0] - pts[i - 1][0]).days for i in range(max(1, len(pts) - 8), len(pts)))
+    med = gaps[len(gaps) // 2] if gaps else 0
+    base = None
+    if 25 <= med <= 35 or 80 <= med <= 100:
+        step = 1 if med <= 35 else 3
+        want = t0.year * 12 + t0.month - 1 - step * periods
+        for t, v in pts:
+            if t.year * 12 + t.month - 1 == want:
+                base = v
+        if base is None:
+            return None
+    elif 5 <= med <= 9:
+        target = t0 - timedelta(days=7 * periods)
+        near = [(abs((t - target).days), v) for t, v in pts if abs((t - target).days) <= 3]
+        if not near:
+            return None
+        base = min(near)[1]
+    else:
+        base = pts[-(periods + 1)][1]
+    if not base:
+        return None
+    return (v0 - base) / base * 100
+
+
+def _yoy_pairs(obs_list: list[dict], months: int = 12):
+    """[(date, yoy%)] for every monthly observation that has a same-month value `months`
+    earlier. Date-matched, so a missing month (Oct 2025 CPI) drops that row instead of
+    shifting every later row by one month."""
+    pts = _obs_points(obs_list)
+    idx = {t.year * 12 + t.month - 1: v for t, v in pts}
+    out = []
+    for t, v in pts:
+        b = idx.get(t.year * 12 + t.month - 1 - months)
+        if b:
+            out.append((t.strftime("%Y-%m-%d"), (v - b) / b * 100))
+    return out
+
+
+def _change_over_days(obs_list: list[dict], days: int):
+    """Percent change from the newest observation at least `days` calendar days older than the
+    latest, plus that base date: (None, None) if there is no usable base. For DAILY series
+    (the old vals[-5] / vals[-21] counted observations, not weeks)."""
+    pts = _obs_points(obs_list)
+    if len(pts) < 2:
+        return None, None
+    t0, v0 = pts[-1]
+    base = [p for p in pts if (t0 - p[0]).days >= days]
+    if not base or not base[-1][1]:
+        return None, None
+    return (v0 - base[-1][1]) / base[-1][1] * 100, base[-1][0].strftime("%Y-%m-%d")
 
 
 # ============================================================================
@@ -346,12 +417,8 @@ async def get_cpi_data() -> str:
 
         # 12-month headline CPI history
         lines.append("\nHeadline CPI YoY trend (last 12 months):")
-        vals = [o for o in cpi if o["value"] is not None]
-        for i in range(max(0, len(vals) - 12), len(vals)):
-            if i >= 12:
-                obs = vals[i]
-                yoy_i = ((obs["value"] - vals[i-12]["value"]) / vals[i-12]["value"]) * 100
-                lines.append(f"  {obs['date']}  {yoy_i:+.2f}%")
+        for _d, _y in _yoy_pairs(cpi)[-12:]:
+            lines.append(f"  {_d}  {_y:+.2f}%")
 
         lines.append("\nFed target: 2.0% YoY PCE (CPI typically runs ~30-50 bps higher)")
         lines.append("Source: FRED — Bureau of Labor Statistics via FRED")
@@ -396,13 +463,10 @@ async def get_pce_data() -> str:
 
         # Trend
         lines.append("\nCore PCE YoY trend (last 12 months):")
-        vals = [o for o in core if o["value"] is not None]
-        for i in range(max(0, len(vals) - 12), len(vals)):
-            if i >= 12:
-                obs = vals[i]
-                yoy_i = ((obs["value"] - vals[i-12]["value"]) / vals[i-12]["value"]) * 100
-                marker = " ← latest" if i == len(vals) - 1 else ""
-                lines.append(f"  {obs['date']}  {yoy_i:+.2f}%{marker}")
+        _pairs = _yoy_pairs(core)[-12:]
+        for _k, (_d, _y) in enumerate(_pairs):
+            marker = " ← latest" if _k == len(_pairs) - 1 else ""
+            lines.append(f"  {_d}  {_y:+.2f}%{marker}")
 
         lines.append("\nSource: FRED — Bureau of Economic Analysis via FRED")
     except Exception as e:
@@ -935,9 +999,11 @@ async def get_fed_policy_data() -> str:
 
     try:
         # Fed Balance Sheet (total assets — weekly)
-        balance_sheet = await _fred_series("WALCL", limit=12)
+        balance_sheet = await _fred_series("WALCL", limit=60)
         bval, bdate = _latest(balance_sheet)
-        bchg = _pct_change(balance_sheet, 12)
+        # Nov 9 2026: was _pct_change(.., 12) on only 12 weekly rows (needs 13), so this
+        # "52-week change" line never printed. True 52 weeks = 364 calendar days.
+        bchg, _bbase = _change_over_days(balance_sheet, 364)
         if bval:
             lines.append(f"Fed Balance Sheet:         ${bval/1e6:.2f}T  [{bdate}]")
             if bchg is not None:
@@ -1085,9 +1151,8 @@ async def get_macro_snapshot() -> str:
                 # Compute YoY for index-level series
                 try:
                     obs = await _fred_series(sid, limit=24, frequency="m")
-                    vals = [o["value"] for o in obs if o["value"] is not None]
-                    if len(vals) >= 13:
-                        yoy = ((vals[-1] - vals[-13]) / vals[-13]) * 100
+                    yoy = _pct_change(obs, 12)
+                    if yoy is not None:
                         lines.append(f"  {label:<28} {yoy:+.2f}%  [{date}]")
                         continue
                 except Exception:
@@ -1171,27 +1236,22 @@ async def build_macro_backdrop() -> str:
     spread_2_10 = ((dgs10 - dgs2) * 100) if dgs10 and dgs2 else None
     spread_3m_10 = ((dgs10 - dgs3m) * 100) if dgs10 and dgs3m else None
 
-    pce_yoy = None
-    pce_vals = [o["value"] for o in pce_obs if o["value"] is not None]
-    if len(pce_vals) >= 13:
-        pce_yoy = ((pce_vals[-1] - pce_vals[-13]) / pce_vals[-13]) * 100
+    # Nov 9 2026: date-matched (see _pct_change): CPI has no Oct 2025 value, so index-based
+    # "12 back" was a 13-month change.
+    pce_yoy = _pct_change(pce_obs, 12)
+    cpi_yoy = _pct_change(cpi_obs, 12)
+    hcpi_yoy = _pct_change(hcpi_obs, 12)
 
-    cpi_yoy = None
-    cpi_vals = [o["value"] for o in cpi_obs if o["value"] is not None]
-    if len(cpi_vals) >= 13:
-        cpi_yoy = ((cpi_vals[-1] - cpi_vals[-13]) / cpi_vals[-13]) * 100
-
-    hcpi_yoy = None
-    hcpi_vals = [o["value"] for o in hcpi_obs if o["value"] is not None]
-    if len(hcpi_vals) >= 13:
-        hcpi_yoy = ((hcpi_vals[-1] - hcpi_vals[-13]) / hcpi_vals[-13]) * 100
-
+    # Nov 9 2026: 4-week oil change is now 28 calendar days, and both series are cut at their
+    # COMMON latest date. Atlas printed Brent -14.7% vs WTI +3.5% because index counting over
+    # two daily series with different holiday gaps / latest dates compared different windows.
+    _end = min([t for t, _ in _obs_points(wti_obs)][-1:] + [t for t, _ in _obs_points(brent_obs)][-1:]) \
+        if (_obs_points(wti_obs) and _obs_points(brent_obs)) else None
     def _chg_4w(obs):
-        """% change over ~20 trading days from a daily FRED series."""
-        v = [o["value"] for o in obs if o["value"] is not None]
-        if len(v) >= 21 and v[-21]:
-            return ((v[-1] - v[-21]) / v[-21]) * 100
-        return None
+        if _end is None:
+            return None
+        cut = [o for o in obs if o["value"] is not None and str(o["date"])[:10] <= _end.strftime("%Y-%m-%d")]
+        return _change_over_days(cut, 28)[0]
     wti_4w, brent_4w = _chg_4w(wti_obs), _chg_4w(brent_obs)
     brent_wti_spread = (brent_val - wti_val) if (brent_val and wti_val) else None
 

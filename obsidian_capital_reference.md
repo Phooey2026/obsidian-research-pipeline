@@ -2477,6 +2477,27 @@ were confirmed against real output; the rest were tested with mocks.
   latest cash and long-term debt instant from 10-Q/10-K; FCF = last fiscal year operating
   cash flow minus capex, labeled "SEC XBRL FY ending …". EV multiples and Current Ratio
   are not filled. Banks stay N/A by design. The six non-banks were refetched.
+- ✅ **Foreign filers (AEM, VALE, RIO) showed "No quarterly EPS data found"** — they file
+  20-F/40-F + 6-K and have no 10-Q, so SEC XBRL has no quarterly series. `get_sec_earnings`
+  now says so and points to `get_sec_earnings_release` (novamcp). Fixed in `mcp/app.py`.
+- ✅ **Dollar index "4-week/13-week change" were 4/13 trading days** — `DTWEXBGS` is a daily
+  series and the code used `vals[-5]`/`vals[-14]`. Now real 28/91 calendar days with the base
+  date printed; fed `get_forex_rates` and the backdrop YAML (`dollar_index.stance`,
+  `dxy_4week_change_pct`). Fixed in `mcp/app4.py`.
+- ✅ **FRED index-counting bugs (class fix)** — `_pct_change` in `mcp/app2.py` and `mcp/app4.py`
+  counted observations, wrong for any series with a gap. FRED has NO Oct 2025 CPI value
+  (shutdown), so "12 back" from Sep 2026 was a 13-month change (CPI YoY overstated ~0.2-0.3
+  pts; core CPI 2.79% -> 2.57%, headline now 3.72%). `_pct_change` now finds its base by date
+  (monthly = same month, quarterly = 3×periods months, weekly = 7×periods days ±3) and returns
+  None if that base month is absent (so the Oct 2026 CPI YoY, due mid-November, will print
+  nothing because Oct 2025 does not exist). Also fixed: CPI/PCE YoY trend lists
+  (`_yoy_pairs`), the Fed balance-sheet "52-week change" (asked for 13 rows, fetched 12, never
+  printed), Atlas WTI/Brent 4-week change (28 calendar days, both cut at the common latest
+  date), and the BDI FRED fallback 4-week change. Expect CPI YoY and oil 4w numbers in the
+  next Atlas run to differ from last week's.
+- ℹ️ Core CPI (2.57%) still below core PCE (3.12%): likely the known shutdown distortion in
+  the Oct/Nov 2025 CPI (October rents carried forward, depressing shelter) rather than a bug;
+  it should fade as those months leave the 12-month window. Atlas should treat it as a caveat.
 - ✅ **Nova legal records** re-run with `--force` for RTX, TSLA, FCX, ABBV, IP, JPM, XOM and
   Jupiter summaries refreshed with `repair_summaries.py --refetch`.
 - ℹ️ Barrick Q3 6-K not yet filed as of Nov 9 (latest is Aug 17). Recheck.

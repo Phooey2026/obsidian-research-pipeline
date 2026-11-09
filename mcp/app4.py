@@ -143,12 +143,83 @@ def _latest(obs_list: list[dict]) -> tuple[Optional[float], str]:
     return None, "N/A"
 
 
+def _obs_points(obs_list: list[dict]):
+    """(datetime, value) pairs for the usable observations, oldest first."""
+    pts = []
+    for o in obs_list:
+        if o.get("value") is None:
+            continue
+        try:
+            pts.append((datetime.strptime(str(o["date"])[:10], "%Y-%m-%d"), o["value"]))
+        except Exception:
+            pass
+    return pts
+
+
 def _pct_change(obs_list: list[dict], periods: int = 1) -> Optional[float]:
-    """Compute pct change between the last and `periods`-ago observation."""
-    vals = [o["value"] for o in obs_list if o["value"] is not None]
-    if len(vals) < periods + 1:
+    """Percent change between the latest observation and the one `periods` periods earlier.
+
+    Nov 9 2026: this used to count OBSERVATIONS (vals[-(periods+1)]), which is wrong whenever
+    the series has a gap. FRED's CPIAUCSL/CPILFESL have no October 2025 value (shutdown), so
+    "12 observations back" from Sep 2026 landed on Aug 2025 (a 13-month change) and CPI YoY ran
+    high. Now the base is found BY DATE from the series' own spacing: monthly -> same month
+    `periods` months earlier; quarterly -> `3*periods` months; weekly -> `7*periods` days
+    (+/-3). If that base date is absent the answer is None (callers print nothing) instead of
+    a wrong number. Daily/irregular series keep the old index behaviour."""
+    pts = _obs_points(obs_list)
+    if len(pts) < periods + 1:
         return None
-    return ((vals[-1] - vals[-(periods + 1)]) / vals[-(periods + 1)]) * 100
+    t0, v0 = pts[-1]
+    gaps = sorted((pts[i][0] - pts[i - 1][0]).days for i in range(max(1, len(pts) - 8), len(pts)))
+    med = gaps[len(gaps) // 2] if gaps else 0
+    base = None
+    if 25 <= med <= 35 or 80 <= med <= 100:
+        step = 1 if med <= 35 else 3
+        want = t0.year * 12 + t0.month - 1 - step * periods
+        for t, v in pts:
+            if t.year * 12 + t.month - 1 == want:
+                base = v
+        if base is None:
+            return None
+    elif 5 <= med <= 9:
+        target = t0 - timedelta(days=7 * periods)
+        near = [(abs((t - target).days), v) for t, v in pts if abs((t - target).days) <= 3]
+        if not near:
+            return None
+        base = min(near)[1]
+    else:
+        base = pts[-(periods + 1)][1]
+    if not base:
+        return None
+    return (v0 - base) / base * 100
+
+
+def _yoy_pairs(obs_list: list[dict], months: int = 12):
+    """[(date, yoy%)] for every monthly observation that has a same-month value `months`
+    earlier. Date-matched, so a missing month (Oct 2025 CPI) drops that row instead of
+    shifting every later row by one month."""
+    pts = _obs_points(obs_list)
+    idx = {t.year * 12 + t.month - 1: v for t, v in pts}
+    out = []
+    for t, v in pts:
+        b = idx.get(t.year * 12 + t.month - 1 - months)
+        if b:
+            out.append((t.strftime("%Y-%m-%d"), (v - b) / b * 100))
+    return out
+
+
+def _change_over_days(obs_list: list[dict], days: int):
+    """Percent change from the newest observation at least `days` calendar days older than the
+    latest, plus that base date: (None, None) if there is no usable base. For DAILY series
+    (the old vals[-5] / vals[-21] counted observations, not weeks)."""
+    pts = _obs_points(obs_list)
+    if len(pts) < 2:
+        return None, None
+    t0, v0 = pts[-1]
+    base = [p for p in pts if (t0 - p[0]).days >= days]
+    if not base or not base[-1][1]:
+        return None, None
+    return (v0 - base[-1][1]) / base[-1][1] * 100, base[-1][0].strftime("%Y-%m-%d")
 
 
 _MONTHS = {m: i for i, m in enumerate(
@@ -275,21 +346,20 @@ async def get_forex_rates() -> str:
 
     # ── Fed broad trade-weighted dollar index from FRED ──────────────────
     try:
-        dxy = await _fred_series("DTWEXBGS", limit=30)
+        dxy = await _fred_series("DTWEXBGS", limit=100)   # daily obs; ~100 covers 13+ weeks
         dxy_val, dxy_date = _latest(dxy)
 
         lines.append(f"\nFed Broad Dollar Index (FRED DTWEXBGS, ~120 scale, NOT the ICE DXY):  "
                      f"{dxy_val:.3f}  [{dxy_date}]  — weekly series, lags the FX table by days")
 
         # 4-week and 13-week trend
-        vals = [o["value"] for o in dxy if o["value"] is not None]
-        if len(vals) >= 5:
-            chg_4w = ((vals[-1] - vals[-5]) / vals[-5]) * 100
+        chg_4w, _b4 = _change_over_days(dxy, 28)
+        if chg_4w is not None:
             direction = "↑ strengthening" if chg_4w > 0 else "↓ weakening"
-            lines.append(f"  4-week change:         {chg_4w:+.2f}%  ({direction})")
-        if len(vals) >= 14:
-            chg_13w = ((vals[-1] - vals[-14]) / vals[-14]) * 100
-            lines.append(f"  13-week change:        {chg_13w:+.2f}%")
+            lines.append(f"  4-week change:         {chg_4w:+.2f}%  ({direction}, vs {_b4})")
+        chg_13w, _b13 = _change_over_days(dxy, 91)
+        if chg_13w is not None:
+            lines.append(f"  13-week change:        {chg_13w:+.2f}%  (vs {_b13})")
 
         lines.append("\nFed Broad Dollar Index recent history (last 10 obs):")
         for obs in dxy[-10:]:
@@ -2410,10 +2480,9 @@ async def get_baltic_dry() -> str:
             val, date = _latest(obs)
             if val is not None:
                 lines.append(f"Baltic Dry Index (FRED):  {val:,.0f}  [{date}]")
-                vals = [o["value"] for o in obs if o["value"] is not None]
-                if len(vals) >= 5:
-                    chg_4w = ((vals[-1] - vals[-5]) / vals[-5]) * 100
-                    lines.append(f"  4-week change: {chg_4w:+.1f}%")
+                chg_4w, _bb = _change_over_days(obs, 28)
+                if chg_4w is not None:
+                    lines.append(f"  4-week change: {chg_4w:+.1f}%  (vs {_bb})")
                 bdi_found = True
         except Exception:
             pass
@@ -2546,9 +2615,7 @@ async def build_mercury_backdrop() -> str:
         bdi_val, bdi_4w = None, None      # stale reading must not enter the backdrop YAML as current
 
     # ── DXY trend ─────────────────────────────────────────────────────────
-    dxy_vals = [o["value"] for o in dxy_obs if o["value"] is not None]
-    dxy_4w   = ((dxy_vals[-1] - dxy_vals[-5]) / dxy_vals[-5] * 100) \
-               if len(dxy_vals) >= 5 else None
+    dxy_4w, _dxy_base = _change_over_days(dxy_obs, 28)   # true 28 calendar days (series is daily)
     if dxy_4w is not None:
         if dxy_4w > 2:
             dxy_stance = "Strengthening"
@@ -2662,7 +2729,7 @@ async def build_mercury_backdrop() -> str:
         f"  stance: {dxy_stance}",
         f"  key_metrics:",
         f"    dxy_level: {f'{dxy_val:.3f}' if dxy_val else 'N/A'}",
-        f"    dxy_4week_change_pct: {f'{dxy_4w:.2f}' if dxy_4w else 'N/A'}",
+        f"    dxy_4week_change_pct: {f'{dxy_4w:.2f}' if dxy_4w is not None else 'N/A'}",
         f"  risk_flags:",
     ]
     if dxy_4w and dxy_4w > 3:

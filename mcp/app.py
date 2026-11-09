@@ -1410,9 +1410,30 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
             if cik is None:
                 cik, company_name = _cik, entry.get('title', ticker_upper)
 
+        def _foreign_note():
+            """Nov 9 2026: AEM and VALE (40-F/20-F + 6-K filers) printed 'No quarterly EPS
+            data found', which reads like a failure. Foreign private issuers have no 10-Q,
+            so SEC XBRL has no quarterly series; say so and name the tool that has the
+            latest results. Returns '' when the filer is a normal 10-Q filer or on any error."""
+            try:
+                _recent = sec_get(f'https://data.sec.gov/submissions/CIK{cik}.json'
+                                  ).get('filings', {}).get('recent', {}).get('form', [])[:250]
+                if (any(_f in ('20-F', '40-F', '20-F/A', '40-F/A', '6-K') for _f in _recent)
+                        and '10-Q' not in _recent):
+                    return (f"NOTE: {company_name or ticker_upper} is a foreign private issuer "
+                            f"(files 20-F/40-F annual reports and 6-K interim releases, no 10-Q), so "
+                            f"SEC XBRL has no quarterly EPS series for it. This is expected for foreign filers. "
+                            f"Use get_sec_earnings_release (novamcp) for the latest quarterly results "
+                            f"and Nova's earnings-call record for the call.")
+            except Exception:
+                pass
+            return ""
+
         if not facts:
-            return f"No US-GAAP financial data found for {ticker_upper} "\
-                   f"(CIK: {cik}). Company may use IFRS reporting."
+            _fn = _foreign_note()
+            return (f"No US-GAAP financial data found for {ticker_upper} "
+                    f"(CIK: {cik}). Company may use IFRS reporting."
+                    + (f"\n{_fn}" if _fn else ""))
 
         def _unit_items(concept, unit):
             """Facts for a concept in `unit`. Per-share concepts are not always filed
@@ -1750,6 +1771,9 @@ def get_sec_earnings(ticker: str, quarters: int = 8) -> str:
 
         if displayed == 0:
             lines.append("  No quarterly EPS data found in SEC filings.")
+            _fn = _foreign_note()
+            if _fn:
+                lines.append("  " + _fn)
         elif eps_q:
             _newest_q = max(q['end'] for q in eps_q)
             try:
