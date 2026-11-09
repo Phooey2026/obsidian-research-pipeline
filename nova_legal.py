@@ -100,7 +100,10 @@ def call_tool(tool_name: str, arguments: dict,
                 "params":  {"name": tool_name, "arguments": arguments}
             }, timeout=120)
 
-            text   = r.text.strip()
+            # r.text is deliberately NOT used: requests falls back to
+            # ISO-8859-1 for text/event-stream without a charset, which turns
+            # UTF-8 dashes/box characters into mojibake (see weekly_research.py).
+            text   = r.content.decode('utf-8', errors='replace').strip()
             result = ""
             for line in text.split('\n'):
                 line = line.strip()
@@ -115,7 +118,7 @@ def call_tool(tool_name: str, arguments: dict,
                         continue
             if not result:
                 try:
-                    data = r.json()
+                    data = json.loads(text)
                     for item in data.get("result", {}).get("content", []):
                         if item.get("type") == "text":
                             result += item.get("text", "")
@@ -261,7 +264,7 @@ Here is the research data gathered:
 ═══════════════════════════════════════════
 SEC 10-K DEEP EXTRACTION
 ═══════════════════════════════════════════
-{deep_result[:11000]}
+{deep_result[:29000]}
 
 ═══════════════════════════════════════════
 WEB / NEWS SEARCH RESULTS
@@ -422,9 +425,9 @@ def research_legal(ticker: str, company_name: str,
             and "could not be extracted" not in _web[:500]):
         results["deep_sec"] = (
             "PRIMARY 10-K EXTRACTION (webmcp get_legal_proceedings; starts at Item 3 or the "
-            "note / MD&A section it points to):\n" + _web[:7000] +
+            "note / MD&A section it points to):\n" + _web[:26000] +
             "\n\n---- SECONDARY EXTRACTION (novamcp deep; may include unrelated text) ----\n" +
-            _deep[:3000])
+            _deep[:2000])
 
     # ── LLM synthesis ──────────────────────────────────────────────────────
     print(f"    [synthesis] asking Nova...", end=" ", flush=True)

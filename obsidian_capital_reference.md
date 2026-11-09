@@ -981,6 +981,13 @@ Jupiter call.
   (PNW JBHT LSTR GXO CB CI GE DE COP EOG TXRH WELL DLR CBRE) followed by
   `python3 repair_summaries.py --refetch` for the same list; use `--refetch`, not the
   summary-only command Nova prints, so the research data's own 10-K legal text is replaced too.
+- **Input limits (Nov 9 2026):** Nova's synthesis sees the webmcp 10-K legal text up to 26,000
+  chars (`_web[:26000]`) plus 2,000 of novamcp's secondary text, inside a 29,000-char cap on that
+  prompt section. The first version cut at 7,000 and dropped Aetna, the product-liability class
+  and the Texas qui tam for GILD. webmcp's own extraction stops near 25,000 chars (some
+  tickers sit right at that edge); that source limit is separate and untouched.
+- **`--force` replaces the flag context** with "Manually specified via CLI". Prior flag detail is
+  not carried over, so a forced re-run depends on the fresh text and news alone.
 
 **`nova_earnings_call.py`**
 - Researches earnings calls for stale/pending tickers (85-day window, `--stale-only`)
@@ -2286,9 +2293,9 @@ re-verified — treat as historical unless refreshed.
   BDI weekday/HTML date parsing, ETF flow estimates (baselines only),
   `weekly_mercury.py` prompt wiring for `gold_drivers`/`etf_flows`.
 
-- **`nova_legal.py` raw-field encoding (Aug 2026, open)** — see
-  `nova_legal.py` and `app3.py` notes above. Data-hygiene severity, not
-  correctness-critical (doesn't reach Jupiter's context).
+- **`nova_legal.py` raw-field encoding (Aug 2026) — FIXED Nov 9, 2026.**
+  `call_tool` now decodes `r.content` as UTF-8 (see Nov 9 entry). Records
+  written before the fix keep the garbled raw fields until re-run.
 - **`pipeline_health.py` Nova-earnings-coverage expectations (Aug 2026,
   possibly open)** — not yet confirmed whether this still treats partial
   earnings coverage as a gap; worth checking.
@@ -2546,6 +2553,56 @@ were confirmed against real output; the rest were tested with mocks.
 - ℹ️ `hermes update` to v0.23.0 and the `platform 'cli'` warning: harmless.
   `diag_strip6k.py` hit a pre-3.12 f-string error on the Jetson; f-string
   expressions must not contain backslashes or the enclosing quote character.
+
+- ✅ **Atlas yaml flags added** (`build_macro_backdrop`, `mcp/app2.py`): C&I lending standards
+  (`DRTSCILM`, key metrics `ci_lending_standards_net_tightening_pct` and `_date`; flag wording
+  scales with magnitude: marginal <=5, moderate 5-20, significant >20), core CPI below core
+  PCE (`core_pce_minus_core_cpi_pts`, flag when the gap is >0.25 pts; likely cause named as
+  shutdown-era CPI distortion while the CPI date is before 2026-12-01, stated as "likely"),
+  and Brent/WTI divergence >8 pts with the spread at window start and end
+  (`brent_wti_spread_start_of_window_usd`; Brent -14.7% vs WTI +3.5% was a spread move from
+  $29.20 on 2026-10-06 to $7.39 on 2026-11-03, not bad data). The 4-week oil change is cut at the
+  common latest date (`oil_4w_change_window_end`). `none_identified` only prints if no flag fires.
+  `diag_oil.py` prints the raw WTI/Brent series side by side. (live)
+- ℹ️ **ETF flow window grows by itself.** `etf_share_snapshots.json` holds source-tagged
+  snapshots (10/26, 10/31, 11/03, 11/07), so the 28-day base is the oldest snapshot until history
+  reaches four weeks; no code change needed. A daily cron would hit the `hist[-26:]` cap.
+- ✅ **`nova_legal.py` mojibake** — `call_tool` used `r.text`; requests falls back to
+  ISO-8859-1 for `text/event-stream` with no charset, so UTF-8 dashes and box characters
+  were stored as "â..." in `sec_deep_result`, `doj_raw` etc. and also reached Nova's
+  synthesis input. It now decodes `r.content` as UTF-8 (same as `weekly_research.py`).
+  `check_mcp_tool.py` and `test_mercurymcp.py` still use `r.text` but only print. (live)
+- ✅ **Nova legal text cut at 7,000 chars (GILD)** — see "Input limits" under `nova_legal.py`.
+  The cut-off only existed from Nov 7 (commit `a4cdf25`), so only records written Nov 7-9
+  were affected: ABBV FCX GE GXO PNW RTX TSLA GILD, all re-run. (Older records came from
+  novamcp's own extraction and were not cut this way.) `diag_legal_offsets.py TICKER` shows where
+  key terms fall in the stored 10-K text. `scan_nova_legal.py` over-flags (it listed 53 "CUT"
+  tickers because it ignores record dates); use the dates above, not the scan's CUT tag.
+- ✅ **Nova legal news returned only homepages/Wikipedia** — on this SearXNG, the general
+  category returned bing navigational results (gilead.com, Wikipedia, a Handmaid's Tale wiki) for
+  every legal query and ignored the query words, so GILD's Oct 22 $45M Texas settlement never
+  appeared. The news category (bing news) returned the stories. `search_legal_news`
+  (`mcp/app3.py`) now runs three short news-category queries (1-year window, legal suffix
+  stripped from the name), keeps only hits naming the company (first word of the core name),
+  and falls back to the old general queries when fewer than 4 results remain. `_ddg_search` has
+  optional `categories`/`time_range` (SearXNG only). On this instance brave.news, google news,
+  reuters and startpage news were failing (rate limit/CAPTCHA/HTTP) and mojeek was blocked, so
+  bing news is the one dependable engine; the braveapi engine answers only sometimes.
+  `diag_searx.py` and `diag_news_queries.py` probe this. ~100 records dated Sept/Oct keep their
+  old junk-prone news until next refresh (Jay will re-run others next week). (live, GILD)
+- ✅ **GILD legal record refreshed:** Texas qui tam (Health Choice Advocates, Medicaid) settled
+  for $45M on Oct 22, 2026 with no admission (Bloomberg Law, JD Supra, Fierce Pharma). The 10-K
+  predates it; the record now says settled and still lists the TDF mass tort (~23,000
+  plaintiffs, March 2027 bellwether), the Phase I antitrust appeal and the Aetna trial
+  (March 2027). Risk Moderate (was High under the cut-off-free older text); Nova's own judgment.
+  Note: its text says the settlement came "ahead of its August 2026 trial", which is inference.
+- ℹ️ **CourtListener returned ~60 chars for FCX, GE and RTX on the second run** (first run:
+  5,000-6,000), dropping research_confidence to Medium for FCX and GE. Likely rate limiting;
+  not investigated.
+- ℹ️ **Open items:** short-interest FINRA fallback live (BAC 1.29%, DLR 2.17%, NEE 2.98%);
+  Barrick Q3 6-K due; Jupiter-prompt list (Jansky items 12/13, banks' FCF "not applicable");
+  Jansky dollar -0.10% vs live +0.23% unreconciled; SOUL.md sector count (15 passes vs 16
+  sectors) to confirm. The re-runs of other tickers are planned for next week.
 
 ### Resolved Issues (November 3, 2026 — Jansky's 10/31 review)
 

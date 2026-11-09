@@ -115,10 +115,16 @@ async def _fetch_page_light(url: str, timeout: int = 30) -> tuple[str, str]:
     return title, clean
 
 
-async def _ddg_search(query: str, limit: int = 10) -> list[dict]:
+async def _ddg_search(query: str, limit: int = 10,
+                      categories: str = "", time_range: str = "") -> list[dict]:
     """Search using SearXNG (preferred) or DuckDuckGo fallback.
     SearXNG is used when SEARCH_PROVIDER=searxng and SEARXNG_URL is set.
     Includes a short sleep and one retry to handle rate limiting.
+
+    categories / time_range are SearXNG-only (e.g. categories="news",
+    time_range="year"); the DDG fallback ignores them. The general category
+    often returns only a company's homepage/Wikipedia for legal queries,
+    while the news category returns the actual stories.
     """
     await asyncio.sleep(2.0)
 
@@ -126,6 +132,11 @@ async def _ddg_search(query: str, limit: int = 10) -> list[dict]:
 
     # ── SearXNG path ──────────────────────────────────────────────────────
     if SEARCH_PROVIDER == "searxng" and SEARXNG_URL:
+        _sx_params = {"q": full_query, "format": "json"}
+        if categories:
+            _sx_params["categories"] = categories
+        if time_range:
+            _sx_params["time_range"] = time_range
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(
@@ -135,7 +146,7 @@ async def _ddg_search(query: str, limit: int = 10) -> list[dict]:
                 ) as client:
                     resp = await client.get(
                         f"{SEARXNG_URL.rstrip('/')}/search",
-                        params={"q": full_query, "format": "json"}
+                        params=_sx_params
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -252,7 +263,23 @@ async def search_legal_news(ticker: str, company_name: str,
             if len(first_word) > 2:
                 search_id = first_word
 
-        queries = [
+        # Core name without legal suffix ("Gilead Sciences, Inc." -> "Gilead Sciences").
+        _sfx = re.compile(
+            r',?\s+(Inc\.?|Corp\.?|Corporation|Ltd\.?|LLC|L\.L\.C\.|'
+            r'Limited|PLC|plc|Co\.?|Company|Group|Holdings?|Incorporated)'
+            r'\s*$', re.IGNORECASE)
+        core = _sfx.sub("", company_name).strip().rstrip(",") or company_name
+
+        # News category first: on the SearXNG instance the general category
+        # returned only homepages/Wikipedia for these queries (Gilead's Oct 2026
+        # Texas settlement never appeared), while news returned the stories.
+        # Short queries work better there than year-stuffed ones.
+        news_queries = [
+            f"{core} lawsuit settlement trial verdict",
+            f"{core} investigation SEC DOJ fine penalty",
+            f"{core} antitrust class action FTC enforcement",
+        ]
+        general_queries = [
             f"{company_name} lawsuit litigation 2024 2025 2026",
             f"{search_id} SEC investigation regulatory fine 2025 2026",
             f"{company_name} DOJ FTC antitrust enforcement 2025 2026",
@@ -260,14 +287,35 @@ async def search_legal_news(ticker: str, company_name: str,
         seen_urls: set[str] = set()
         all_results: list[dict] = []
 
-        for q in queries:
-            if len(all_results) >= max_results:
-                break
-            hits = await _ddg_search(q, limit=5)
+        def _add(hits):
             for h in hits:
                 if h["url"] not in seen_urls and len(all_results) < max_results:
                     seen_urls.add(h["url"])
                     all_results.append(h)
+
+        _use_news = (SEARCH_PROVIDER == "searxng" and bool(SEARXNG_URL))
+        if _use_news:
+            for q in news_queries:
+                if len(all_results) >= max_results:
+                    break
+                try:
+                    _hits = await _ddg_search(q, limit=4, categories="news",
+                                              time_range="year")
+                except Exception:
+                    continue
+                # News queries with words like "verdict" pull in unrelated
+                # headlines (a Meta penalty and a celebrity trial showed up in
+                # Gilead's results), so keep only hits that name the company.
+                _key = (core.split()[0] if core.split() else core).lower()
+                _add([h for h in _hits
+                      if _key in (h["title"] + " " + h["description"]
+                                  + " " + h["url"]).lower()])
+        # General queries: the only path for DDG, and a backfill when news is thin.
+        if len(all_results) < 4:
+            for q in general_queries:
+                if len(all_results) >= max_results:
+                    break
+                _add(await _ddg_search(q, limit=5))
 
         if not all_results:
             return (f"No legal news found for {ticker.upper()} "

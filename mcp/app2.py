@@ -1226,6 +1226,10 @@ async def build_macro_backdrop() -> str:
     hy_val,    hy_date,   _    = await _q("BAMLH0A0HYM2", 6)
     ig_val,    ig_date,   _    = await _q("BAMLC0A0CM", 6)
     fsi_val,   fsi_date,  _    = await _q("STLFSI4", 6)
+    # Nov 9 2026 (Jansky): the Senior Loan Officer survey (net % of banks tightening C&I
+    # standards) was in get_credit_conditions but never reached the YAML, so downstream agents
+    # saw "Benign" credit from spreads alone while banks were restricting lending.
+    slos_val,  slos_date, _    = await _q("DRTSCILM", 8, "q")
 
     umich_val, umich_date,_    = await _q("UMCSENT", 6, "m")
     ism_val,   ism_date,  ism_obs = await _q("IPMAN", 13, "m")
@@ -1254,22 +1258,41 @@ async def build_macro_backdrop() -> str:
         return _change_over_days(cut, 28)[0]
     wti_4w, brent_4w = _chg_4w(wti_obs), _chg_4w(brent_obs)
     brent_wti_spread = (brent_val - wti_val) if (brent_val and wti_val) else None
+    _oil_window_end = _end.strftime("%Y-%m-%d") if _end is not None else None
+    # Nov 9 2026: the Brent -14.7% / WTI +3.5% split is REAL in FRED's data (checked with
+    # diag_oil.py): Dated Brent was a $29 physical premium to WTI at the window's start and $7
+    # at its end. Carry the spread at both ends so the flag explains the divergence.
+    _spread_then = _spread_now = _sp_then_date = _sp_now_date = None
+    try:
+        if _end is not None:
+            _wmap = {str(o["date"])[:10]: o["value"] for o in wti_obs if o["value"] is not None}
+            _bmap = {str(o["date"])[:10]: o["value"] for o in brent_obs if o["value"] is not None}
+            _commons = sorted(set(_wmap) & set(_bmap))
+            _cut_w = [o for o in wti_obs if o["value"] is not None and str(o["date"])[:10] <= _oil_window_end]
+            _bd = _change_over_days(_cut_w, 28)[1]
+            _now_c = [d for d in _commons if d <= _oil_window_end]
+            _then_c = [d for d in _commons if _bd and d <= _bd]
+            if _now_c and _then_c:
+                _sp_now_date, _sp_then_date = _now_c[-1], _then_c[-1]
+                _spread_now = _bmap[_sp_now_date] - _wmap[_sp_now_date]
+                _spread_then = _bmap[_sp_then_date] - _wmap[_sp_then_date]
+    except Exception:
+        _spread_then = _spread_now = None
+    _oil_diverge = (abs(brent_4w - wti_4w)
+                    if (brent_4w is not None and wti_4w is not None) else None)
+    # Nov 9 2026 (Jansky): core CPI below core PCE is unusual (CPI normally runs higher).
+    _cpi_pce_gap = (pce_yoy - cpi_yoy) if (pce_yoy is not None and cpi_yoy is not None) else None
+    _cpi_pce_flag = _cpi_pce_gap is not None and _cpi_pce_gap > 0.25
 
-    m2_yoy = None
-    m2_vals = [o["value"] for o in m2_obs if o["value"] is not None]
-    if len(m2_vals) >= 13:
-        m2_yoy = ((m2_vals[-1] - m2_vals[-13]) / m2_vals[-13]) * 100
+    m2_yoy = _pct_change(m2_obs, 12)
 
     # PPI metrics for YAML output (Jansky recommendation)
     ppi_yoy = None
     ppi_mom = None
     try:
         _ppi_obs = await _fred_series("PPIACO", limit=14, frequency="m")
-        _ppi_vals = [o["value"] for o in _ppi_obs if o["value"] is not None]
-        if len(_ppi_vals) >= 13:
-            ppi_yoy = ((_ppi_vals[-1] - _ppi_vals[-13]) / _ppi_vals[-13]) * 100
-        if len(_ppi_vals) >= 2:
-            ppi_mom = ((_ppi_vals[-1] - _ppi_vals[-2]) / _ppi_vals[-2]) * 100
+        ppi_yoy = _pct_change(_ppi_obs, 12)     # date-matched (shutdown gaps)
+        ppi_mom = _pct_change(_ppi_obs, 1)
     except Exception:
         pass
 
@@ -1419,6 +1442,9 @@ async def build_macro_backdrop() -> str:
         f"    brent_usd_bbl: {f'{(brent_val):.2f}' if brent_val else 'N/A'}",
         f"    brent_4w_change_pct: {f'{(brent_4w):.1f}' if brent_4w is not None else 'N/A'}",
         f"    brent_wti_spread_usd: {f'{(brent_wti_spread):.2f}' if brent_wti_spread is not None else 'N/A'}",
+        f"    oil_4w_change_window_end: \"{_oil_window_end or 'N/A'}\"",
+        f"    brent_wti_spread_start_of_window_usd: {f'{_spread_then:.2f}' if _spread_then is not None else 'N/A'}",
+        f"    core_pce_minus_core_cpi_pts: {f'{_cpi_pce_gap:.2f}' if _cpi_pce_gap is not None else 'N/A'}",
         f"    breakeven_5y: {f'{(be5_val):.2f}' if be5_val else 'N/A'}",
         f"    breakeven_10y: {f'{(be10_val):.2f}' if be10_val else 'N/A'}",
         f"    fed_target: 2.00",
@@ -1434,7 +1460,26 @@ async def build_macro_backdrop() -> str:
         lines.append(f"    - \"10Y breakeven {be10_val:.2f}% — market pricing persistent inflation\"")
     if _oil_shock_flag:
         lines.append(_oil_shock_msg)
-    if not (pce_yoy and pce_yoy > 3.5) and not _oil_shock_flag:
+    if _cpi_pce_flag:
+        _cause = (" Likely cause: no October 2025 CPI was collected (government shutdown) and housing rents "
+                  "were carried forward, biasing measured CPI shelter low until those months leave the "
+                  "12-month window."
+                  if (cpi_date != "N/A" and cpi_date < "2026-12-01") else "")
+        lines.append(
+            f"    - \"Core CPI ({cpi_yoy:.2f}%) is {_cpi_pce_gap:.2f}pts BELOW core PCE ({pce_yoy:.2f}%) — "
+            f"unusual, CPI normally runs above PCE.{_cause} Treat core PCE as the cleaner inflation gauge; "
+            f"do not read the gap as disinflation.\"")
+    if _oil_diverge is not None and _oil_diverge > 8:
+        lines.append(
+            f"    - \"Brent and WTI 4-week changes diverge by {_oil_diverge:.1f}pts "
+            f"(Brent {brent_4w:+.1f}%, WTI {wti_4w:+.1f}%, both measured over the same 28 days ending "
+            f"{_oil_window_end}, so this is not a window mismatch)"
+            + (f"; the Brent-WTI spread moved from ${_spread_then:.2f} ({_sp_then_date}) to ${_spread_now:.2f} "
+               f"({_sp_now_date}), i.e. the two crudes diverged because the Brent premium to WTI changed, "
+               f"not because of a bad print" if _spread_then is not None else "")
+            + " — compare with Mercury's futures read\"")
+    if (not (pce_yoy and pce_yoy > 3.5) and not _oil_shock_flag and not _cpi_pce_flag
+            and not (_oil_diverge is not None and _oil_diverge > 8)):
         lines.append(f"    - none_identified")
 
     lines += [
@@ -1466,8 +1511,7 @@ async def build_macro_backdrop() -> str:
     # key_metrics, not just the risk-flag check below. This metric measures
     # manufacturing output and belongs under growth, not sentiment, where
     # it was previously also duplicated.
-    ipman_vals = [o["value"] for o in ism_obs if o["value"] is not None]
-    ipman_yoy  = ((ipman_vals[-1] - ipman_vals[-13]) / ipman_vals[-13] * 100) if len(ipman_vals) >= 13 else None
+    ipman_yoy  = _pct_change(ism_obs, 12)
 
     lines += [
         f"",
@@ -1511,6 +1555,8 @@ async def build_macro_backdrop() -> str:
         f"    hy_spread_bps: {f'{(hy_val * 100):.0f}' if hy_val else 'N/A'}",
         f"    ig_spread_bps: {f'{(ig_val * 100):.0f}' if ig_val else 'N/A'}",
         f"    stl_financial_stress_idx: {f'{(fsi_val):.4f}' if fsi_val else 'N/A'}",
+        f"    ci_lending_standards_net_tightening_pct: {f'{slos_val:.1f}' if slos_val is not None else 'N/A'}",
+        f"    ci_lending_standards_date: \"{slos_date}\"",
         f"  risk_flags:",
     ]
 
@@ -1518,7 +1564,18 @@ async def build_macro_backdrop() -> str:
         lines.append(f"    - \"HY spreads at {hy_val * 100:.0f} bps — elevated credit stress\"")
     if fsi_val and fsi_val > 1.0:
         lines.append(f"    - \"St. Louis FSI at {fsi_val:.3f} — financial stress elevated\"")
-    if not ((hy_val and hy_val * 100 > 600) or (fsi_val and fsi_val > 1.0)):
+    _slos_flag = slos_val is not None and slos_val > 0
+    if _slos_flag:
+        if slos_val > 20:
+            _sev, _tail = "significant ", "banks are restricting credit even though spreads read " + credit_stance.lower() + "; spreads alone understate credit tightening"
+        elif slos_val > 5:
+            _sev, _tail = "moderate ", "credit availability is tightening beneath spreads that read " + credit_stance.lower()
+        else:
+            _sev, _tail = "marginal ", "direction is tightening but the magnitude is near neutral; watch the next survey"
+        lines.append(
+            f"    - \"Bank C&I lending standards: {_sev}net tightening of {slos_val:+.1f}% of banks "
+            f"({slos_date}, Senior Loan Officer Survey) — {_tail}\"")
+    if not ((hy_val and hy_val * 100 > 600) or (fsi_val and fsi_val > 1.0) or _slos_flag):
         lines.append(f"    - none_identified")
 
     lines += [
