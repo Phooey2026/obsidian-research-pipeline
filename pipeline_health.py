@@ -252,10 +252,27 @@ def check_mercury() -> dict:
             gap_count = len(re.findall(r'[•\-\*]|\n\d+\.', gap_text))
             result["metrics"]["reported_gap_count"] = gap_count
 
-            # Flag critical gaps
-            for critical in ["energy price", "gold", "BDI", "baltic"]:
-                if critical.lower() in gap_text.lower():
-                    critical_gaps.append(critical)
+            # Flag critical gaps. Nov 9 2026: the old check matched keywords
+            # anywhere in the gap text, so "gold basing thesis" (context in the
+            # impact clause) or a 10-day-old BDI print tripped "gold"/"baltic"
+            # even though both tools returned data. Now judge each gap line:
+            #   subject = text before "impact:", impact = LOW/MEDIUM/HIGH.
+            # Flag a line if its impact is HIGH, or if the SUBJECT mentions a
+            # critical series AND says it is missing/unavailable.
+            _missing = re.compile(r'unavailable|missing|no data|not available|not returned|failed|empty', re.I)
+            _keys = ["energy price", "crude", "gold price", "bdi", "baltic"]
+            for line in re.split(r'\n(?=\s*[•\-\*]|\s*\d+\.)', gap_text):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = re.split(r'impact\s*:', line, maxsplit=1, flags=re.I)
+                subject = parts[0]
+                impact = parts[1].strip().upper() if len(parts) > 1 else ""
+                label = re.sub(r'^[•\-\*\d\.\s]+', '', subject).split(' — ')[0].strip()[:60]
+                if impact.startswith("HIGH"):
+                    critical_gaps.append(f"{label} [HIGH]")
+                elif _missing.search(subject) and any(k in subject.lower() for k in _keys):
+                    critical_gaps.append(f"{label} [missing]")
 
         # Check confidence rating
         conf_match = re.search(

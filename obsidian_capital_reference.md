@@ -1,5 +1,5 @@
 # Obsidian Capital Research Pipeline — Reference Guide
-## As of June 22, 2026 — updated November 7, 2026
+## As of June 22, 2026 — updated November 9, 2026
 
 ---
 
@@ -2451,6 +2451,37 @@ were confirmed against real output; the rest were tested with mocks.
   summary line shows `= Unchanged`. `--force` / named tickers still rewrite.
 - ✅ **`diag_xbrl.py` could only show a fixed concept list** — `--scan`,
   `+Concept`.
+
+### Resolved Issues (November 9, 2026 — Jansky's 11/7 review, first pass)
+
+- ✅ **MA label said "DEATH CROSS" for names above both averages** (NEE, SO, DUK) —
+  `get_technicals` labeled the STATE ma50<ma200 as a cross. It now looks back 30 sessions
+  for a real crossover and prints `GOLDEN/DEATH CROSS on <date> (N sessions ago)`;
+  otherwise `50D above/below 200D (… no cross in last 30 sessions)`, plus
+  `| price above/below both MAs` or `between the MAs`. Fixed in `mcp/app.py`.
+- ✅ **pipeline_health Mercury WARN "gold, baltic" was a false positive** — the check
+  searched Mercury's gap text for keywords, so "gold basing thesis" (impact clause) and a
+  10-day-old BDI print tripped it although `get_metals_prices` and `get_baltic_dry` returned
+  data. It now judges each gap line: flag if `impact: HIGH`, or if the subject mentions a
+  critical series AND says missing/unavailable. Today it correctly names soybean crop
+  condition and the EIA crude conflict.
+- ✅ **EIA spot vs futures "conflict"** — different dates, not bad data. `get_energy_prices`
+  (`mcp/app4.py`) now prints a same-date reconciliation: spot vs the futures close on EIA's
+  print date, and the futures move since (Oct 30: WTI basis +$1.47, Brent +$3.53; futures
+  since −17.7% / −22.4%). The old "Brent–WTI summary" sentence that blamed Dated Brent
+  premium was removed. EIA spot series are WEEKLY (Friday dates), so the "4-week change"
+  was already correct; it now also prints the comparison date.
+- ✅ **Yahoo returns N/A for Free Cash Flow / Total Cash / Total Debt intermittently**
+  (15 of 128 names Saturday: 9 banks/insurers where FCF is not meaningful, plus VST, PKG,
+  PENN, EPD, MCD, SPG). `get_fundamentals` falls back to SEC XBRL (`_xbrl_cash_debt_fcf`):
+  latest cash and long-term debt instant from 10-Q/10-K; FCF = last fiscal year operating
+  cash flow minus capex, labeled "SEC XBRL FY ending …". EV multiples and Current Ratio
+  are not filled. Banks stay N/A by design. The six non-banks were refetched.
+- ✅ **Nova legal records** re-run with `--force` for RTX, TSLA, FCX, ABBV, IP, JPM, XOM and
+  Jupiter summaries refreshed with `repair_summaries.py --refetch`.
+- ℹ️ Barrick Q3 6-K not yet filed as of Nov 9 (latest is Aug 17). Recheck.
+- ℹ️ Jupiter-prompt items for the offline calibration work: tell Jupiter that missing FCF
+  for banks/insurers means "not applicable", not a data gap.
 
 ### Resolved Issues (November 7, 2026)
 

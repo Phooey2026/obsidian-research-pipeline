@@ -736,6 +736,8 @@ async def get_energy_prices() -> str:
     """
     lines = ["=== ENERGY PRICES ===\n"]
     _spot_spread = None
+    _spot_info = {}     # "RWTC"/"RBRTE" -> (price, period) for the futures reconciliation below
+    _fut_hist = {}      # "CL=F"/"BZ=F" -> Close series, for the same reconciliation
 
     # ── EIA API v2 route-based calls ────────────────────────────────────
     if EIA_API_KEY:
@@ -767,7 +769,7 @@ async def get_energy_prices() -> str:
                             "facets[series][]":     series_id,
                             "sort[0][column]":      "period",
                             "sort[0][direction]":   "desc",
-                            "length":               "8",
+                            "length":               "40",
                         },
                     )
                     r.raise_for_status()
@@ -777,12 +779,29 @@ async def get_energy_prices() -> str:
                         val    = latest.get("value")
                         period = latest.get("period", "N/A")
                         lines.append(f"{label:<45} {val}  [{period}]")
-                        vals = [float(d["value"]) for d in series_data
-                                if d.get("value") not in (None, "")]
-                        if len(vals) >= 2:
-                            chg_4w = ((vals[0] - vals[min(4, len(vals)-1)])
-                                      / vals[min(4, len(vals)-1)]) * 100
-                            lines.append(f"  {'4-week change:':<43} {chg_4w:+.2f}%")
+                        if series_id in ("RWTC", "RBRTE"):
+                            try:
+                                _spot_info[series_id] = (float(val), str(period))
+                            except Exception:
+                                pass
+                        # Nov 9 2026: this used vals[4] of an 8-row response, which for DAILY
+                        # series (WTI, Brent, Henry Hub) is 4 trading days back, not 4 weeks
+                        # (it printed WTI "+7.67% 4-week" while futures fell 6.7% over a month).
+                        # Pick the first observation at least 28 calendar days before the latest.
+                        _pts = []
+                        for _d in series_data:
+                            try:
+                                _pts.append((datetime.strptime(str(_d.get("period"))[:10], "%Y-%m-%d"),
+                                             float(_d["value"])))
+                            except Exception:
+                                pass
+                        if len(_pts) >= 2:
+                            _t0, _v0 = _pts[0]
+                            _base = [_p for _p in _pts if (_t0 - _p[0]).days >= 28]
+                            if _base and _base[0][1]:
+                                chg_4w = (_v0 - _base[0][1]) / _base[0][1] * 100
+                                _bd = _base[0][0].strftime("%Y-%m-%d")
+                                lines.append(f"  {'4-week change:':<43} {chg_4w:+.2f}%  (vs {_bd})")
                     else:
                         lines.append(f"{label:<45} N/A (no data returned)")
                 except Exception as e:
@@ -946,21 +965,52 @@ async def get_energy_prices() -> str:
                 _last = float(_h["Close"].iloc[-1])
                 _first = float(_h["Close"].iloc[0])
                 _fut[_sym] = _last
+                _fut_hist[_sym] = _h["Close"].dropna()
                 lines.append(f"{_lbl:<45} {_last:.2f}  [{_h.index[-1].strftime('%Y-%m-%d')}]")
                 if _first:
                     lines.append(f"  {'~1-month change:':<43} {((_last - _first) / _first) * 100:+.2f}%")
         if len(_fut) == 2:
             _fspr = _fut['BZ=F'] - _fut['CL=F']
             lines.append(f"Futures Brent–WTI spread: ${_fspr:.2f}")
-            if _spot_spread is not None:
-                lines.append(
-                    f"Brent–WTI summary: spot spread ${_spot_spread:.2f} vs futures spread ${_fspr:.2f} "
-                    f"(usual range roughly $2–$10). Both are wide, so the market is pricing a large Brent "
-                    f"premium; the extra ${_spot_spread - _fspr:.2f} on spot reflects physical Dated Brent "
-                    f"trading above Brent futures plus EIA's roughly one-week reporting lag.")
         elif _spot_spread is not None and (_spot_spread < 0 or _spot_spread > 15):
             lines.append(f"\nData-quality warning: Brent–WTI SPOT spread is ${_spot_spread:.2f} "
                          f"(usual range roughly $2–$10) and no futures prices were available to cross-check it.")
+        # Nov 9 2026: Mercury still logged "EIA spot (WTI $105.59 / Brent $121.17)
+        # conflicts with futures ($90.83/$98.32)" as a HIGH gap, because the two
+        # series carry different dates (EIA spot lags about a week). Put both on
+        # the SAME date: look up the futures close on/before EIA's print date and
+        # show the spot-vs-futures basis that day, plus how far futures moved since.
+        try:
+            _recon = []
+            for _sid, _sym, _nm in (("RWTC", "CL=F", "WTI"), ("RBRTE", "BZ=F", "Brent")):
+                if _sid in _spot_info and _sym in _fut_hist:
+                    _sp, _per = _spot_info[_sid]
+                    _ser = _fut_hist[_sym]
+                    _ser = _ser[[str(_d)[:10] <= _per for _d in _ser.index]]
+                    if len(_ser):
+                        _fd = str(_ser.index[-1])[:10]
+                        _fc = float(_ser.iloc[-1])
+                        _now = float(_fut_hist[_sym].iloc[-1])
+                        _recon.append(
+                            f"  {_nm}: EIA spot {_sp:.2f} [{_per}] vs futures {_fc:.2f} [{_fd}] "
+                            f"-> same-date basis ${_sp - _fc:+.2f}; futures since: "
+                            f"{(_now - _fc) / _fc * 100:+.1f}% (now {_now:.2f})")
+            if "RWTC" in _spot_info and "RBRTE" in _spot_info and "CL=F" in _fut_hist and "BZ=F" in _fut_hist:
+                _per2 = _spot_info["RWTC"][1]
+                _sw = _fut_hist["CL=F"][[str(_d)[:10] <= _per2 for _d in _fut_hist["CL=F"].index]]
+                _sb = _fut_hist["BZ=F"][[str(_d)[:10] <= _per2 for _d in _fut_hist["BZ=F"].index]]
+                if len(_sw) and len(_sb):
+                    _recon.append(
+                        f"  Brent-WTI spread on {_per2}: spot ${_spot_info['RBRTE'][0] - _spot_info['RWTC'][0]:.2f} "
+                        f"vs futures ${float(_sb.iloc[-1]) - float(_sw.iloc[-1]):.2f}; futures spread now ${_fspr:.2f}")
+            if _recon:
+                lines.append("Same-date reconciliation (EIA spot vs futures on EIA's print date):")
+                lines.extend(_recon)
+                lines.append("  Read: compare spot to futures ON THE SAME DATE. A large positive basis on that "
+                             "date is physical/backwardation premium; a large move in futures since that date "
+                             "is genuine price change, not a feed conflict. Use futures for the current level.")
+        except Exception as e:
+            lines.append(f"Reconciliation problem: {type(e).__name__}")
         lines.append("Note: the EIA/FRED prices above are physical SPOT benchmarks; futures can differ "
                      "materially from spot in a tight market. A wide gap between the two is a market "
                      "signal (physical premium / backwardation), not necessarily a bad print.")

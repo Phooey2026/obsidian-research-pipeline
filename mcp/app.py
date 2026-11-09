@@ -477,6 +477,117 @@ def get_stock_info(ticker: str) -> str:
         return f"Error fetching info for {ticker}: {str(e)}"
 
 
+_XBRL_BS_CACHE = {}
+
+
+def _xbrl_cash_debt_fcf(ticker, _facts=None):
+    """SEC XBRL fallback for fields Yahoo leaves N/A (Nov 9 2026: VST showed Total Cash,
+    Total Debt and Free Cash Flow all N/A, so Jupiter's table had no FCF/debt).
+    Returns {'cash': (val, end), 'debt': (val, end, tag), 'fcf': (val, fy_end), 'ocf': val,
+    'capex': val} with only the fields that could be found, or {} on any failure.
+    Cash and debt are the latest balance-sheet instant from a 10-Q/10-K; FCF is the latest
+    fiscal year (10-K) operating cash flow minus capex, so it is labelled FY, not TTM."""
+    import time
+    import json
+    import urllib.request
+    from datetime import datetime
+    key = ticker.upper()
+    hit = _XBRL_BS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 6 * 3600 and _facts is None:
+        return hit[1]
+    out = {}
+    try:
+        if _facts is None:
+            hdr = {'User-Agent': 'Jay jay@example.com'}
+
+            def _get(url):
+                req = urllib.request.Request(url, headers=hdr)
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    return json.loads(r.read())
+            cands = [e for e in _get('https://www.sec.gov/files/company_tickers.json').values()
+                     if e.get('ticker', '').upper() == key]
+            if key == 'XOM':
+                cands.append({'cik_str': '34088'})
+            for e in cands:
+                try:
+                    d = _get('https://data.sec.gov/api/xbrl/companyfacts/CIK%s.json' % str(e['cik_str']).zfill(10))
+                except Exception:
+                    continue
+                _facts = d.get('facts', {}).get('us-gaap', {})
+                if _facts:
+                    break
+        if not _facts:
+            return {}
+
+        def _items(tag):
+            return _facts.get(tag, {}).get('units', {}).get('USD', [])
+
+        def _latest_instant(tag):
+            best = None
+            for x in _items(tag):
+                if x.get('form') in ('10-Q', '10-Q/A', '10-K', '10-K/A') and 'end' in x and x.get('val') is not None:
+                    if best is None or x['end'] > best['end'] or (x['end'] == best['end'] and x.get('filed', '') > best.get('filed', '')):
+                        best = x
+            return best
+
+        def _latest_fy(tag):
+            best = None
+            for x in _items(tag):
+                if x.get('form') in ('10-K', '10-K/A') and 'start' in x and 'end' in x and x.get('val') is not None:
+                    try:
+                        days = (datetime.strptime(x['end'], '%Y-%m-%d') - datetime.strptime(x['start'], '%Y-%m-%d')).days
+                    except Exception:
+                        continue
+                    if 350 <= days <= 380:
+                        if best is None or x['end'] > best['end'] or (x['end'] == best['end'] and x.get('filed', '') > best.get('filed', '')):
+                            best = x
+            return best
+
+        def _fresh(x, days):
+            try:
+                return (datetime.utcnow() - datetime.strptime(x['end'], '%Y-%m-%d')).days <= days
+            except Exception:
+                return False
+
+        for tag in ('CashAndCashEquivalentsAtCarryingValue',
+                    'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents'):
+            x = _latest_instant(tag)
+            if x and _fresh(x, 200):
+                out['cash'] = (float(x['val']), x['end'])
+                break
+        x = _latest_instant('LongTermDebt')
+        if x and _fresh(x, 200):
+            out['debt'] = (float(x['val']), x['end'], 'LongTermDebt')
+        else:
+            n = _latest_instant('LongTermDebtNoncurrent')
+            if n and _fresh(n, 200):
+                c = _latest_instant('LongTermDebtCurrent')
+                cv = float(c['val']) if c and c['end'] == n['end'] else 0.0
+                out['debt'] = (float(n['val']) + cv, n['end'], 'LongTermDebtNoncurrent+Current')
+        ocf = None
+        for tag in ('NetCashProvidedByUsedInOperatingActivities',
+                    'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'):
+            ocf = _latest_fy(tag)
+            if ocf:
+                break
+        capex = None
+        for tag in ('PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets',
+                    'PaymentsForCapitalImprovements'):
+            capex = _latest_fy(tag)
+            if capex and ocf and capex['end'] == ocf['end']:
+                break
+            capex = None
+        if ocf and capex and ocf['end'] == capex['end'] and _fresh(ocf, 600):
+            out['ocf'] = float(ocf['val'])
+            out['capex'] = float(capex['val'])
+            out['fcf'] = (float(ocf['val']) - float(capex['val']), ocf['end'])
+    except Exception:
+        out = {}
+    if _facts is None or out:
+        _XBRL_BS_CACHE[key] = (time.time(), out)
+    return out
+
+
 @mcp.tool()
 def get_fundamentals(ticker: str) -> str:
     """Fetch extended fundamental valuation metrics: PEG ratio, Price/Sales,
@@ -498,9 +609,18 @@ def get_fundamentals(ticker: str) -> str:
                 return f"{val*100:.1f}%"
             return f"{prefix}{val:,.{decimals}f}{suffix}"
 
-        # Free Cash Flow
+        # Nov 9 2026: when Yahoo leaves Free Cash Flow / Total Cash / Total Debt empty
+        # (VST), fall back to SEC XBRL so the data pack still has FCF and debt. The
+        # source and as-of date are printed on the line so nothing is passed off as Yahoo.
         fcf = info.get('freeCashflow')
-        fcf_str = fmt(fcf, billions=True) if fcf else "N/A"
+        _xb = {}
+        if not fcf or info.get('totalDebt') is None or info.get('totalCash') is None:
+            _xb = _xbrl_cash_debt_fcf(ticker)
+        fcf_note = ""
+        if not fcf and _xb.get('fcf'):
+            fcf = _xb['fcf'][0]
+            fcf_note = f"  (SEC XBRL FY ending {_xb['fcf'][1]}: operating CF minus capex)"
+        fcf_str = (fmt(fcf, billions=True) if fcf else "N/A") + (fcf_note if fcf else "")
 
         # Price/FCF
         price = info.get('currentPrice') or info.get('regularMarketPrice')
@@ -520,6 +640,13 @@ def get_fundamentals(ticker: str) -> str:
         total_debt = info.get('totalDebt')
         total_cash = info.get('totalCash')
         de_ratio   = info.get('debtToEquity')
+        debt_note = cash_note = ""
+        if total_debt is None and _xb.get('debt'):
+            total_debt = _xb['debt'][0]
+            debt_note = f"  (SEC XBRL {_xb['debt'][2]}, as of {_xb['debt'][1]})"
+        if total_cash is None and _xb.get('cash'):
+            total_cash = _xb['cash'][0]
+            cash_note = f"  (SEC XBRL, as of {_xb['cash'][1]})"
 
         lines = [f"=== {ticker.upper()} Extended Fundamentals ===\n"]
 
@@ -537,8 +664,8 @@ def get_fundamentals(ticker: str) -> str:
         lines.append(f"  FCF Margin:        {fmt(fcf / info['totalRevenue'] if fcf and info.get('totalRevenue') else None, pct=True)}")
 
         lines.append("\n── Balance Sheet ──")
-        lines.append(f"  Total Cash:        {fmt(total_cash, billions=True)}")
-        lines.append(f"  Total Debt:        {fmt(total_debt, billions=True)}")
+        lines.append(f"  Total Cash:        {fmt(total_cash, billions=True)}{cash_note if total_cash is not None else ''}")
+        lines.append(f"  Total Debt:        {fmt(total_debt, billions=True)}{debt_note if total_debt is not None else ''}")
         lines.append(f"  Debt/Equity:       {fmt(de_ratio, suffix='%') if de_ratio else 'N/A'}")
         lines.append(f"  Current Ratio:     {fmt(info.get('currentRatio'), decimals=2)}")
         lines.append(f"  Quick Ratio:       {fmt(info.get('quickRatio'), decimals=2)}")
@@ -610,11 +737,44 @@ def get_technicals(ticker: str) -> str:
         ma200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
 
         # MA cross signal
+        # Nov 9 2026: the old label said "DEATH CROSS" whenever ma50 < ma200, even
+        # when the cross happened months ago and price had since recovered above
+        # both averages (NEE, SO, DUK). A cross is an EVENT; ma50-vs-ma200 is a
+        # STATE. Look back over the last 30 sessions for the actual crossover and
+        # only use the CROSS wording if one occurred; otherwise describe the state.
         if ma50 and ma200:
-            if ma50 > ma200:
-                ma_signal = "GOLDEN CROSS (bullish)"
+            _cross_kind, _cross_date, _cross_ago = None, None, None
+            try:
+                _n = len(closes)
+                _idx = list(hist.index)
+                _prev_state = None
+                _look = min(30, _n - 200)
+                for _k in range(_n - _look - 1, _n):
+                    if _k < 199:
+                        continue
+                    _m50 = sum(closes[_k - 49:_k + 1]) / 50
+                    _m200 = sum(closes[_k - 199:_k + 1]) / 200
+                    _state = _m50 > _m200
+                    if _prev_state is not None and _state != _prev_state:
+                        _cross_kind = "GOLDEN" if _state else "DEATH"
+                        _cross_date = str(_idx[_k])[:10]
+                        _cross_ago = _n - 1 - _k
+                    _prev_state = _state
+            except Exception:
+                _cross_kind = None
+            _above_both = current > ma50 and current > ma200
+            _below_both = current < ma50 and current < ma200
+            _px = (" | price above both MAs" if _above_both
+                   else " | price below both MAs" if _below_both
+                   else " | price between the MAs")
+            if _cross_kind == "GOLDEN":
+                ma_signal = (f"GOLDEN CROSS on {_cross_date} ({_cross_ago} sessions ago, bullish)" + _px)
+            elif _cross_kind == "DEATH":
+                ma_signal = (f"DEATH CROSS on {_cross_date} ({_cross_ago} sessions ago, bearish)" + _px)
+            elif ma50 > ma200:
+                ma_signal = "50D above 200D (bullish structure, no cross in last 30 sessions)" + _px
             else:
-                ma_signal = "DEATH CROSS (bearish)"
+                ma_signal = "50D below 200D (bearish structure, no cross in last 30 sessions)" + _px
         else:
             ma_signal = "Insufficient data"
 
