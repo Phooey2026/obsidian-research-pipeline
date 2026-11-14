@@ -828,11 +828,57 @@ FORMATTING — follow this exactly, every time, with no exceptions:
     is only reviewed once a week by this pipeline, so a daily-close
     convention implies monitoring that isn't actually happening and can't
     actually be acted on before the next weekly review anyway.
-    Be stingy with the ACCUMULATE
-    verdict. Companies with bearish momentum and weak earnings or revenues,
-    or have huge litigation risk, should be rated "AVOID". Good companies
-    that are seeing revenue and earnings weakness because of Macro economic
-    or political issues, but otherwise offer a lot of upside should be rated WATCH.
+
+    VERDICT DEFINITIONS (choose the one the evidence supports; WATCH is
+    not the safe default):
+
+    ACCUMULATE: the risk/reward is favorable and you would be comfortable
+    adding at the current price. Typically at least two of: valuation
+    attractive versus its own history or peers; fundamentals stable or
+    improving; open-market insider buying; technicals stabilizing or
+    constructive (including strong price momentum); an identifiable
+    catalyst. A macro headwind alone does
+    not disqualify a good company. A quality business at a discount
+    because of macro or sentiment is a valid ACCUMULATE if legal risk is
+    Low or Moderate and the balance sheet can carry it. Serious
+    unresolved legal risk (High or Critical) rules out ACCUMULATE.
+
+    AVOID: the risk/reward is unfavorable and you would not add, and
+    would consider reducing an existing position. Typically any of:
+    deteriorating revenue or earnings with bearish momentum; High or
+    Critical legal risk; heavy C-level open-market selling alongside
+    weakness; stretched valuation with decelerating growth AND a weak
+    price trend; balance-sheet stress. Valuation alone is never enough
+    for AVOID (see MOMENTUM below).
+
+    WATCH: the evidence is genuinely mixed, offsetting, or too incomplete
+    to lean either way, and you can name what would tip it toward
+    ACCUMULATE or AVOID. Do not use WATCH merely because you are unsure
+    or to avoid committing.
+
+    Weighing the evidence: the absence of insider buying is neutral, not
+    a negative. Only net insider selling counts against a stock, so do
+    not make ACCUMULATE contingent on insiders buying. Use the Atlas
+    macro backdrop to separate names it helps from names it hurts. A
+    market-wide headwind that affects every stock alike is not by itself
+    a reason to withhold ACCUMULATE.
+
+    MOMENTUM: do not fight momentum. A stock trading near its 52-week
+    high and above its 50-day and 200-day moving averages is not an
+    AVOID because of valuation, an overbought RSI, or a premium multiple
+    alone. Strong price action means the market is paying for something,
+    and this firm lets winners run. Rate such a stock WATCH or ACCUMULATE
+    unless its fundamentals are deteriorating or there is serious legal
+    or balance-sheet risk. Use stretched valuation and overbought
+    readings to set a tighter weekly-close stop-loss thesis, not to
+    downgrade to AVOID. Reserve AVOID for names where weak price action
+    (a bearish moving-average structure, broken support) confirms the
+    negative thesis.
+
+    Before finalizing, add one short line starting with "Counter-case:"
+    naming the strongest argument for each of the two verdicts you did
+    NOT choose and why it loses. If the argument for ACCUMULATE or AVOID
+    is stronger than the case for WATCH, choose it.
 
 IMPORTANT RULES:
 - Base analysis ONLY on data provided
@@ -845,9 +891,10 @@ IMPORTANT RULES:
 - Do not give percentage splits of causes (e.g. "two-thirds sentiment, one-third fundamentals"):
   they cannot be derived from the data. Describe drivers qualitatively.
 - If your analysis concludes the position should be reduced, say so in the first sentence of
-  the verdict rationale and make sure the verdict word does not contradict it (a broken
-  thesis is AVOID; otherwise WATCH with the trim stated explicitly). Do not leave reduce
-  language buried under a WATCH verdict.
+  the verdict rationale and make sure the verdict word does not contradict it. A reduce
+  conclusion means AVOID, unless it is purely a position-size or concentration trim on an
+  otherwise sound thesis, in which case WATCH with the trim stated explicitly. Do not leave
+  reduce language buried under a WATCH verdict.
 - NEWS WARNING: Yahoo Finance sometimes returns off-topic articles.
   Only reference news items that clearly relate to {ticker}.
   Ignore any news about other companies entirely.
