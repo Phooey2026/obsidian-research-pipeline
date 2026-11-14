@@ -2459,6 +2459,60 @@ were confirmed against real output; the rest were tested with mocks.
 - ✅ **`diag_xbrl.py` could only show a fixed concept list** — `--scan`,
   `+Concept`.
 
+### Resolved Issues (November 14, 2026 — Jansky's 11/14 review)
+
+Context: this week's Jupiter run (10:38) used the OLD "stingy ACCUMULATE" prompt; the new
+verdict-definition prompt in `weekly_research.py` was committed at 13:27 (`1781e88`) and has not
+run yet. Verdict mix this week: 1 ACCUMULATE / 123 WATCH / 4 AVOID. Jay said to ignore Jansky's
+Nova-record complaints this week (DDOG/FLUT/QSR summaries predated their new legal records).
+
+- ✅ **Atlas CPI YoY printed N/A for all 128 tickers (regression from the Nov 9 date-matching)** —
+  October 2026 CPI posted and FRED has no October 2025 CPI (shutdown), so the date-matched
+  12-month change found no base and returned None. New `_yoy_latest` / `_yoy_asof_note` in
+  `mcp/app2.py` return the YoY at the newest month that has a year-earlier value, with its date.
+  The yaml now has `core_cpi_yoy_as_of` / `headline_cpi_yoy_as_of` and a risk flag explaining
+  the gap; `get_cpi_data` and the macro snapshot show "as of" too; the core-CPI-vs-core-PCE gap
+  compares both at the same month. Live: core 2.57, headline 3.72, as of 2026-09-01. (live)
+- ✅ **CourtListener timeouts saved as data** — `fetch_courtlistener` returned
+  `"Error fetching CourtListener data for '<name>': "` (empty message: httpx timeouts have an
+  empty `str(e)`), and `nova_legal.py` only treated text starting with `ERROR` as a failure, so
+  FCX/GE/RTX (last week) and QSR (today) were saved with a ✓. Fix: 60s timeout with one retry and
+  the exception class in the message (`mcp/app3.py`); `nova_legal.py` retries any `Error...`
+  result twice (8s, 20s) and marks it ✗. QSR/FCX/GE/RTX re-run clean. Still holding failed court
+  text from before the fix: NVO, CMG, CVS (re-run next week). (live)
+- ✅ **Jansky saw only 15 of 24 High/Critical Nova tickers** — `jansky_review.py` listed
+  `high_risk[:15]` in the Nova pass prompt (dashboard `[:10]`); now 40 and 30.
+- ✅ **`get_energy_prices` EIA rows were weekly averages** — with no `frequency` parameter the EIA
+  v2 route returns its weekly series, each row the mean of that week's daily prices dated by the
+  week's last day (Brent "100.41 [11-06]" = mean of Nov 2-6; the 11-06 close was 97.83). The
+  4-week change therefore compared weekly averages (Mercury Brent -21.2%, weeks ending 10-09 vs
+  11-06) while Atlas compared daily closes (-27.2%, 10-14 vs 11-11), and the same-date futures
+  reconciliation compared an average with a close. `mcp/app4.py` now requests `frequency=daily`
+  for RWTC, RBRTE and RNGWHHD (weekly fallback labeled "WEEKLY AVERAGE"; gasoline and heating
+  oil stay weekly). Live: WTI 89.62 / Brent 92.14 [2026-11-11], 4-week -6.98% / -27.19% vs
+  2026-10-14, matching Atlas. Values print with 2 decimals (EIA returned "3" for 3.00). (live)
+- ℹ️ **GILD "duplicate" insider sale is real** — Dickinson and Mercier each sold 3,000 sh at
+  $156.22 on 2026-10-16 with different owned-after (161,096 / 113,684). Separate filings; no dedupe
+  bug. (`get_insider_trades` reads one reporting owner per filing; joint filings would be the
+  case to watch.)
+- ℹ️ **Summary artifacts** (`scan_summary_artifacts.py`): five real in 128 summaries (MRK leaked
+  "wait, per Nova..."; ODFL "Nessun"; PKG "WestRock/Smuri"; CCK "ÜMildly"; NEE "Tata" which the
+  scan misses). The scan also reports accented company names, "x" and "wait-and-see" as hits.
+  No lint added; revisit after the new prompt runs.
+- ℹ️ **Legal-risk label and the new ACCUMULATE rule** (for the rating methodology): the prompt
+  says High/Critical legal risk rules out ACCUMULATE and lists it as a typical AVOID reason, but
+  Nova's rubric defines High as "significant litigation with material exposure" with no scale
+  against company size, so 24 of 110 records are High (including AMZN, AAPL, GOOG, META). The
+  label also moves between runs (TSLA and GILD High -> Moderate on the same text, FCX Moderate ->
+  High). Options: add a materiality scale and a separate enforcement tag to Nova's rubric, or let
+  only Critical (or High + deteriorating fundamentals) bar ACCUMULATE. Jay is deciding offline.
+- ℹ️ **For Jansky's SOUL.md / Jupiter prompt**: the Utilities/Citi "stale XBRL quarterly table" is
+  the known SEC `companyfacts` lag (quarters are read from the filings by design), not a failed
+  job; the 21 passes are Atlas, Mercury, Nova, 16 sector passes, synthesis and trade review (so
+  SOUL.md should say 16 sector passes); transcript absence and intentional blank Nova legal
+  records are by design and should not appear as section-11 gaps.
+- Tools added: `show_jansky.py` (dump `jansky_latest.json` as text), `scan_summary_artifacts.py`.
+
 ### Resolved Issues (November 9, 2026 — Jansky's 11/7 review, first pass)
 
 - ✅ **MA label said "DEATH CROSS" for names above both averages** (NEE, SO, DUK) —
@@ -2472,12 +2526,15 @@ were confirmed against real output; the rest were tested with mocks.
   data. It now judges each gap line: flag if `impact: HIGH`, or if the subject mentions a
   critical series AND says missing/unavailable. Today it correctly names soybean crop
   condition and the EIA crude conflict.
-- ✅ **EIA spot vs futures "conflict"** — different dates, not bad data. `get_energy_prices`
+- ✅ **EIA spot vs futures "conflict"** — different dates, not bad data. (Nov 14 correction:
+  the EIA rows were WEEKLY AVERAGES, not daily prints, so the Nov 9 basis numbers compared an
+  average with a close; see the Nov 14 entry on `get_energy_prices`.) `get_energy_prices`
   (`mcp/app4.py`) now prints a same-date reconciliation: spot vs the futures close on EIA's
   print date, and the futures move since (Oct 30: WTI basis +$1.47, Brent +$3.53; futures
   since −17.7% / −22.4%). The old "Brent–WTI summary" sentence that blamed Dated Brent
-  premium was removed. EIA spot series are WEEKLY (Friday dates), so the "4-week change"
-  was already correct; it now also prints the comparison date.
+  premium was removed. EIA spot series came back WEEKLY (Friday dates) and the 4-week change
+  now prints its comparison date. (Nov 14: those weekly rows are averages, so the basis numbers
+  above are superseded; spot is now requested daily.)
 - ✅ **Yahoo returns N/A for Free Cash Flow / Total Cash / Total Debt intermittently**
   (15 of 128 names Saturday: 9 banks/insurers where FCF is not meaningful, plus VST, PKG,
   PENN, EPD, MCD, SPG). `get_fundamentals` falls back to SEC XBRL (`_xbrl_cash_debt_fcf`):

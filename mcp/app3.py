@@ -366,21 +366,29 @@ async def fetch_courtlistener(company_name: str, max_results: int = 10) -> str:
             cl_headers["Authorization"] = f"Token {cl_token}"
 
         async with httpx.AsyncClient(
-            timeout=30,
+            timeout=60,
             headers=cl_headers
         ) as client:
             # Primary: use the /search/ endpoint with type=d (dockets).
             # This endpoint accepts natural language queries and is more
             # forgiving than /dockets/ with company name strings.
-            resp = await client.get(
-                "https://www.courtlistener.com/api/rest/v4/search/",
-                params={
-                    "q":         search_name,
-                    "type":      "d",
-                    "order_by":  "score desc",
-                    "page_size": max_results,
-                }
-            )
+            resp = None
+            for _attempt in range(2):
+                try:
+                    resp = await client.get(
+                        "https://www.courtlistener.com/api/rest/v4/search/",
+                        params={
+                            "q":         search_name,
+                            "type":      "d",
+                            "order_by":  "score desc",
+                            "page_size": max_results,
+                        }
+                    )
+                    break
+                except (httpx.TimeoutException, httpx.TransportError):
+                    if _attempt == 1:
+                        raise
+                    await asyncio.sleep(5.0)
 
             # Fall back to /dockets/ if search endpoint returns an error
             if resp.status_code >= 400:
@@ -440,7 +448,10 @@ async def fetch_courtlistener(company_name: str, max_results: int = 10) -> str:
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error fetching CourtListener data for '{company_name}': {e}"
+        # httpx timeouts have an empty str(e); Nov 14 2026 four lookups (FCX, GE, RTX, QSR)
+        # came back as "Error fetching ... : " with nothing after the colon.
+        return (f"Error fetching CourtListener data for '{company_name}': "
+                f"{type(e).__name__}: {e}")
 
 
 @mcp.tool()

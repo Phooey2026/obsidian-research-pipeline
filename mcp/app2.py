@@ -226,6 +226,27 @@ def _yoy_pairs(obs_list: list[dict], months: int = 12):
     return out
 
 
+def _yoy_latest(obs_list: list[dict], months: int = 12):
+    """(yoy%, yoy_date, latest_obs_date): YoY at the newest observation that HAS a same-month
+    value a year earlier. Nov 14 2026: Oct 2026 CPI posted, and Oct 2025 CPI does not exist
+    (shutdown), so _pct_change(cpi, 12) returned None and the Atlas yaml printed core/headline
+    CPI YoY as N/A for every ticker. Here the Sept YoY is returned with its own date, and
+    callers show that date (yoy_date != latest_obs_date means the latest month has no YoY)."""
+    pairs = _yoy_pairs(obs_list, months)
+    pts = _obs_points(obs_list)
+    if not pairs or not pts:
+        return None, None, None
+    return pairs[-1][1], pairs[-1][0], pts[-1][0].strftime("%Y-%m-%d")
+
+
+def _yoy_asof_note(yoy_date, latest_date) -> str:
+    """'' when the YoY is for the latest observation, else a short explanation."""
+    if not yoy_date or not latest_date or yoy_date[:7] == latest_date[:7]:
+        return ""
+    return (f"  (as of {yoy_date[:7]}; {latest_date[:7]} YoY not computable - FRED has no "
+            f"{str(int(latest_date[:4]) - 1)}{latest_date[4:7]} value, a data gap not a feed failure)")
+
+
 def _change_over_days(obs_list: list[dict], days: int):
     """Percent change from the newest observation at least `days` calendar days older than the
     latest, plus that base date: (None, None) if there is no usable base. For DAILY series
@@ -389,31 +410,31 @@ async def get_cpi_data() -> str:
         cpi = await _fred_series("CPIAUCSL", limit=24, frequency="m")
         val, date = _latest(cpi)
         mom = _pct_change(cpi, 1)
-        yoy = _pct_change(cpi, 12)
+        yoy, _yd, _ld = _yoy_latest(cpi)
         lines.append(f"Headline CPI:     {val:.3f}  [{date}]")
         if mom is not None:
             lines.append(f"  MoM change:     {mom:+.2f}%")
         if yoy is not None:
-            lines.append(f"  YoY change:     {yoy:+.2f}%")
+            lines.append(f"  YoY change:     {yoy:+.2f}%{_yoy_asof_note(_yd, _ld)}")
 
         # Core CPI (Less Food & Energy)
         core = await _fred_series("CPILFESL", limit=24, frequency="m")
         cval, cdate = _latest(core)
         cmom = _pct_change(core, 1)
-        cyoy = _pct_change(core, 12)
+        cyoy, _cyd, _cld = _yoy_latest(core)
         lines.append(f"\nCore CPI:         {cval:.3f}  [{cdate}]")
         if cmom is not None:
             lines.append(f"  MoM change:     {cmom:+.2f}%")
         if cyoy is not None:
-            lines.append(f"  YoY change:     {cyoy:+.2f}%")
+            lines.append(f"  YoY change:     {cyoy:+.2f}%{_yoy_asof_note(_cyd, _cld)}")
 
         # Shelter CPI
         shelter = await _fred_series("CUSR0000SAH1", limit=24, frequency="m")
         sval, sdate = _latest(shelter)
-        syoy = _pct_change(shelter, 12)
+        syoy, _syd, _sld = _yoy_latest(shelter)
         lines.append(f"\nShelter CPI:      {sval:.3f}  [{sdate}]")
         if syoy is not None:
-            lines.append(f"  YoY change:     {syoy:+.2f}%")
+            lines.append(f"  YoY change:     {syoy:+.2f}%{_yoy_asof_note(_syd, _sld)}")
 
         # 12-month headline CPI history
         lines.append("\nHeadline CPI YoY trend (last 12 months):")
@@ -1151,9 +1172,11 @@ async def get_macro_snapshot() -> str:
                 # Compute YoY for index-level series
                 try:
                     obs = await _fred_series(sid, limit=24, frequency="m")
-                    yoy = _pct_change(obs, 12)
+                    yoy, _yd, _ld = _yoy_latest(obs)
                     if yoy is not None:
-                        lines.append(f"  {label:<28} {yoy:+.2f}%  [{date}]")
+                        lines.append(f"  {label:<28} {yoy:+.2f}%  [{_yd}]"
+                                     + (f"  (latest obs {date}: no YoY, base month missing)"
+                                        if _yd != date else ""))
                         continue
                 except Exception:
                     pass
@@ -1243,8 +1266,11 @@ async def build_macro_backdrop() -> str:
     # Nov 9 2026: date-matched (see _pct_change): CPI has no Oct 2025 value, so index-based
     # "12 back" was a 13-month change.
     pce_yoy = _pct_change(pce_obs, 12)
-    cpi_yoy = _pct_change(cpi_obs, 12)
-    hcpi_yoy = _pct_change(hcpi_obs, 12)
+    # Nov 14 2026: CPI uses the newest month that has a year-earlier value (Oct 2025 is
+    # missing, so once Oct 2026 posted the plain 12-month change returned None -> "N/A").
+    cpi_yoy, _cpi_yoy_date, _cpi_latest = _yoy_latest(cpi_obs)
+    hcpi_yoy, _hcpi_yoy_date, _hcpi_latest = _yoy_latest(hcpi_obs)
+    _cpi_gap_note = _yoy_asof_note(_cpi_yoy_date, _cpi_latest).strip()
 
     # Nov 9 2026: 4-week oil change is now 28 calendar days, and both series are cut at their
     # COMMON latest date. Atlas printed Brent -14.7% vs WTI +3.5% because index counting over
@@ -1281,7 +1307,10 @@ async def build_macro_backdrop() -> str:
     _oil_diverge = (abs(brent_4w - wti_4w)
                     if (brent_4w is not None and wti_4w is not None) else None)
     # Nov 9 2026 (Jansky): core CPI below core PCE is unusual (CPI normally runs higher).
-    _cpi_pce_gap = (pce_yoy - cpi_yoy) if (pce_yoy is not None and cpi_yoy is not None) else None
+    # Compare core PCE at the SAME month as the core CPI YoY (PCE posts later than CPI).
+    _pce_pairs = dict(_yoy_pairs(pce_obs))
+    _pce_at_cpi = _pce_pairs.get(_cpi_yoy_date) if _cpi_yoy_date else None
+    _cpi_pce_gap = (_pce_at_cpi - cpi_yoy) if (_pce_at_cpi is not None and cpi_yoy is not None) else None
     _cpi_pce_flag = _cpi_pce_gap is not None and _cpi_pce_gap > 0.25
 
     m2_yoy = _pct_change(m2_obs, 12)
@@ -1435,7 +1464,9 @@ async def build_macro_backdrop() -> str:
         f"  key_metrics:",
         f"    core_pce_yoy: {f'{(pce_yoy):.2f}' if pce_yoy else 'N/A'}",
         f"    core_cpi_yoy: {f'{(cpi_yoy):.2f}' if cpi_yoy else 'N/A'}",
+        f"    core_cpi_yoy_as_of: \"{_cpi_yoy_date or 'N/A'}\"",
         f"    headline_cpi_yoy: {f'{(hcpi_yoy):.2f}' if hcpi_yoy else 'N/A'}",
+        f"    headline_cpi_yoy_as_of: \"{_hcpi_yoy_date or 'N/A'}\"",
         f"    michigan_1y_inflation_expectation: {f'{(mich1_val):.1f}' if mich1_val else 'N/A'}",
         f"    wti_usd_bbl: {f'{(wti_val):.2f}' if wti_val else 'N/A'}",
         f"    wti_4w_change_pct: {f'{(wti_4w):.1f}' if wti_4w is not None else 'N/A'}",
@@ -1460,13 +1491,18 @@ async def build_macro_backdrop() -> str:
         lines.append(f"    - \"10Y breakeven {be10_val:.2f}% — market pricing persistent inflation\"")
     if _oil_shock_flag:
         lines.append(_oil_shock_msg)
+    if _cpi_yoy_date and _cpi_latest and _cpi_yoy_date[:7] != _cpi_latest[:7]:
+        lines.append(
+            f"    - \"CPI YoY is shown as of {_cpi_yoy_date[:7]}: the {_cpi_latest[:7]} YoY cannot be computed "
+            f"because FRED has no October 2025 CPI (shutdown). This is a known data gap, not a feed "
+            f"failure; CPI MoM is current and core PCE is the cleaner gauge.\"")
     if _cpi_pce_flag:
         _cause = (" Likely cause: no October 2025 CPI was collected (government shutdown) and housing rents "
                   "were carried forward, biasing measured CPI shelter low until those months leave the "
                   "12-month window."
                   if (cpi_date != "N/A" and cpi_date < "2026-12-01") else "")
         lines.append(
-            f"    - \"Core CPI ({cpi_yoy:.2f}%) is {_cpi_pce_gap:.2f}pts BELOW core PCE ({pce_yoy:.2f}%) — "
+            f"    - \"Core CPI ({cpi_yoy:.2f}%, {_cpi_yoy_date[:7]}) is {_cpi_pce_gap:.2f}pts BELOW core PCE ({_pce_at_cpi:.2f}%) — "
             f"unusual, CPI normally runs above PCE.{_cause} Treat core PCE as the cleaner inflation gauge; "
             f"do not read the gap as disinflation.\"")
     if _oil_diverge is not None and _oil_diverge > 8:

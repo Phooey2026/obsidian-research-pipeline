@@ -831,24 +831,45 @@ async def get_energy_prices() -> str:
         async with httpx.AsyncClient(timeout=30) as client:
             for label, route, series_id in eia_routes:
                 try:
-                    r = await client.get(
-                        route,
-                        params={
-                            "api_key":              EIA_API_KEY,
-                            "data[]":               "value",
-                            "facets[series][]":     series_id,
-                            "sort[0][column]":      "period",
-                            "sort[0][direction]":   "desc",
-                            "length":               "40",
-                        },
-                    )
+                    # Nov 14 2026: with no `frequency` param EIA returns its WEEKLY series for these
+                    # routes, and each weekly row is the AVERAGE of that week's daily prices, dated
+                    # by the week's last day (Brent "100.41 [2026-11-06]" was the mean of Nov 2-6;
+                    # the Nov 6 close was 97.83). That made the "4-week change" a change between
+                    # weekly averages and the same-date futures reconciliation compare an average
+                    # with a close. Ask for DAILY where it exists; fall back to weekly and say so.
+                    _daily = series_id in ("RWTC", "RBRTE", "RNGWHHD")
+                    _weekly_fallback = False
+                    _params = {
+                        "api_key":              EIA_API_KEY,
+                        "data[]":               "value",
+                        "facets[series][]":     series_id,
+                        "sort[0][column]":      "period",
+                        "sort[0][direction]":   "desc",
+                        "length":               "40",
+                    }
+                    if _daily:
+                        _params["frequency"] = "daily"
+                    r = await client.get(route, params=_params)
                     r.raise_for_status()
                     series_data = r.json().get("response", {}).get("data", [])
+                    if _daily and not series_data:
+                        _params.pop("frequency", None)
+                        r = await client.get(route, params=_params)
+                        r.raise_for_status()
+                        series_data = r.json().get("response", {}).get("data", [])
+                        _weekly_fallback = bool(series_data)
                     if series_data:
                         latest = series_data[0]
                         val    = latest.get("value")
                         period = latest.get("period", "N/A")
-                        lines.append(f"{label:<45} {val}  [{period}]")
+                        try:
+                            if _daily:
+                                val = f"{float(val):.2f}"     # EIA can return "3" for 3.00
+                        except Exception:
+                            pass
+                        lines.append(f"{label:<45} {val}  [{period}]"
+                                     + ("  (WEEKLY AVERAGE: daily series unavailable)"
+                                        if _weekly_fallback else ""))
                         if series_id in ("RWTC", "RBRTE"):
                             try:
                                 _spot_info[series_id] = (float(val), str(period))

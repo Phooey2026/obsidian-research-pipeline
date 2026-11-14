@@ -702,7 +702,7 @@ Stale Legal Records (>{LEGAL_STALE_DAYS} days old — need refresh):
 {chr(10).join(stale_legal[:20]) if stale_legal else '  None'}
 
 High/Critical Risk Tickers (Jupiter must be aware):
-{chr(10).join(high_risk[:15]) if high_risk else '  None'}
+{chr(10).join(high_risk[:40]) if high_risk else '  None'}
 
 Low Confidence Legal Research (may need re-run):
 {', '.join(low_confidence[:20]) if low_confidence else 'None'}
@@ -2022,7 +2022,7 @@ def build_dashboard_fragment(report: dict, run_date: str) -> str:
         {'<div style="background:#f59e0b11;border:1px solid #f59e0b44;border-radius:6px;padding:16px;margin-bottom:12px;"><div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:#f59e0b;margin-bottom:10px;">⚠ Stale Earnings Records</div>' + ''.join(f'<div style="font-size:12px;color:#f59e0b;padding:2px 0;">{t}</div>' for t in stale_earn[:15]) + '</div>' if stale_earn else ''}
 
         <!-- High risk -->
-        {'<div style="background:#ef444411;border:1px solid #ef444444;border-radius:6px;padding:16px;"><div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:#ef4444;margin-bottom:10px;">🔴 High/Critical Legal Risk</div>' + ''.join(f'<div style="font-size:12px;color:#ef4444;padding:2px 0;">{t}</div>' for t in high_risk[:10]) + '</div>' if high_risk else ''}
+        {'<div style="background:#ef444411;border:1px solid #ef444444;border-radius:6px;padding:16px;"><div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:#ef4444;margin-bottom:10px;">🔴 High/Critical Legal Risk</div>' + ''.join(f'<div style="font-size:12px;color:#ef4444;padding:2px 0;">{t}</div>' for t in high_risk[:30]) + '</div>' if high_risk else ''}
       </div>
 
     </div>

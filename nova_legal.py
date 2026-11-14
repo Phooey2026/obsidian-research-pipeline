@@ -413,8 +413,21 @@ def research_legal(ticker: str, company_name: str,
                     data = f"ERROR: max retries ({e.snippet[:60]})"
         if data is None:
             data = f"ERROR: no data returned"
+        # novamcp tools return failures as text ("Error fetching CourtListener data ...").
+        # Those used to be saved as data with a ✓ (FCX, GE, RTX, QSR, Nov 2026), so retry
+        # twice and mark them ✗ if they persist.
+        for _wait in (8, 20):
+            if not data.startswith(("Error", "ERROR")):
+                break
+            print(f"↺ tool error ({data[:50]!r}), wait {_wait}s...", end=" ", flush=True)
+            time.sleep(_wait)
+            try:
+                data = call_tool(tool, args,
+                                 mcp_url=WEBMCP_URL if key == "web_item3" else NOVAMCP_URL)
+            except _RetryableError:
+                pass
         results[key] = data
-        status = "✓" if not data.startswith("ERROR") else "✗"
+        status = "✓" if not data.startswith(("Error", "ERROR")) else "✗"
         print(f"{status} ({len(data):,} chars)")
         time.sleep(3.0)     # be polite to external APIs / DDG rate limits
 
