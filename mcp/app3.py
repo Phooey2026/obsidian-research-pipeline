@@ -351,11 +351,21 @@ async def fetch_courtlistener(company_name: str, max_results: int = 10) -> str:
         #      "Advanced Micro Devices, Inc." → "Advanced Micro Devices"
         _suffix_re = re.compile(
             r',?\s+(Inc\.?|Corp\.?|Corporation|Ltd\.?|LLC|L\.L\.C\.|'
-            r'Limited|PLC|plc|Co\.?|Company|Group|Holdings?|Incorporated)'
+            r'Limited|PLC|plc|Co\.?|Company|Group|Holdings?|Incorporated|'
+            # Foreign legal forms (a slash in "A/S" makes the dockets
+            # endpoint return 400, e.g. "Novo Nordisk A/S")
+            r'A/S|ASA|AB|AG|SE|N\.?V\.?|B\.?V\.?|S\.?A\.?|S\.?p\.?A\.?|'
+            r'KGaA|Oyj|S\.?A\.?B\.? de C\.?V\.?)'
             r'\s*$',
             re.IGNORECASE
         )
-        search_name = _suffix_re.sub("", company_name).strip().rstrip(",")
+        search_name = company_name
+        for _ in range(3):  # stacked suffixes, e.g. "Holdings Ltd"
+            _new = _suffix_re.sub("", search_name).strip().rstrip(",")
+            if _new == search_name or not _new:
+                break
+            search_name = _new
+        search_name = search_name.replace("/", " ").strip() or company_name
 
         # Build auth header — degrades gracefully if key not present
         cl_token  = os.environ.get("COURTLISTENER_API_KEY", "")

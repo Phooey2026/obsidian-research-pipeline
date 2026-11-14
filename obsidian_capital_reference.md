@@ -2479,7 +2479,15 @@ Nova-record complaints this week (DDOG/FLUT/QSR summaries predated their new leg
   FCX/GE/RTX (last week) and QSR (today) were saved with a ✓. Fix: 60s timeout with one retry and
   the exception class in the message (`mcp/app3.py`); `nova_legal.py` retries any `Error...`
   result twice (8s, 20s) and marks it ✗. QSR/FCX/GE/RTX re-run clean. Still holding failed court
-  text from before the fix: NVO, CMG, CVS (re-run next week). (live)
+  text from before the fix: NVO, CMG, CVS. CMG and CVS re-ran clean; NVO failed for a different
+  reason (next item). (live)
+- ✅ **NVO CourtListener 400 Bad Request** — the company name "Novo Nordisk A/S" was not stripped
+  of `A/S`, and the slash went into the query (`A%2FS`), which the dockets endpoint rejects.
+  `fetch_courtlistener` (`mcp/app3.py`) now strips foreign legal forms (A/S, ASA, AB, AG, SE, N.V.,
+  B.V., S.A., S.p.A., KGaA, Oyj, S.A.B. de C.V.), including stacked suffixes, and replaces any
+  remaining `/` with a space. NVO re-run: court 6,779 chars (Ozempic/Wegovy product-liability suits,
+  E.D. Pa.), risk Moderate, confidence Medium. Any foreign filer whose name had a slash or a European
+  legal form had no court data before this. (live)
 - ✅ **Jansky saw only 15 of 24 High/Critical Nova tickers** — `jansky_review.py` listed
   `high_risk[:15]` in the Nova pass prompt (dashboard `[:10]`); now 40 and 30.
 - ✅ **`get_energy_prices` EIA rows were weekly averages** — with no `frequency` parameter the EIA
