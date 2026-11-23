@@ -426,6 +426,14 @@ python3 pipeline_health.py
 #    pool can empty out until the container restarts. Runs are manual, so run it first.
 python3 searxng_preflight.py     # runs are launched by hand, so this is just step 0 of the manual sequence
 
+# 0b. Refresh Neptune's price marks BEFORE the agents run (added Nov 23, 2026).
+#    Mercury and Jupiter read neptune_holdings.json for position size, weight and
+#    return. Until now the only price refresh was step 8, after Jupiter, so a week of
+#    market moves left them on the previous settlement's marks (Nov 21: portfolio
+#    $199.7M on stale marks vs $189.3M refreshed; Jansky found 10+ stale tickers, QCOM
+#    return +9.9% shown vs -4.5%). Prices only; no trades are settled.
+python3 settle_portfolio.py --skip-settlement
+
 # 1. Macro research (Atlas + FRED + Fed Communications)
 python3 weekly_macro.py
 
@@ -2458,6 +2466,74 @@ were confirmed against real output; the rest were tested with mocks.
   summary line shows `= Unchanged`. `--force` / named tickers still rewrite.
 - ✅ **`diag_xbrl.py` could only show a fixed concept list** — `--scan`,
   `+Concept`.
+
+### Changes (November 23, 2026 — Jupiter legal materiality)
+
+First run of the new verdict-definition prompt (`1781e88`, Nov 21): 42 ACCUMULATE / 65 WATCH /
+21 AVOID (last week 1 / 123 / 4; sector listing, hand count). The prompt's rule "High or Critical
+legal risk rules out ACCUMULATE" held: none of the 19 High-legal names from the Sept records was
+ACCUMULATE (8 AVOID, 11 WATCH; CVS WATCH, FCX AVOID after this week's re-runs), and AVOID ran 42%
+among High-legal names against 16% overall. Jay's call: legal risk is relative to company size
+(AAPL, GOOG, AMZN etc. are not a concern) and at least half of the High names should be
+ACCUMULATE-eligible. No quota was added (a forced quota caused the Sept verdict/summary mismatch).
+
+- ✅ **Legal rule changed from severity to materiality** (`weekly_research.py`, Jupiter's prompt):
+  - Section 9 gains a required line `Materiality:` rating the exposure Immaterial / Manageable /
+    Material / Existential relative to this company's size (market cap, annual free cash flow,
+    cash and liquidity in the DATA), naming the one proceeding that drives it. Material or
+    Existential = worst case is a large share of equity value or earnings, or a structural remedy
+    (injunction, breakup, product ban, loss of license), or unquantifiable exposure at a company
+    too small or leveraged to absorb it.
+  - ACCUMULATE: a High or Critical severity label from Nova or the 10-K no longer rules it out;
+    Material or Existential exposure does. AVOID: "Material or Existential legal exposure relative
+    to company size" replaces "High or Critical legal risk". MOMENTUM and the IMPORTANT RULES say
+    "material legal exposure" / "judged relative to company size".
+  - The Nova legal block injected into the prompt now ends with a note that Nova's risk level is
+    severity and not scaled to company size. Nova's own rubric (`nova_legal.py`) is unchanged.
+  - Jupiter's `SOUL.md` carried the old rule ("serious unresolved litigation is not an
+    ACCUMULATE") and is updated to match: legal risk judged relative to company size, and Nova's
+    risk level is severity, not materiality (`Jupiter_SOUL.md`; lives in the Jupiter profile, not
+    in the repo).
+  - Nov 21 High-legal names (24): 13 WATCH (AAPL AMGN AMZN BYD CRM CVS GOOG INTC LLY LMT RIO RTX
+    WFC) and 11 AVOID (BA BHP CHRW ELV FCX FLUT HUM IP META VALE VST); none ACCUMULATE.
+  - Verdict parsing is unchanged (`Overall Verdict` regex); nothing parses the Risk level or the
+    new Materiality line. To check on the next run: `python3 verdict_mix.py --why` (ACCUMULATE
+    count among High-legal names, and the stated reasons for the rest).
+
+- ✅ **Jansky pass 10 (Banks) failed: `[Errno 7] Argument list too long: 'jansky'`** (Nov 23). Not
+  a model-context limit: `_call_jansky` passes the whole prompt as one argv string, and Linux caps
+  a single argv string at 131,072 BYTES (E2BIG; a kernel constant). Banks was 138,248 chars (9
+  tickers); the new Jupiter prompt writes longer summaries (Materiality and Counter-case lines),
+  and other sectors sat close (Real_Estate 123k, Insurance 122k chars). The Synthesis pass already
+  had a byte budget; the sector passes did not. `pass_jupiter_sector` in `jansky_review.py` now
+  builds the prompt, and if it exceeds `SECTOR_PROMPT_MAX_BYTES` (128,000 bytes, counted in UTF-8
+  bytes, not chars; the Synthesis pass keeps its own 120,000) reviews the sector in the fewest
+  balanced parts that fit, each with COMPLETE
+  summaries (Banks: 4 + 5 tickers), labelled "[Part k/n: tickers]" in the sector note. Nothing is
+  trimmed. The "Context: N chars" line counts characters, so it understates bytes when summaries
+  hold box-drawing or em-dash characters. The other agents' prompts are well under the limit
+  (Jupiter's data is capped at 85,000 chars). If Hermes' oneshot mode can read a prompt from stdin
+  or a file, that would remove the limit and the split could be dropped. Mock-tested with
+  Banks-sized, unicode-heavy and oversize sectors. Nov 23 re-run: Banks split 4 + 5, both OK
+  (141,279 bytes). Insurance (124,363 bytes) and Real_Estate (126,453) were also split at the
+  first 120,000 budget though they had run fine unsplit that morning, hence the 128,000 sector
+  budget. `jansky -z -` does not read stdin (the model receives the literal "-"), so splitting
+  is the only route past the limit.
+
+- ✅ **Atlas's prose never mentioned oil; its summary prompt was cutting off the YAML**
+  (`weekly_macro.py`, Nov 23). The macro YAML has had `wti_4w_change_pct` / `brent_4w_change_pct`
+  / the Brent-WTI spread since Nov 9 (Nov 21: WTI -17.0, Brent -19.3), and Jupiter and Mercury
+  read the YAML directly. But `generate_summary` sent `raw_text[:12000]` and the sixteen sections
+  total ~19,200 chars, so the cut kept only 59% of Fed Communications and dropped the whole
+  BUILD YAML BACKDROP section (oil, CPI as-of, the risk flags) before Atlas wrote a word. Jansky's
+  "oil never made it into Atlas's backdrop" was therefore half right: in the YAML, not in the
+  commentary. Fix: the cap is now 30,000 with a printed warning if it ever cuts, and Section 2
+  (Inflation Picture) asks for oil when present: the 4-week move and Brent-WTI spread, a 10%+
+  move treated as a headline factor, pass-through to PPI/CPI, breakevens and energy-linked
+  sectors, and no cause the data does not state. Atlas's `SOUL.md` is deliberately NOT prepended
+  to the oneshot prompt (see the comment in `generate_summary`), so the prompt in
+  `weekly_macro.py` is what drives the weekly briefing; `Atlas_SOUL.md` carries the same
+  guidance for consistency. Mock-tested: the YAML and the full Fed text now reach the prompt.
 
 ### Resolved Issues (November 14, 2026 — Jansky's 11/14 review)
 

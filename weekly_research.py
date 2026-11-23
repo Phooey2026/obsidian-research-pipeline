@@ -408,7 +408,9 @@ def _build_nova_preamble(ticker: str, nova_data: dict) -> str:
                 f"{intro}\n\n"
                 f"{summary}\n\n"
                 f"Nova Risk Assessment: {risk}  |  "
-                f"Research Confidence: {confidence}"
+                f"Research Confidence: {confidence}\n"
+                f"Note: Nova's risk level rates the severity of the proceedings and is NOT "
+                f"scaled to company size. Judge materiality yourself in section 9."
             )
             sections.append(legal_block)
 
@@ -793,7 +795,18 @@ FORMATTING — follow this exactly, every time, with no exceptions:
 
 ## 9. LEGAL & REGULATORY RISK
    - Active material lawsuits or regulatory actions
-   - Risk level: Low / Moderate / High / Critical
+   - Risk level: Low / Moderate / High / Critical (the severity of the proceedings as such)
+   - Materiality: on its own line starting "Materiality:", rate the legal exposure
+     relative to THIS company's size as Immaterial / Manageable / Material / Existential,
+     and name the one proceeding that drives the rating. Judge it against market cap,
+     annual free cash flow, and cash and liquidity in the DATA. A large proceeding at a
+     large-cap or mega-cap with strong cash flow is usually Immaterial or Manageable: a
+     fine, settlement, or damages award that is a small fraction of market cap or of a
+     year of free cash flow is not a threat to the equity. Rate Material or Existential
+     only when the worst case is a large share of equity value or earnings, or the remedy
+     is structural (an injunction, forced breakup, product ban, or loss of a license or
+     franchise), or the exposure is unquantifiable and the company is too small or too
+     leveraged to absorb it. If the DATA does not let you size the exposure, say so.
    - If the SEC EDGAR 10-K legal tool fails to extract any data or provides
      insufficient data to form a legal opinion, you MUST flag the company.
    - If Nova has provided legal research above, use it as the primary source
@@ -839,14 +852,19 @@ FORMATTING — follow this exactly, every time, with no exceptions:
     constructive (including strong price momentum); an identifiable
     catalyst. A macro headwind alone does
     not disqualify a good company. A quality business at a discount
-    because of macro or sentiment is a valid ACCUMULATE if legal risk is
-    Low or Moderate and the balance sheet can carry it. Serious
-    unresolved legal risk (High or Critical) rules out ACCUMULATE.
+    because of macro or sentiment is a valid ACCUMULATE if its legal
+    exposure is Immaterial or Manageable for a company of this size (the
+    section 9 Materiality line) and the balance sheet can carry it. A High
+    or Critical severity label from Nova or the 10-K does not by itself
+    rule out ACCUMULATE: legal risk is relative to company size, and a
+    large, cash-generative company can absorb proceedings that would sink
+    a small one. Material or Existential legal exposure rules out
+    ACCUMULATE.
 
     AVOID: the risk/reward is unfavorable and you would not add, and
     would consider reducing an existing position. Typically any of:
-    deteriorating revenue or earnings with bearish momentum; High or
-    Critical legal risk; heavy C-level open-market selling alongside
+    deteriorating revenue or earnings with bearish momentum; Material or
+    Existential legal exposure relative to company size; heavy C-level open-market selling alongside
     weakness; stretched valuation with decelerating growth AND a weak
     price trend; balance-sheet stress. Valuation alone is never enough
     for AVOID (see MOMENTUM below).
@@ -868,8 +886,8 @@ FORMATTING — follow this exactly, every time, with no exceptions:
     AVOID because of valuation, an overbought RSI, or a premium multiple
     alone. Strong price action means the market is paying for something,
     and this firm lets winners run. Rate such a stock WATCH or ACCUMULATE
-    unless its fundamentals are deteriorating or there is serious legal
-    or balance-sheet risk. Use stretched valuation and overbought
+    unless its fundamentals are deteriorating or there is material legal
+    exposure or balance-sheet risk. Use stretched valuation and overbought
     readings to set a tighter weekly-close stop-loss thesis, not to
     downgrade to AVOID. Reserve AVOID for names where weak price action
     (a bearish moving-average structure, broken support) confirms the
@@ -884,7 +902,8 @@ IMPORTANT RULES:
 - Base analysis ONLY on data provided
 - Flag ALL missing data explicitly in section 11
 - Never invent metrics not present in the data
-- Legal risk is a first-class consideration
+- Legal risk is a first-class consideration, judged relative to company size: the
+  Nova or 10-K severity label is an input, and the Materiality line is what decides
 - Insider open market trades outweigh analyst ratings
 - PROVENANCE: credit Nova (or any source) only for data actually present above. If a
   Nova record is blank or absent, write "no Nova record" instead of calling it authoritative.

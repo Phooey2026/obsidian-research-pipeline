@@ -288,6 +288,15 @@ def generate_summary(all_data: dict, run_date: str) -> str:
         if isinstance(content, str) and content and not content.startswith("Error")
     ])
 
+    # (Nov 2026) The prompt used raw_text[:12000], but the sixteen sections add up to ~19,000
+    # chars: it kept only 59% of Fed Communications and cut the BUILD YAML BACKDROP section
+    # (wti_4w_change_pct, brent_4w_change_pct, the Brent-WTI spread, CPI as-of, the risk
+    # flags) entirely, so Atlas's prose could never mention oil. Atlas's model has plenty
+    # of room; keep everything and say so if it ever has to cut.
+    _RAW_MAX = 30_000
+    if len(raw_text) > _RAW_MAX:
+        print(f"\n  ⚠ Atlas raw data is {len(raw_text):,} chars; cutting the tail to {_RAW_MAX:,}")
+
     prompt = f"""You are Atlas, macroeconomic research specialist at Obsidian Capital.
 Your task: produce the weekly macroeconomic intelligence briefing
 for {run_date}. Structure your report EXACTLY as follows:
@@ -303,7 +312,14 @@ numeric series below. If no communications were found, rely on the
 numeric data alone as before.]
 
 ### 2. INFLATION PICTURE
-[2-3 sentences on PCE, CPI, PPI trends, breakevens]
+[3-4 sentences on PCE, CPI, PPI trends, breakevens, and oil. Oil is a macro
+factor: when the data includes WTI/Brent (wti_usd_bbl, brent_usd_bbl,
+wti_4w_change_pct, brent_4w_change_pct, brent_wti_spread_usd and its
+start-of-window value in the YAML backdrop section), state the 4-week move
+and the Brent-WTI spread, treat a move of 10% or more as a headline factor
+for the week, and say what it implies for PPI/CPI pass-through, breakevens,
+and energy-linked sectors. Do not assert a cause (supply, demand, OPEC) that
+the data does not state.]
 
 ### 3. LABOR MARKET
 [2-3 sentences on payrolls, unemployment, claims, wage pressure]
@@ -335,7 +351,7 @@ Be precise, data-driven, and actionable. Every claim must be anchored
 to a specific data point from the raw data provided below.
 
 --- RAW MACRO DATA ---
-{raw_text[:12000]}
+{raw_text[:_RAW_MAX]}
 --- END RAW DATA ---"""
 
     try:

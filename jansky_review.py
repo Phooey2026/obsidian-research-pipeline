@@ -855,18 +855,42 @@ def pass_jupiter_sector(sector: str, tickers: list[str],
                 f"  {ticker}: Legal={risk}, EarningsCall={cdate}"
             )
 
-    nova_context = "\n".join(sector_nova_context)
     all_ticker_text = "\n\n".join(ticker_sections)
 
     # Estimate size and warn if large
     total_chars = len(all_ticker_text)
     print(f"    Context: {total_chars:,} chars across {len(tickers)} tickers (full summaries)")
 
-    prompt = f"""You are Jansky, Head of AI Operations at Obsidian Capital.
+    # (Nov 2026) The whole prompt travels as ONE argv string, and Linux caps a
+    # single argv string at 131,072 BYTES (E2BIG, "Errno 7 Argument list too
+    # long"). That is an OS limit, not the model's context window. The new
+    # Jupiter prompt writes longer summaries, so Banks (9 tickers, 138k chars)
+    # failed outright and several other sectors sit within a few KB of the
+    # limit (see SECTOR_PROMPT_MAX_BYTES). A sector that does not fit is reviewed in 2+ parts, each with
+    # complete summaries, rather than trimming anything.
+    nova_by_ticker = {}
+    for ticker in tickers:
+        nova_rec = nova.get(ticker, {})
+        if nova_rec:
+            legal    = nova_rec.get("legal", {})
+            earnings = nova_rec.get("earnings", {})
+            risk     = legal.get("risk_level", "—")
+            cdate    = earnings.get("call_date", "—")[:10]
+            nova_by_ticker[ticker] = f"  {ticker}: Legal={risk}, EarningsCall={cdate}"
+
+    def _prompt(part_tickers: list[str], part_text: str, part: tuple | None) -> str:
+        nova_context = "\n".join(nova_by_ticker[t] for t in part_tickers if t in nova_by_ticker)
+        part_note = (
+            f"\nThis is PART {part[0]} of {part[1]} of the {sector} review. The sector was "
+            f"split only because of a size limit. Review ONLY the tickers listed here; "
+            f"your 3-5 sentence sector summary covers only them.\n"
+            if part else ""
+        )
+        return f"""You are Jansky, Head of AI Operations at Obsidian Capital.
 
 You are reviewing Jupiter's weekly analysis for the {sector} sector
-({len(tickers)} tickers: {', '.join(tickers)}).
-
+({len(part_tickers)} tickers: {', '.join(part_tickers)}).
+{part_note}
 You are seeing Jupiter's COMPLETE analysis for each ticker (all 13 sections),
 plus any automated flags our system detected. Review the full report — pay
 particular attention to sections 7 (Insider Activity), 8 (Institutional
@@ -895,10 +919,48 @@ Do NOT re-summarize what Jupiter wrote. Focus on quality assessment.
 Total response: 250-350 words.
 
 JUPITER'S {sector.upper()} SECTOR ANALYSIS:
-{all_ticker_text}
+{part_text}
 """
 
-    return _call_jansky(prompt, f"Jupiter/{sector}"), python_flags
+    def _bytes(text: str) -> int:
+        return len(text.encode("utf-8"))
+
+    whole = _prompt(tickers, all_ticker_text, None)
+    if _bytes(whole) <= SECTOR_PROMPT_MAX_BYTES:
+        return _call_jansky(whole, f"Jupiter/{sector}"), python_flags
+
+    # Split into the fewest parts that each fit, balanced by size.
+    blocks = list(zip(tickers, ticker_sections))
+    overhead = _bytes(_prompt(tickers, "", (9, 9)))
+    budget = SECTOR_PROMPT_MAX_BYTES - overhead
+    sizes = [_bytes(b) + 2 for _, b in blocks]          # +2 for the "\n\n" joiner
+    parts: list[list[int]] = []
+    n_parts = max(2, -(-sum(sizes) // budget))
+    while True:
+        target = sum(sizes) / n_parts
+        parts, cur, cur_size = [], [], 0
+        for i, sz in enumerate(sizes):
+            if cur and cur_size + sz > target and len(parts) < n_parts - 1:
+                parts.append(cur)
+                cur, cur_size = [], 0
+            cur.append(i)
+            cur_size += sz
+        parts.append(cur)
+        if all(sum(sizes[i] for i in grp) <= budget for grp in parts) or n_parts >= len(blocks):
+            break
+        n_parts += 1
+    print(f"    Over the {SECTOR_PROMPT_MAX_BYTES:,}-byte argv limit "
+          f"({_bytes(whole):,} bytes): reviewing in {len(parts)} parts "
+          f"({', '.join(str(len(g)) for g in parts)} tickers)")
+
+    outputs = []
+    for k, grp in enumerate(parts, 1):
+        part_tickers = [blocks[i][0] for i in grp]
+        part_text = "\n\n".join(blocks[i][1] for i in grp)
+        out = _call_jansky(_prompt(part_tickers, part_text, (k, len(parts))),
+                           f"Jupiter/{sector} part {k}/{len(parts)}")
+        outputs.append(f"[Part {k}/{len(parts)}: {', '.join(part_tickers)}]\n{out}")
+    return "\n\n".join(outputs), python_flags
 
 # ─── Pass 20: Synthesis ───────────────────────────────────────────────────────
 
@@ -907,6 +969,9 @@ JUPITER'S {sector.upper()} SECTOR ANALYSIS:
 # (["jansky", "-z", prompt]). Box-drawing/em-dash characters are 3 bytes in
 # UTF-8, so budget in bytes, not characters, with headroom under the limit.
 PROMPT_MAX_BYTES = 120_000
+# Sector reviews may use more of the 131,071-byte argv ceiling (Nov 23 run: Insurance at
+# 124,363 and Real_Estate at 126,453 bytes ran fine unsplit). Keep ~3 KB of headroom.
+SECTOR_PROMPT_MAX_BYTES = 128_000
 SECTOR_NOTES_MAX_CHARS = 60_000
 SECTOR_NOTES_MIN_CHARS = 12_000
 SYNTHESIS_FIXED_TEXT_BYTES = 6_000   # instructions + verdict block, generous
